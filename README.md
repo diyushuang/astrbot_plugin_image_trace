@@ -1,6 +1,6 @@
 # astrbot_plugin_image_trace 图片溯源
 
-[![version](https://img.shields.io/badge/version-v1.3.0-blue)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-v1.3.1-blue)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](./LICENSE)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)

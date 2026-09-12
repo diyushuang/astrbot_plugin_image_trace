@@ -141,8 +141,16 @@ def sign_request(
 
 
 def _s3_error_detail(body: bytes) -> str:
-    """尽量从 S3 错误响应 XML 提取 <Code>/<Message>，解析失败时回退原文。"""
+    """尽量从 S3 错误响应 XML 提取 <Code>/<Message>，解析失败时回退原文。
+
+    错误响应体已由 read_limited_bytes 限长，但标准库 ElementTree 对
+    内部实体展开（billion laughs）不设防；S3 错误 XML 从不包含 DTD，
+    解析前先拒绝含 <!DOCTYPE/<!ENTITY 的文本，回退原文展示。
+    """
     text = body.decode("utf-8", errors="replace")
+    lowered = text.lower()
+    if "<!doctype" in lowered or "<!entity" in lowered:
+        return text[:200]
     try:
         root = ET.fromstring(text)
     except ET.ParseError:

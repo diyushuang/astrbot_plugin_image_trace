@@ -113,7 +113,7 @@ BUCKET_LEGACY_FIELDS = (
     "astrbot_plugin_image_trace",
     "diyushuang",
     "图片溯源：pHash 哈希 / Qdrant 多模态向量双引擎比对相似度并回传原图",
-    "v1.3.0",
+    "v1.3.1",
 )
 class ImageTracePlugin(Star):
     """图片溯源插件主类。"""
