@@ -1,0 +1,8 @@
+name: astrbot_plugin_image_trace
+display_name: 图片溯源
+desc: 群内发送或引用图片并使用 /溯源 指令，双引擎检索原图：pHash（本地哈希库）与 Qdrant 多模态向量（图床侧钩子自动入库），相似度达标即回传原图。支持泛用自建图床（Lsky Pro、EasyImages、Chevereto 等）、CloudFlare-ImgBed、Cloudflare R2 与甲骨文 OCI 对象存储，可选视觉大模型复核。
+short_desc: 发图溯源（哈希+向量双引擎），一键找回原图
+version: v1.2.1
+author: diyushuang
+repo: https://github.com/diyushuang/astrbot_plugin_image_trace
+astrbot_version: ">=4.0.0"

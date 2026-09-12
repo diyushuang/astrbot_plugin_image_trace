@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行数据（插件数据应存放在 AstrBot 的 data 目录，不应入库）
+data/
+
+# 工具会话状态与系统文件
+.mimosa/
+.DS_Store
+Thumbs.db

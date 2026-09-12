@@ -1,0 +1,341 @@
+{
+  "similarity_threshold": {
+    "description": "相似度阈值（0~1）",
+    "type": "float",
+    "default": 0.85,
+    "obvious_hint": true,
+    "hint": "查询图与图库图片的感知哈希相似度达到该值才判定命中（相似度 = 1 - 汉明距离/总位数）。设置过高容易漏图，过低容易误报，推荐 0.85。"
+  },
+  "hash_size": {
+    "description": "感知哈希精度",
+    "type": "int",
+    "options": [8, 16],
+    "default": 16,
+    "hint": "pHash 精度：16 对应 256bit（区分度高，推荐），8 对应 64bit（速度更快）。取值必须为 4~32 之间 4 的倍数（其它取值会导致新旧数据无法比对、索引失效）。修改后请执行 /溯源重扫 force 重建图库。"
+  },
+  "top_n": {
+    "description": "未命中时提示的最接近候选数",
+    "type": "int",
+    "default": 3,
+    "hint": "没有图片达到相似度阈值时，回复图库中最接近的前 N 条（含相似度）。0 表示不提示。"
+  },
+  "max_images_per_query": {
+    "description": "单次溯源最大处理图片数",
+    "type": "int",
+    "default": 3,
+    "hint": "一条消息中最多处理的图片数量，防止消息包含多图时刷屏。"
+  },
+  "max_download_mb": {
+    "description": "单张图片大小上限（MB）",
+    "type": "int",
+    "default": 20,
+    "hint": "超过该大小的图片拒绝处理，防止异常大图拖垮机器人。"
+  },
+  "scan_dirs": {
+    "description": "本地图库目录（原图片库 / 图床存储目录）",
+    "type": "list",
+    "default": [],
+    "obvious_hint": true,
+    "hint": "目录下（含子目录）的图片文件将被建立索引，例如本地图床（Lsky Pro 等）的存储目录。必须是机器人进程可访问的绝对路径。修改后执行 /溯源重扫 生效。"
+  },
+  "search_engine": {
+    "description": "检索引擎",
+    "type": "string",
+    "options": ["auto", "vector", "hash"],
+    "default": "auto",
+    "obvious_hint": true,
+    "hint": "auto=向量优先：先查 Qdrant 向量库，未命中或向量引擎不可用时自动回退 pHash 哈希库；vector=只用向量引擎；hash=只用原哈希引擎（保持旧行为）。向量引擎要求下方 vector_search 配置完整。"
+  },
+  "vector_search": {
+    "description": "向量检索设置（Qdrant + 多模态向量 AI）",
+    "type": "object",
+    "hint": "与服务器侧图床入库共用同一套向量 AI 与集合：embed 的 base_url/model/image_input 三值必须与图床入库侧完全一致，才能保证向量可比。登记原图时若图床自带服务器侧钩子（如 cloudflare_imgbed），插件不会重复写入。",
+    "items": {
+      "qdrant_url": {
+        "description": "Qdrant 服务地址",
+        "type": "string",
+        "default": "",
+        "obvious_hint": true,
+        "hint": "Qdrant REST 地址，如 http://<你的服务器IP>:6333。必须是公网可达的 http/https 地址（插件出网经 SSRF 校验，不接受内网地址）。"
+      },
+      "qdrant_api_key": {
+        "description": "Qdrant API Key",
+        "type": "string",
+        "secret": true,
+        "default": "",
+        "hint": "Qdrant 启动时通过 QDRANT__SERVICE__API_KEY 设置的密钥，留空则不带鉴权头。"
+      },
+      "collection_name": {
+        "description": "Qdrant 集合名",
+        "type": "string",
+        "default": "imgbed_images",
+        "hint": "向量点所在的集合，需与图床入库侧一致。"
+      },
+      "embed_base_url": {
+        "description": "多模态向量 AI 地址",
+        "type": "string",
+        "default": "",
+        "obvious_hint": true,
+        "hint": "OpenAI 兼容 embedding 服务的 base，如 https://<你的网关域名>/v1（不带尾斜杠），实际请求 POST {base}/embeddings。"
+      },
+      "embed_api_key": {
+        "description": "向量 AI API Key",
+        "type": "string",
+        "secret": true,
+        "default": "",
+        "hint": "embedding 请求的 Authorization: Bearer 密钥。"
+      },
+      "embed_model": {
+        "description": "多模态图片向量模型",
+        "type": "string",
+        "default": "",
+        "obvious_hint": true,
+        "hint": "接受图片输入的多模态 embedding 模型 ID（文本 embedding 模型无法对图片向量化），例如 Qwen/Qwen3-VL-Embedding-8B。必须与图床入库侧一致。"
+      },
+      "embed_image_input": {
+        "description": "图片输入序列化格式",
+        "type": "string",
+        "options": ["qwen-vl", "nemotron-vl", "dataurl", "jina-image"],
+        "default": "qwen-vl",
+        "hint": "qwen-vl=content 数组 [{\"type\":\"image\",\"image\":<dataURL>}]（Qwen3-VL-Embedding 系）；nemotron-vl=裸 dataURL 字符串 + input_type=passage（NVIDIA llama-nemotron-embed-vl 系）；dataurl=直接传 dataURL 字符串；jina-image=[{\"image\":<base64>}]（jina-clip 系）。模型报 400 时在此切换，需与图床入库侧一致。"
+      },
+      "embed_input_type": {
+        "description": "NVIDIA 非对称模型 input_type",
+        "type": "string",
+        "options": ["passage", "query"],
+        "default": "passage",
+        "hint": "仅 nemotron-vl 模式相关：llama-nemotron-embed-vl 是非对称模型，图片只能走 passage 侧（query 侧拒绝图片）。本插件对图片固定使用 passage，此值仅供与图床入库侧核对一致性。"
+      },
+      "similarity_threshold": {
+        "description": "向量相似度阈值（0~1）",
+        "type": "float",
+        "default": 0.8,
+        "obvious_hint": true,
+        "hint": "Qdrant cosine 相似度达到该值判定命中（同一张图的压缩/裁剪变体通常 0.85+，不同图通常更低）。建议先用少量成对图片实测校准。"
+      },
+      "top_k": {
+        "description": "向量检索返回候选数",
+        "type": "int",
+        "default": 5,
+        "hint": "每次从 Qdrant 取回的最相似点数：达到相似度阈值的命中会全部回传（按相似度降序），因此该值同时也是单次回传图片数量的上限；未命中时其中前 top_n 条作为候选列出。"
+      },
+      "request_timeout": {
+        "description": "请求超时（秒）",
+        "type": "int",
+        "default": 30,
+        "hint": "embedding 与 Qdrant 请求的超时时间。大模型 embedding 较慢时可调大。"
+      },
+      "vector_index_on_register": {
+        "description": "登记原图时同步写入向量库",
+        "type": "bool",
+        "default": true,
+        "hint": "/登记原图 上传成功后，把新图向量写入 Qdrant（cloudflare_imgbed 模式由图床侧钩子自动入库，插件不会重复写）。"
+      }
+    }
+  },
+  "image_bed": {
+    "description": "图床设置（登记原图的保存方式）",
+    "type": "object",
+    "hint": "登记原图（/登记原图）时图片的上传/保存方式；日常查询不依赖图床。",
+    "items": {
+      "mode": {
+        "description": "图床模式",
+        "type": "string",
+        "options": ["local", "generic_http", "cloudflare_r2", "oracle_oci", "cloudflare_imgbed"],
+        "default": "local",
+        "obvious_hint": true,
+        "hint": "local=原图副本保存到机器人数据目录（零配置）；generic_http=通过通用 HTTP 接口上传到自建图床（Lsky Pro、EasyImages、Chevereto 等）；cloudflare_r2=Cloudflare R2 对象存储（官方 S3 兼容 API）；oracle_oci=甲骨文 OCI Object Storage（官方 S3 兼容 API）；cloudflare_imgbed=CloudFlare-ImgBed 自建图床（官方 REST API，POST /upload 上传，/溯源删除 可同步删除远端文件）。后四种上传失败时自动回退本地副本。"
+      },
+      "api_url": {
+        "description": "图床上传接口地址",
+        "type": "string",
+        "default": "",
+        "obvious_hint": true,
+        "hint": "generic_http 模式必填，例如 Lsky Pro 为 https://bed.example.com/api/v1/upload。必须是公网可访问的 http/https 地址。"
+      },
+      "token": {
+        "description": "图床鉴权 Token",
+        "type": "string",
+        "secret": true,
+        "default": "",
+        "hint": "图床的 API Token，留空则不携带鉴权信息。"
+      },
+      "auth_header": {
+        "description": "鉴权请求头名称",
+        "type": "string",
+        "default": "Authorization",
+        "hint": "Lsky Pro 用 Authorization；EasyImages 等部分图床用 token。留空表示不发送鉴权头。"
+      },
+      "auth_prefix": {
+        "description": "鉴权头值前缀",
+        "type": "string",
+        "default": "Bearer ",
+        "hint": "拼接在 Token 前的字符串。Lsky Pro 为 “Bearer ”（注意保留尾部空格）；EasyImages 等通常留空。"
+      },
+      "file_field": {
+        "description": "上传文件字段名",
+        "type": "string",
+        "default": "file",
+        "hint": "multipart 表单中图片文件的字段名，多数图床为 file，部分为 image。"
+      },
+      "extra_fields": {
+        "description": "附加表单字段",
+        "type": "dict",
+        "items": {},
+        "default": {},
+        "hint": "上传时随请求附加的固定表单字段，如部分图床要求的 strategy_id、api_secret 等。"
+      },
+      "url_path": {
+        "description": "响应中图片直链的 JSON 路径",
+        "type": "string",
+        "default": "data.url",
+        "obvious_hint": true,
+        "hint": "上传成功后按点号路径从响应 JSON 中提取图片直链。Lsky Pro 为 data.url；EasyImages 常为 url 或 data.url；Chevereto 为 image.url。"
+      },
+      "timeout": {
+        "description": "上传超时（秒）",
+        "type": "int",
+        "default": 30
+      },
+      "r2_account_id": {
+        "description": "R2 账户 ID（Account ID）",
+        "type": "string",
+        "default": "",
+        "hint": "cloudflare_r2 模式必填。Cloudflare 控制台 → R2 → 概览页右侧的「账户 ID」。"
+      },
+      "r2_access_key_id": {
+        "description": "R2 Access Key ID",
+        "type": "string",
+        "default": "",
+        "hint": "cloudflare_r2 模式必填。在 R2「管理 R2 API 令牌」页创建 API 令牌（权限需含对象读写）后获得的 Access Key ID。"
+      },
+      "r2_secret_access_key": {
+        "description": "R2 Secret Access Key",
+        "type": "string",
+        "secret": true,
+        "default": "",
+        "hint": "cloudflare_r2 模式必填。创建 API 令牌时与 Access Key ID 一同生成，仅显示一次。"
+      },
+      "r2_bucket": {
+        "description": "R2 存储桶名称",
+        "type": "string",
+        "default": "",
+        "hint": "cloudflare_r2 模式必填。"
+      },
+      "r2_endpoint": {
+        "description": "R2 S3 endpoint（可选）",
+        "type": "string",
+        "default": "",
+        "hint": "留空使用官方默认 https://<账户ID>.r2.cloudflarestorage.com；欧盟等司法区的存储桶按官方文档填 https://<账户ID>.eu.r2.cloudflarestorage.com。"
+      },
+      "r2_public_base_url": {
+        "description": "R2 公开访问域名",
+        "type": "string",
+        "default": "",
+        "obvious_hint": true,
+        "hint": "cloudflare_r2 模式必填。在 R2 存储桶「设置 → 公开访问」中开启 r2.dev 子域（如 https://pub-xxxx.r2.dev）或绑定自定义域名。溯源回图需要长期有效的直链，未配置时自动回退本地副本。"
+      },
+      "oci_namespace": {
+        "description": "OCI 对象存储命名空间",
+        "type": "string",
+        "default": "",
+        "hint": "oracle_oci 模式必填。OCI 控制台「对象存储 → 存储桶」页面可见的 Object Storage Namespace 字符串。"
+      },
+      "oci_region": {
+        "description": "OCI 区域标识",
+        "type": "string",
+        "default": "",
+        "hint": "oracle_oci 模式必填，如 ap-osaka-1、us-ashburn-1。"
+      },
+      "oci_access_key_id": {
+        "description": "OCI Access Key",
+        "type": "string",
+        "default": "",
+        "hint": "oracle_oci 模式必填。OCI 控制台「用户设置 → Customer Secret Keys（客户密钥）」中生成的 Access Key（S3 兼容 API 凭据）。"
+      },
+      "oci_secret_access_key": {
+        "description": "OCI Secret Key",
+        "type": "string",
+        "secret": true,
+        "default": "",
+        "hint": "oracle_oci 模式必填。生成 Customer Secret Key 时显示的 Secret Key，仅显示一次。"
+      },
+      "oci_bucket": {
+        "description": "OCI 存储桶名称",
+        "type": "string",
+        "default": "",
+        "hint": "oracle_oci 模式必填。"
+      },
+      "oci_endpoint": {
+        "description": "OCI S3 endpoint（可选）",
+        "type": "string",
+        "default": "",
+        "hint": "留空使用官方标准格式 https://<命名空间>.compat.objectstorage.<区域>.oraclecloud.com，一般无需填写。"
+      },
+      "oci_public_bucket": {
+        "description": "OCI 存储桶已设为公共可读",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后直链使用官方对象 URL 格式 https://objectstorage.<区域>.oraclecloud.com/n/<命名空间>/b/<桶>/o/<对象名>；需先在 OCI 控制台将存储桶可见性设为 Public。未开启且未填 oci_public_base_url 时自动回退本地副本。"
+      },
+      "oci_public_base_url": {
+        "description": "OCI 自定义公开地址（可选）",
+        "type": "string",
+        "default": "",
+        "hint": "优先于 oci_public_bucket 生效。可填自定义域名，或 OCI 控制台为存储桶创建的「带对象名前缀的预认证请求（PAR）」URL（以 /o/ 结尾），直链 = 该地址 + 对象名。"
+      },
+      "cfi_base_url": {
+        "description": "CloudFlare-ImgBed 站点地址",
+        "type": "string",
+        "default": "",
+        "obvious_hint": true,
+        "hint": "cloudflare_imgbed 模式必填。你部署的 CloudFlare-ImgBed 站点首页地址，如 https://img.example.com（不带尾斜杠）。必须是公网可访问的 http/https 地址。"
+      },
+      "cfi_token": {
+        "description": "CloudFlare-ImgBed API Token",
+        "type": "string",
+        "secret": true,
+        "default": "",
+        "hint": "站点后台「系统设置 → 安全设置 → API Token 管理」中创建。上传需要 upload 权限；如需 /溯源删除 同步删除远端文件还需 delete 权限（创建 Token 时勾选）。留空则不携带 Authorization 请求头（站点未开启登录校验时可留空）。"
+      },
+      "cfi_auth_code": {
+        "description": "上传鉴权码 authCode",
+        "type": "string",
+        "secret": true,
+        "default": "",
+        "hint": "站点启用登录校验时也可用上传鉴权码（upload 请求的 authCode 查询参数）上传，与 API Token 二选一或同时配置。"
+      },
+      "cfi_upload_channel": {
+        "description": "存储渠道 uploadChannel",
+        "type": "string",
+        "default": "",
+        "hint": "官方可选值：telegram、cfr2、s3、discord、huggingface、webdav。留空使用站点默认渠道。"
+      },
+      "cfi_channel_name": {
+        "description": "渠道名称 channelName",
+        "type": "string",
+        "default": "",
+        "hint": "多渠道配置场景下指定具体渠道名（如多个 S3 渠道）；单渠道站点留空即可。"
+      },
+      "cfi_upload_folder": {
+        "description": "上传目录 uploadFolder",
+        "type": "string",
+        "default": "",
+        "hint": "上传到站点的相对目录（如 img/test）。留空上传到根目录。"
+      }
+    }
+  },
+  "ai_verify": {
+    "description": "AI 视觉复核（可选）",
+    "type": "bool",
+    "default": false,
+    "obvious_hint": true,
+    "hint": "开启后，哈希命中的候选图会交给当前会话使用的视觉大模型二次确认“是否为同一张图”，回答不是则跳过该候选。需要已配置支持图片输入的 LLM 提供商，未配置时自动跳过复核，不影响正常使用。"
+  },
+  "register_admin_only": {
+    "description": "仅管理员可登记原图",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后 /登记原图 仅限 AstrBot 管理员（含群管理员）使用；关闭后所有用户可登记。"
+  }
+}
