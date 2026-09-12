@@ -49,7 +49,7 @@
   "vector_search": {
     "description": "向量检索设置（Qdrant + 多模态向量 AI）",
     "type": "object",
-    "hint": "与服务器侧图床入库共用同一套向量 AI 与集合：embed 的 base_url/model/image_input 三值必须与图床入库侧完全一致，才能保证向量可比。登记原图时若图床自带服务器侧钩子（如 cloudflare_imgbed），插件不会重复写入。",
+    "hint": "为什么必填向量 AI：向量库（Qdrant）里只存向量不存图片，/溯源 时插件必须调用与图床入库侧相同的多模态向量 AI 把查询图转成向量，才能去 Qdrant 检索，因此 embed_base_url / embed_model 必填（embed_api_key 在网关无鉴权时可留空）。embed 的 base_url/model/image_input 三值必须与图床入库侧完全一致，否则查询向量与库中向量不在同一空间、相似度无意义。登记原图时若图床自带服务器侧钩子（如 cloudflare_imgbed），插件不会重复写入。",
     "items": {
       "qdrant_url": {
         "description": "Qdrant 服务地址",
@@ -76,14 +76,14 @@
         "type": "string",
         "default": "",
         "obvious_hint": true,
-        "hint": "OpenAI 兼容 embedding 服务的 base，如 https://<你的网关域名>/v1（不带尾斜杠），实际请求 POST {base}/embeddings。"
+        "hint": "OpenAI 兼容 embedding 服务的 base，如 https://<你的网关域名>/v1（不带尾斜杠），实际请求 POST {base}/embeddings。与图床入库侧填同一个地址。"
       },
       "embed_api_key": {
         "description": "向量 AI API Key",
         "type": "string",
         "secret": true,
         "default": "",
-        "hint": "embedding 请求的 Authorization: Bearer 密钥。"
+        "hint": "embedding 请求的 Authorization: Bearer 密钥；网关未开启鉴权时可留空（留空则不带鉴权头）。"
       },
       "embed_model": {
         "description": "多模态图片向量模型",
@@ -133,18 +133,120 @@
       }
     }
   },
+  "storage_bucket": {
+    "description": "储存桶设置（Cloudflare R2 / 甲骨文 OCI，可选）",
+    "type": "object",
+    "hint": "把登记原图（/登记原图）存到对象存储。储存桶配置完整时优先于下方图床设置；mode 为 none 或配置不完整时使用图床设置。上传失败时自动回退本地副本。",
+    "items": {
+      "mode": {
+        "description": "储存桶模式",
+        "type": "string",
+        "options": ["none", "cloudflare_r2", "oracle_oci"],
+        "default": "none",
+        "obvious_hint": true,
+        "hint": "none=不使用储存桶（登记原图走下方图床设置）；cloudflare_r2=Cloudflare R2 对象存储（官方 S3 兼容 API）；oracle_oci=甲骨文 OCI Object Storage（官方 S3 兼容 API）。选择后需填写下方对应模式的全部必填项，配置不完整时自动改用图床设置。"
+      },
+      "r2_account_id": {
+        "description": "R2 账户 ID（Account ID）",
+        "type": "string",
+        "default": "",
+        "hint": "cloudflare_r2 模式必填。Cloudflare 控制台 → R2 → 概览页右侧的「账户 ID」。"
+      },
+      "r2_access_key_id": {
+        "description": "R2 Access Key ID",
+        "type": "string",
+        "default": "",
+        "hint": "cloudflare_r2 模式必填。在 R2「管理 R2 API 令牌」页创建 API 令牌（权限需含对象读写）后获得的 Access Key ID。"
+      },
+      "r2_secret_access_key": {
+        "description": "R2 Secret Access Key",
+        "type": "string",
+        "secret": true,
+        "default": "",
+        "hint": "cloudflare_r2 模式必填。创建 API 令牌时与 Access Key ID 一同生成，仅显示一次。"
+      },
+      "r2_bucket": {
+        "description": "R2 存储桶名称",
+        "type": "string",
+        "default": "",
+        "hint": "cloudflare_r2 模式必填。"
+      },
+      "r2_endpoint": {
+        "description": "R2 S3 endpoint（可选）",
+        "type": "string",
+        "default": "",
+        "hint": "留空使用官方默认 https://<账户ID>.r2.cloudflarestorage.com；欧盟等司法区的存储桶按官方文档填 https://<账户ID>.eu.r2.cloudflarestorage.com。"
+      },
+      "r2_public_base_url": {
+        "description": "R2 公开访问域名",
+        "type": "string",
+        "default": "",
+        "obvious_hint": true,
+        "hint": "cloudflare_r2 模式必填。在 R2 存储桶「设置 → 公开访问」中开启 r2.dev 子域（如 https://pub-xxxx.r2.dev）或绑定自定义域名。溯源回图需要长期有效的直链，未配置时该储存桶视为配置不完整。"
+      },
+      "oci_namespace": {
+        "description": "OCI 对象存储命名空间",
+        "type": "string",
+        "default": "",
+        "hint": "oracle_oci 模式必填。OCI 控制台「对象存储 → 存储桶」页面可见的 Object Storage Namespace 字符串。"
+      },
+      "oci_region": {
+        "description": "OCI 区域标识",
+        "type": "string",
+        "default": "",
+        "hint": "oracle_oci 模式必填，如 ap-osaka-1、us-ashburn-1。"
+      },
+      "oci_access_key_id": {
+        "description": "OCI Access Key",
+        "type": "string",
+        "default": "",
+        "hint": "oracle_oci 模式必填。OCI 控制台「用户设置 → Customer Secret Keys（客户密钥）」中生成的 Access Key（S3 兼容 API 凭据）。"
+      },
+      "oci_secret_access_key": {
+        "description": "OCI Secret Key",
+        "type": "string",
+        "secret": true,
+        "default": "",
+        "hint": "oracle_oci 模式必填。生成 Customer Secret Key 时显示的 Secret Key，仅显示一次。"
+      },
+      "oci_bucket": {
+        "description": "OCI 存储桶名称",
+        "type": "string",
+        "default": "",
+        "hint": "oracle_oci 模式必填。"
+      },
+      "oci_endpoint": {
+        "description": "OCI S3 endpoint（可选）",
+        "type": "string",
+        "default": "",
+        "hint": "留空使用官方标准格式 https://<命名空间>.compat.objectstorage.<区域>.oraclecloud.com，一般无需填写。"
+      },
+      "oci_public_bucket": {
+        "description": "OCI 存储桶已设为公共可读",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后直链使用官方对象 URL 格式 https://objectstorage.<区域>.oraclecloud.com/n/<命名空间>/b/<桶>/o/<对象名>；需先在 OCI 控制台将存储桶可见性设为 Public。开启或填写 oci_public_base_url 二选一，否则该储存桶视为配置不完整。"
+      },
+      "oci_public_base_url": {
+        "description": "OCI 自定义公开地址（可选）",
+        "type": "string",
+        "default": "",
+        "hint": "优先于 oci_public_bucket 生效。可填自定义域名，或 OCI 控制台为存储桶创建的「带对象名前缀的预认证请求（PAR）」URL（以 /o/ 结尾），直链 = 该地址 + 对象名。"
+      }
+    }
+  },
   "image_bed": {
     "description": "图床设置（登记原图的保存方式）",
     "type": "object",
-    "hint": "登记原图（/登记原图）时图片的上传/保存方式；日常查询不依赖图床。",
+    "hint": "登记原图（/登记原图）时图片的上传/保存方式；日常查询不依赖图床。上方储存桶配置完整时，本组设置会被跳过。",
     "items": {
       "mode": {
         "description": "图床模式",
         "type": "string",
-        "options": ["local", "generic_http", "cloudflare_r2", "oracle_oci", "cloudflare_imgbed"],
+        "options": ["local", "generic_http", "cloudflare_imgbed"],
         "default": "local",
         "obvious_hint": true,
-        "hint": "local=原图副本保存到机器人数据目录（零配置）；generic_http=通过通用 HTTP 接口上传到自建图床（Lsky Pro、EasyImages、Chevereto 等）；cloudflare_r2=Cloudflare R2 对象存储（官方 S3 兼容 API）；oracle_oci=甲骨文 OCI Object Storage（官方 S3 兼容 API）；cloudflare_imgbed=CloudFlare-ImgBed 自建图床（官方 REST API，POST /upload 上传，/溯源删除 可同步删除远端文件）。后四种上传失败时自动回退本地副本。"
+        "hint": "local=原图副本保存到机器人数据目录（零配置）；generic_http=通过通用 HTTP 接口上传到自建图床（Lsky Pro、EasyImages、Chevereto 等）；cloudflare_imgbed=CloudFlare-ImgBed 自建图床（官方 REST API，POST /upload 上传，/溯源删除 可同步删除远端文件）。远程模式上传失败时自动回退本地副本。需要 R2/OCI 对象存储请改用上方「储存桶设置」。"
       },
       "api_url": {
         "description": "图床上传接口地址",
@@ -196,93 +298,6 @@
         "description": "上传超时（秒）",
         "type": "int",
         "default": 30
-      },
-      "r2_account_id": {
-        "description": "R2 账户 ID（Account ID）",
-        "type": "string",
-        "default": "",
-        "hint": "cloudflare_r2 模式必填。Cloudflare 控制台 → R2 → 概览页右侧的「账户 ID」。"
-      },
-      "r2_access_key_id": {
-        "description": "R2 Access Key ID",
-        "type": "string",
-        "default": "",
-        "hint": "cloudflare_r2 模式必填。在 R2「管理 R2 API 令牌」页创建 API 令牌（权限需含对象读写）后获得的 Access Key ID。"
-      },
-      "r2_secret_access_key": {
-        "description": "R2 Secret Access Key",
-        "type": "string",
-        "secret": true,
-        "default": "",
-        "hint": "cloudflare_r2 模式必填。创建 API 令牌时与 Access Key ID 一同生成，仅显示一次。"
-      },
-      "r2_bucket": {
-        "description": "R2 存储桶名称",
-        "type": "string",
-        "default": "",
-        "hint": "cloudflare_r2 模式必填。"
-      },
-      "r2_endpoint": {
-        "description": "R2 S3 endpoint（可选）",
-        "type": "string",
-        "default": "",
-        "hint": "留空使用官方默认 https://<账户ID>.r2.cloudflarestorage.com；欧盟等司法区的存储桶按官方文档填 https://<账户ID>.eu.r2.cloudflarestorage.com。"
-      },
-      "r2_public_base_url": {
-        "description": "R2 公开访问域名",
-        "type": "string",
-        "default": "",
-        "obvious_hint": true,
-        "hint": "cloudflare_r2 模式必填。在 R2 存储桶「设置 → 公开访问」中开启 r2.dev 子域（如 https://pub-xxxx.r2.dev）或绑定自定义域名。溯源回图需要长期有效的直链，未配置时自动回退本地副本。"
-      },
-      "oci_namespace": {
-        "description": "OCI 对象存储命名空间",
-        "type": "string",
-        "default": "",
-        "hint": "oracle_oci 模式必填。OCI 控制台「对象存储 → 存储桶」页面可见的 Object Storage Namespace 字符串。"
-      },
-      "oci_region": {
-        "description": "OCI 区域标识",
-        "type": "string",
-        "default": "",
-        "hint": "oracle_oci 模式必填，如 ap-osaka-1、us-ashburn-1。"
-      },
-      "oci_access_key_id": {
-        "description": "OCI Access Key",
-        "type": "string",
-        "default": "",
-        "hint": "oracle_oci 模式必填。OCI 控制台「用户设置 → Customer Secret Keys（客户密钥）」中生成的 Access Key（S3 兼容 API 凭据）。"
-      },
-      "oci_secret_access_key": {
-        "description": "OCI Secret Key",
-        "type": "string",
-        "secret": true,
-        "default": "",
-        "hint": "oracle_oci 模式必填。生成 Customer Secret Key 时显示的 Secret Key，仅显示一次。"
-      },
-      "oci_bucket": {
-        "description": "OCI 存储桶名称",
-        "type": "string",
-        "default": "",
-        "hint": "oracle_oci 模式必填。"
-      },
-      "oci_endpoint": {
-        "description": "OCI S3 endpoint（可选）",
-        "type": "string",
-        "default": "",
-        "hint": "留空使用官方标准格式 https://<命名空间>.compat.objectstorage.<区域>.oraclecloud.com，一般无需填写。"
-      },
-      "oci_public_bucket": {
-        "description": "OCI 存储桶已设为公共可读",
-        "type": "bool",
-        "default": false,
-        "hint": "开启后直链使用官方对象 URL 格式 https://objectstorage.<区域>.oraclecloud.com/n/<命名空间>/b/<桶>/o/<对象名>；需先在 OCI 控制台将存储桶可见性设为 Public。未开启且未填 oci_public_base_url 时自动回退本地副本。"
-      },
-      "oci_public_base_url": {
-        "description": "OCI 自定义公开地址（可选）",
-        "type": "string",
-        "default": "",
-        "hint": "优先于 oci_public_bucket 生效。可填自定义域名，或 OCI 控制台为存储桶创建的「带对象名前缀的预认证请求（PAR）」URL（以 /o/ 结尾），直链 = 该地址 + 对象名。"
       },
       "cfi_base_url": {
         "description": "CloudFlare-ImgBed 站点地址",

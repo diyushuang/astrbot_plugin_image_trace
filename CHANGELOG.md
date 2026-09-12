@@ -1,5 +1,25 @@
 # 更新日志
 
+## v1.3.0（2026-09-12，储存桶与图床配置拆分）
+
+- **配置面板重构：储存桶与图床分设两组**。Cloudflare R2 / 甲骨文 OCI 从
+  `image_bed` 模式中独立为单独的「储存桶设置」（`storage_bucket`）配置组
+  （`mode`：`none` / `cloudflare_r2` / `oracle_oci`），`image_bed` 组回归纯图床
+  设置（`local` / `generic_http` / `cloudflare_imgbed`），两类字段不再在面板里
+  混排。
+- **储存桶优先**：`storage_bucket` 配置完整（必填项齐全且公开直链条件满足）
+  时优先于图床设置；`mode=none` 或配置不完整时自动改用图床设置（日志提示
+  缺项），`/溯源状态` 的「存储方式」一行标明当前生效来源。
+- **老配置自动迁移（幂等）**：v1.2.x 填在 `image_bed.mode = cloudflare_r2 /
+  oracle_oci` 及 `r2_*` / `oci_*` 字段的配置，在插件启动时自动搬到
+  `storage_bucket` 组，图床模式归位 `local`，无需手动操作。
+- **`embed_api_key` 放宽为可留空**：向量引擎启用判定不再要求 API Key
+  （网关未开启鉴权时无需再填占位值），留空则 embedding 请求不带鉴权头；
+  `qdrant_url` / `embed_base_url` / `embed_model` 三项仍为向量引擎必填。
+- 文档：`vector_search` 组与 README 补充"为什么要填向量 AI"说明（Qdrant
+  只存向量，查询图需插件侧用同一模型向量化）；FAQ 新增向量 AI 必填原因、
+  储存桶与图床并存优先级、v1.2.x 升级迁移三条。
+
 ## v1.2.1（2026-09-12，结构与健壮性修复）
 
 - **修复兜底下载失效**：`_download` 的 prepare 回调按 url_guard 的三参契约

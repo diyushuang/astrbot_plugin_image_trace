@@ -70,12 +70,50 @@ except ImportError:  # 兼容插件以独立模块方式加载
 PLUGIN_NAME = "astrbot_plugin_image_trace"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".jfif"}
 
+# 储存桶（对象存储）独立配置组；v1.2.x 曾作为 image_bed 的模式，迁移见
+# _migrate_bucket_config。完整判定与 image_bed.py 的 _require / 公开直链
+# 校验口径一致：缺任何一项上传都必然回退本地副本，不满足就不优先于图床
+BUCKET_MODES = ("cloudflare_r2", "oracle_oci")
+BUCKET_REQUIRED = {
+    "cloudflare_r2": (
+        "r2_account_id",
+        "r2_access_key_id",
+        "r2_secret_access_key",
+        "r2_bucket",
+        "r2_public_base_url",
+    ),
+    "oracle_oci": (
+        "oci_namespace",
+        "oci_region",
+        "oci_access_key_id",
+        "oci_secret_access_key",
+        "oci_bucket",
+    ),
+}
+# v1.2.x image_bed 组里可能遗留的储存桶字段（迁移时搬走并清理）
+BUCKET_LEGACY_FIELDS = (
+    "r2_account_id",
+    "r2_access_key_id",
+    "r2_secret_access_key",
+    "r2_bucket",
+    "r2_endpoint",
+    "r2_public_base_url",
+    "oci_namespace",
+    "oci_region",
+    "oci_access_key_id",
+    "oci_secret_access_key",
+    "oci_bucket",
+    "oci_endpoint",
+    "oci_public_bucket",
+    "oci_public_base_url",
+)
+
 
 @register(
     "astrbot_plugin_image_trace",
     "diyushuang",
     "图片溯源：pHash 哈希 / Qdrant 多模态向量双引擎比对相似度并回传原图",
-    "v1.2.1",
+    "v1.3.0",
 )
 class ImageTracePlugin(Star):
     """图片溯源插件主类。"""
@@ -102,15 +140,19 @@ class ImageTracePlugin(Star):
             os.path.join(self.data_dir, "library.db"),
             expected_phash_hex_len=phash_hex_len(hash_size),
         )
-        self.bed = ImageBedClient(self.data_dir, self._dict_cfg("image_bed"))
+        # v1.2.x 的储存桶配置先迁移，再合并（储存桶完整时优先于图床）
+        self._migrate_bucket_config()
+        self._bed_cfg = self._effective_bed_cfg()
+        self.bed = ImageBedClient(self.data_dir, self._bed_cfg)
         self._http: Optional[aiohttp.ClientSession] = None
         self.vector = VectorEngine(config, self._get_http)
         self._cleanup_tmp()
         engine = self._engine_choice()
         vector_note = "（向量引擎已启用）" if self.vector.enabled and engine != "hash" else ""
+        bucket_note = f"（储存桶 {self._bed_mode()} 优先）" if self._bed_mode() in BUCKET_MODES else ""
         logger.info(
             f"图片溯源插件已加载，当前图库共 {self.library.count()} 条，"
-            f"引擎={engine} {vector_note}"
+            f"引擎={engine} {vector_note}{bucket_note}"
         )
 
     # ------------------------------------------------------------------
@@ -140,8 +182,100 @@ class ImageTracePlugin(Star):
             return default
         return truthy(value)
 
+    def _migrate_bucket_config(self) -> None:
+        """v1.2.x 升级迁移（幂等）：image_bed 组里的储存桶模式与字段搬到
+        独立的 storage_bucket 组。
+
+        v1.3.0 起 image_bed.mode 不再含 cloudflare_r2 / oracle_oci（二者
+        移入 storage_bucket 组），老配置只在 image_bed 组里存在，启动时
+        搬一次；storage_bucket 已有 mode 时只清理残留不覆盖用户新配置。
+        """
+        bed = self.config.get("image_bed")
+        if not isinstance(bed, dict):
+            return
+        legacy_mode = str(bed.get("mode") or "").strip()
+        if legacy_mode not in BUCKET_MODES:
+            return
+        bucket = self.config.get("storage_bucket")
+        if not isinstance(bucket, dict):
+            bucket = {}
+            self.config["storage_bucket"] = bucket
+        if not bucket.get("mode"):
+            bucket["mode"] = legacy_mode
+            for key in BUCKET_LEGACY_FIELDS:
+                value = bed.get(key)
+                if value not in (None, "", False):
+                    bucket[key] = value
+        # 旧下拉里已没有储存桶选项，归位 local；r2_*/oci_* 字段也不在
+        # image_bed 组的 schema 里了，一并清掉避免残留
+        bed["mode"] = "local"
+        for key in BUCKET_LEGACY_FIELDS:
+            bed.pop(key, None)
+        try:
+            self.config.save_config()
+        except Exception as e:
+            # 保存失败只影响持久化：本次会话已用迁移后的内存配置，
+            # 重启后同一条迁移会再次执行（幂等）
+            logger.warning(f"储存桶配置迁移写入失败（重启后会自动重试）: {e}")
+        logger.info(
+            f"已把 v1.2.x 图床配置中的储存桶设置（{legacy_mode}）迁移到 "
+            "storage_bucket 组，image_bed 组回归图床模式 local。"
+        )
+
+    def _bucket_config(self) -> Optional[dict]:
+        """储存桶配置完整时返回可并入图床配置的 dict（含 mode），否则 None。
+
+        完整 = mode 已选 + 必填项齐全 + 公开直链条件满足（R2 需
+        r2_public_base_url，OCI 需公共桶或自定义公开地址二选一）：
+        缺任一项上传都必然回退本地副本，优先于图床只会白费一次必败上传。
+        """
+        raw = self._dict_cfg("storage_bucket")
+        mode = str(raw.get("mode") or "").strip()
+        if mode not in BUCKET_MODES:
+            return None
+        missing = [
+            f"storage_bucket.{k}" for k in BUCKET_REQUIRED[mode] if self._is_blank(raw.get(k))
+        ]
+        if (
+            mode == "oracle_oci"
+            and not truthy(raw.get("oci_public_bucket"))
+            and self._is_blank(raw.get("oci_public_base_url"))
+        ):
+            missing.append(
+                "storage_bucket.oci_public_bucket / oci_public_base_url（公开直链二选一）"
+            )
+        if missing:
+            logger.warning(
+                f"储存桶 {mode} 配置不完整（缺 {'、'.join(missing)}），"
+                "登记原图将改用图床设置。"
+            )
+            return None
+        cfg = dict(raw)
+        cfg["mode"] = mode
+        return cfg
+
+    def _effective_bed_cfg(self) -> dict:
+        """合并储存桶与图床两组配置：储存桶配置完整时优先（覆盖 mode 与字段）。"""
+        bed = dict(self._dict_cfg("image_bed"))
+        bucket = self._bucket_config()
+        if bucket is not None:
+            bed.update(bucket)
+        return bed
+
     def _bed_mode(self) -> str:
-        return str(self._dict_cfg("image_bed").get("mode") or "local")
+        """生效的存储模式（storage_bucket 优先合并后的图床配置）。"""
+        return str(self._bed_cfg.get("mode") or "local")
+
+    def _storage_line(self) -> str:
+        """/溯源状态 的存储方式一行：标明生效来源（储存桶优先于图床）。"""
+        bucket_mode = str(self._dict_cfg("storage_bucket").get("mode") or "").strip()
+        bed_mode = str(self._dict_cfg("image_bed").get("mode") or "local")
+        active = self._bed_mode()
+        if bucket_mode in BUCKET_MODES:
+            if active == bucket_mode:
+                return f"· 存储方式：储存桶 {bucket_mode}（优先于图床 {bed_mode}）"
+            return f"· 存储方式：图床 {active}（储存桶 {bucket_mode} 配置不完整，未生效）"
+        return f"· 存储方式：图床 {active}"
 
     def _engine_choice(self) -> str:
         """当前检索引擎：hash | vector | auto（vector 优先，失败/未命中回退 hash）。"""
@@ -694,7 +828,6 @@ class ImageTracePlugin(Star):
     async def status(self, event: AstrMessageEvent):
         """查看图库统计与插件配置摘要"""
         stats = self.library.stats()
-        bed_mode = self._bed_mode()
         scan_dirs = self._scan_dirs()
         lines = [f"📚 图片溯源图库状态：共 {stats['total']} 条（索引 {stats['indexed']}）"]
         if stats["skipped"]:
@@ -708,7 +841,7 @@ class ImageTracePlugin(Star):
             )
         lines.append(f"· pHash 精度：{self.hash_size * self.hash_size}bit（hash_size={self.hash_size}）")
         lines.append(f"· 相似度阈值：{self._float_cfg('similarity_threshold', 0.85) * 100:.0f}%")
-        lines.append(f"· 图床模式：{bed_mode}")
+        lines.append(self._storage_line())
         engine = self._engine_choice()
         lines.append(
             f"· 检索引擎：{engine}（向量{'已启用' if self.vector.enabled else '未启用'}）"

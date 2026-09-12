@@ -124,9 +124,8 @@ class VectorEngine:
         timeout_s = max(5, as_int(raw.get("request_timeout"), 30))
         self.timeout = aiohttp.ClientTimeout(total=timeout_s)
         self._session_getter = session_getter
-        self.enabled = bool(
-            self.qdrant_url and self.embed_base_url and self.embed_key and self.embed_model
-        )
+        # embed_api_key 不参与启用判定：网关未开鉴权时留空是合法场景
+        self.enabled = bool(self.qdrant_url and self.embed_base_url and self.embed_model)
 
     # ------------------------------------------------------------------
     # 配置诊断
@@ -135,16 +134,15 @@ class VectorEngine:
     def missing_fields(self) -> list:
         """返回未配置的必填项名称列表（供提示文案使用）。
 
-        qdrant_api_key 不列入：自托管无鉴权的 Qdrant 是合法场景
-        （与 __init__ 的 enabled 判定口径一致）。
+        qdrant_api_key / embed_api_key 不列入：自托管无鉴权的 Qdrant、
+        未开鉴权的 embedding 网关都是合法场景（与 __init__ 的 enabled
+        判定口径一致）。
         """
         missing = []
         if not self.qdrant_url:
             missing.append("vector_search.qdrant_url")
         if not self.embed_base_url:
             missing.append("vector_search.embed_base_url")
-        if not self.embed_key:
-            missing.append("vector_search.embed_api_key")
         if not self.embed_model:
             missing.append("vector_search.embed_model")
         return missing
@@ -234,8 +232,8 @@ class VectorEngine:
         请求按 embed_image_input 序列化；网络/响应/解析错误统一归为
         VectorEngineError（可展示给用户），429 带 retry-after 提示。
         """
-        if not self.embed_key:
-            raise VectorEngineError("embed_api_key 未配置，无法向量化图片。")
+        if not self.embed_base_url:
+            raise VectorEngineError("embed_base_url 未配置，无法向量化图片。")
         if not self.embed_model:
             raise VectorEngineError("embed_model 未配置，无法向量化图片。")
         b64 = base64.b64encode(data).decode("ascii")
@@ -253,7 +251,10 @@ class VectorEngine:
         session = await self._session_getter()
 
         def prepare(_u: str, _m: str, cross_origin: bool = False) -> dict:
-            headers = {} if cross_origin else {"Authorization": f"Bearer {self.embed_key}"}
+            # 未配置 embed_api_key 时不带鉴权头；跨域重定向时一律剥离
+            headers = {} if cross_origin else (
+                {"Authorization": f"Bearer {self.embed_key}"} if self.embed_key else {}
+            )
             return {
                 "json": payload,
                 "headers": headers,
