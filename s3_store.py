@@ -27,21 +27,21 @@ from __future__ import annotations
 import hashlib
 import hmac
 import xml.etree.ElementTree as ET
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
-from typing import Optional
 from urllib.parse import quote, urlparse
 
 import aiohttp
 
 try:
     from .common import USER_AGENT
-    from .url_guard import UrlBlockedError, guarded_request, make_pinned_connector, read_limited_bytes
+    from .http_client import GuardedHttpClient
+    from .url_guard import UrlBlockedError, read_limited_bytes
 except ImportError:  # 兼容插件以独立模块方式加载
     from common import USER_AGENT  # type: ignore[no-redef]
+    from http_client import GuardedHttpClient  # type: ignore[no-redef]
     from url_guard import (  # type: ignore[no-redef]
         UrlBlockedError,
-        guarded_request,
-        make_pinned_connector,
         read_limited_bytes,
     )
 
@@ -92,8 +92,8 @@ def sign_request(
     access_key: str,
     secret_key: str,
     region: str,
-    extra_signed_headers: Optional[dict] = None,
-    canonical_uri: Optional[str] = None,
+    extra_signed_headers: dict | None = None,
+    canonical_uri: str | None = None,
 ) -> str:
     """按 AWS Signature Version 4（S3 服务）生成 Authorization 请求头。
 
@@ -115,15 +115,12 @@ def sign_request(
         "x-amz-date": amz_date,
     }
     if extra_signed_headers:
-        headers.update(
-            {k.strip().lower(): str(v).strip() for k, v in extra_signed_headers.items()}
-        )
+        headers.update({k.strip().lower(): str(v).strip() for k, v in extra_signed_headers.items()})
     signed_headers = ";".join(sorted(headers))
     canonical_headers = "".join(f"{name}:{headers[name]}\n" for name in sorted(headers))
 
     canonical_request = (
-        f"{method}\n{canonical_uri}\n\n"
-        f"{canonical_headers}\n{signed_headers}\n{payload_sha256_hex}"
+        f"{method}\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_sha256_hex}"
     )
     scope = f"{datestamp}/{region}/s3/aws4_request"
     string_to_sign = (
@@ -131,9 +128,7 @@ def sign_request(
         f"{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
     )
     signing_key = derive_signing_key(secret_key, datestamp, region)
-    signature = hmac.new(
-        signing_key, string_to_sign.encode("utf-8"), hashlib.sha256
-    ).hexdigest()
+    signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
     return (
         f"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, "
         f"SignedHeaders={signed_headers}, Signature={signature}"
@@ -172,13 +167,14 @@ class S3CompatClient:
         secret_key: str,
         region: str,
         timeout: int = 30,
+        http_getter: Callable[[], Awaitable[GuardedHttpClient]] | None = None,
     ):
         self.endpoint = endpoint.rstrip("/")
         self.access_key = access_key
         self.secret_key = secret_key
         self.region = region
         self.timeout = aiohttp.ClientTimeout(total=max(5, int(timeout)))
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._http_getter = http_getter
 
     async def put_object(self, bucket: str, key: str, data: bytes, content_type: str) -> None:
         await self._signed("PUT", f"/{bucket}/{key}", data=data, content_type=content_type)
@@ -186,18 +182,9 @@ class S3CompatClient:
     async def delete_object(self, bucket: str, key: str) -> None:
         await self._signed("DELETE", f"/{bucket}/{key}", expect=(200, 204))
 
-    async def _get_session(self) -> aiohttp.ClientSession:
-        """懒建长会话：对象存储 endpoint 固定，跨请求复用连接与 TLS 握手。"""
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                timeout=self.timeout, connector=make_pinned_connector()
-            )
-        return self._session
-
     async def aclose(self) -> None:
-        if self._session is not None and not self._session.closed:
-            await self._session.close()
-        self._session = None
+        """保留兼容；HTTP 会话由共享客户端统一释放。"""
+        return None
 
     async def _signed(
         self,
@@ -243,10 +230,8 @@ class S3CompatClient:
                 kwargs["data"] = data
             return kwargs
 
-        session = await self._get_session()
-        async with await guarded_request(session, method, url, prepare=prepare) as resp:
+        client = await self._http_getter()
+        async with await client.request(method, url, prepare=prepare, timeout=self.timeout) as resp:
             body = await read_limited_bytes(resp)
             if resp.status not in expect:
-                raise RuntimeError(
-                    f"对象存储返回 HTTP {resp.status}: {_s3_error_detail(body)!r}"
-                )
+                raise RuntimeError(f"对象存储返回 HTTP {resp.status}: {_s3_error_detail(body)!r}")

@@ -19,8 +19,11 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import socket
+from collections.abc import Callable, Mapping
+from contextlib import AbstractAsyncContextManager
 from contextvars import ContextVar
-from typing import Any, Dict, List, Mapping
+from types import MappingProxyType
+from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
@@ -86,7 +89,7 @@ def _url_origin(url: str) -> str:
     return f"{(parsed.hostname or '').lower()}:{_url_port(parsed)}"
 
 
-def resolve_public_addrs(url: str) -> tuple[str, List[ResolveResult]]:
+def resolve_public_addrs(url: str) -> tuple[str, list[ResolveResult]]:
     """校验 URL 并解析主机。返回 (主机名, 已确认公网的地址列表)。
 
     主机为 IP 字面量时同样返回一份已校验地址，调用方据此钉扎——
@@ -132,7 +135,7 @@ def resolve_public_addrs(url: str) -> tuple[str, List[ResolveResult]]:
     if not infos:
         raise UrlBlockedError(f"域名解析结果为空: {host}")
 
-    addrs: List[ResolveResult] = []
+    addrs: list[ResolveResult] = []
     for family, _type, proto, _canon, sockaddr in infos:
         ip_str = str(sockaddr[0])
         try:
@@ -155,7 +158,9 @@ def resolve_public_addrs(url: str) -> tuple[str, List[ResolveResult]]:
 
 # 当前请求钉扎的地址：{小写主机名: [已校验的 ResolveResult]}。
 # 用 ContextVar 承载，使并发的不同请求互不干扰。
-_PINS: ContextVar[Mapping[str, List[ResolveResult]]] = ContextVar("url_guard_pins", default={})
+_PINS: ContextVar[Mapping[str, list[ResolveResult]]] = ContextVar(
+    "url_guard_pins", default=MappingProxyType({})
+)
 
 
 class PinnedResolver(AbstractResolver):
@@ -166,7 +171,7 @@ class PinnedResolver(AbstractResolver):
         host: str,
         port: int = 0,
         family: socket.AddressFamily = socket.AF_UNSPEC,
-    ) -> List[ResolveResult]:
+    ) -> list[ResolveResult]:
         addrs = _PINS.get().get(host.lower())
         if not addrs:
             raise OSError(f"目标主机未经过 SSRF 校验，已拒绝连接: {host}")
@@ -176,7 +181,7 @@ class PinnedResolver(AbstractResolver):
         return None
 
 
-def make_pinned_connector(**kwargs) -> aiohttp.TCPConnector:
+def make_pinned_connector(**kwargs: Any) -> aiohttp.TCPConnector:
     """创建启用 IP 钉扎的连接器；插件所有出网会话都应使用它。
 
     关闭 aiohttp 自带的 DNS 缓存：每个新连接都重新走钉扎逻辑，连接池复用则
@@ -186,7 +191,12 @@ def make_pinned_connector(**kwargs) -> aiohttp.TCPConnector:
     return aiohttp.TCPConnector(resolver=PinnedResolver(), **kwargs)
 
 
-def prepare_headers(prepare, url: str, method: str, cross_origin: bool) -> Dict[str, Any]:
+def prepare_headers(
+    prepare: Callable[[str, str, bool], dict] | None,
+    url: str,
+    method: str,
+    cross_origin: bool,
+) -> dict[str, Any]:
     """调用 prepare 回调取得请求参数；跨域重定向时剥离凭据类请求头。
 
     prepare 契约：prepare(url, method, cross_origin) -> dict，其中
@@ -233,7 +243,14 @@ async def read_limited_text(
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 
-async def guarded_request(session, method: str, url: str, *, max_redirects: int = 3, prepare=None):
+async def guarded_request(
+    session: aiohttp.ClientSession,
+    method: str,
+    url: str,
+    *,
+    max_redirects: int = 3,
+    prepare: Callable[[str, str, bool], dict] | None = None,
+) -> AbstractAsyncContextManager[aiohttp.ClientResponse]:
     """发起经 SSRF 校验的 HTTP 请求，手动跟随重定向并对每一跳重新校验。
 
     aiohttp 默认自动跟随重定向，只校验首跳 URL 挡不住
@@ -264,7 +281,7 @@ async def guarded_request(session, method: str, url: str, *, max_redirects: int 
         if resp.status not in REDIRECT_STATUSES:
             return resp
         location = resp.headers.get("Location", "")
-        resp.release()
+        await resp.release()
         if not location or hop == max_redirects:
             raise UrlBlockedError(f"重定向无效或次数超过上限 {max_redirects}: {url}")
         current = urljoin(current, location)

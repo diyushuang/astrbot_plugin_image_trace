@@ -18,11 +18,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 import os
 import time
 import uuid
-from typing import Any, Callable, Optional
-from urllib.parse import urlparse
+from typing import Any
+from urllib.parse import quote, urlparse
 
 import aiohttp
 
@@ -35,18 +36,18 @@ except Exception:  # 兼容独立模块加载/本地自测环境
 
 try:
     from .common import as_float, as_int
+    from .http_client import HttpClientGetter
     from .url_guard import (
         ResponseTooLargeError,
         UrlBlockedError,
-        guarded_request,
         read_limited_text,
     )
 except ImportError:  # 兼容插件以独立模块方式加载
     from common import as_float, as_int  # type: ignore[no-redef]
+    from http_client import HttpClientGetter  # type: ignore[no-redef]
     from url_guard import (  # type: ignore[no-redef]
         ResponseTooLargeError,
         UrlBlockedError,
-        guarded_request,
         read_limited_text,
     )
 
@@ -68,12 +69,16 @@ IMAGE_INPUTS = ("qwen-vl", "nemotron-vl", "dataurl", "jina-image")
 class VectorEngineError(Exception):
     """向量引擎可展示给用户的错误。"""
 
+    def __init__(self, message: str, *, detail: str | None = None):
+        super().__init__(message)
+        self.detail = detail or message
+
 
 class HttpError(VectorEngineError):
     """带 HTTP 状态码的向量服务错误（供调用方按状态码分支，如 404）。"""
 
     def __init__(self, status: int, body: str):
-        super().__init__(f"HTTP {status}: {body[:200]}")
+        super().__init__(f"服务返回 HTTP {status}", detail=f"HTTP {status}: {body[:500]}")
         self.status = status
 
 
@@ -92,16 +97,17 @@ class VectorEngine:
     def __init__(
         self,
         config,
-        session_getter: Callable[[], "aiohttp.ClientSession"],
+        http_getter: HttpClientGetter,
     ):
-        """session_getter: 异步可调用，返回共享 aiohttp.ClientSession。"""
+        """http_getter: 异步可调用，返回共享 GuardedHttpClient。"""
         raw = config.get("vector_search")
         if not isinstance(raw, dict):
             raw = {}
-        self.qdrant_url = str(raw.get("qdrant_url") or "").rstrip("/")
+        self.config_raw = raw
+        self.qdrant_url = self._normalize_base_url(raw.get("qdrant_url"))
         self.qdrant_key = str(raw.get("qdrant_api_key") or "")
         self.collection = str(raw.get("collection_name") or "imgbed_images")
-        self.embed_base_url = str(raw.get("embed_base_url") or "").rstrip("/")
+        self.embed_base_url = self._normalize_base_url(raw.get("embed_base_url"))
         self.embed_key = str(raw.get("embed_api_key") or "")
         self.embed_model = str(raw.get("embed_model") or "")
         self.image_input = str(raw.get("embed_image_input") or "qwen-vl")
@@ -117,15 +123,21 @@ class VectorEngine:
         self.input_type = str(raw.get("embed_input_type") or "passage")
         if self.input_type not in ("query", "passage"):
             self.input_type = "passage"
-        self.threshold = max(
-            0.0, min(1.0, as_float(raw.get("similarity_threshold"), 0.80))
-        )
+        self.threshold = max(0.0, min(1.0, as_float(raw.get("similarity_threshold"), 0.80)))
         self.top_k = max(1, as_int(raw.get("top_k"), 5))
         timeout_s = max(5, as_int(raw.get("request_timeout"), 30))
         self.timeout = aiohttp.ClientTimeout(total=timeout_s)
-        self._session_getter = session_getter
+        self._http_getter = http_getter
         # embed_api_key 不参与启用判定：网关未开鉴权时留空是合法场景
         self.enabled = bool(self.qdrant_url and self.embed_base_url and self.embed_model)
+
+    @staticmethod
+    def _normalize_base_url(value: object) -> str:
+        base_url = str(value or "").strip().rstrip("/")
+        if base_url and not base_url.lower().startswith(("http://", "https://")):
+            logger.warning("忽略非法向量服务地址（必须以 http/https 开头）")
+            return ""
+        return base_url
 
     # ------------------------------------------------------------------
     # 配置诊断
@@ -145,6 +157,12 @@ class VectorEngine:
             missing.append("vector_search.embed_base_url")
         if not self.embed_model:
             missing.append("vector_search.embed_model")
+        raw_qdrant_url = str(self.config_raw.get("qdrant_url") or "").strip()
+        raw_embed_url = str(self.config_raw.get("embed_base_url") or "").strip()
+        if raw_qdrant_url and not self.qdrant_url:
+            missing.append("vector_search.qdrant_url（必须以 http/https 开头）")
+        if raw_embed_url and not self.embed_base_url:
+            missing.append("vector_search.embed_base_url（必须以 http/https 开头）")
         return missing
 
     def config_hint(self) -> str:
@@ -163,10 +181,10 @@ class VectorEngine:
         method: str,
         url: str,
         *,
-        json_body: Optional[dict] = None,
-        headers: Optional[dict] = None,
+        json_body: dict | None = None,
+        headers: dict | None = None,
     ):
-        session = await self._session_getter()
+        client = await self._http_getter()
 
         def prepare(_u: str, _m: str, cross_origin: bool = False) -> dict:
             return {
@@ -177,17 +195,23 @@ class VectorEngine:
             }
 
         try:
-            async with await guarded_request(session, method, url, prepare=prepare) as resp:
+            async with await client.request(method, url, prepare=prepare) as resp:
                 text = await read_limited_text(resp)
                 status = resp.status
         except VectorEngineError:
             raise
         except UrlBlockedError as e:
-            raise VectorEngineError(f"目标地址被安全策略拒绝: {e}") from e
+            raise VectorEngineError(
+                "目标地址被安全策略拒绝",
+                detail=f"目标地址被安全策略拒绝: {e}",
+            ) from e
         except ResponseTooLargeError as e:
             raise VectorEngineError(f"响应体过大，已中止: {e}") from e
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-            raise VectorEngineError(f"网络请求失败: {url}: {e}") from e
+            raise VectorEngineError(
+                "网络请求失败（详情见日志）",
+                detail=f"网络请求失败: {url}: {e}",
+            ) from e
         return status, text
 
     async def _request_json(
@@ -195,8 +219,8 @@ class VectorEngine:
         method: str,
         url: str,
         *,
-        json_body: Optional[dict] = None,
-        headers: Optional[dict] = None,
+        json_body: dict | None = None,
+        headers: dict | None = None,
     ) -> Any:
         status, text = await self._request(method, url, json_body=json_body, headers=headers)
         if status != 200:
@@ -204,7 +228,10 @@ class VectorEngine:
         try:
             return json.loads(text)
         except ValueError as e:
-            raise VectorEngineError(f"响应不是合法 JSON: {text[:100]}") from e
+            raise VectorEngineError(
+                "服务响应不是合法 JSON",
+                detail=f"响应不是合法 JSON: {text[:500]}",
+            ) from e
 
     # ------------------------------------------------------------------
     # 向量化
@@ -248,12 +275,14 @@ class VectorEngine:
             # 与图床入库服务的图片 embed 侧保持一致
             payload["input_type"] = "passage"
         url = f"{self.embed_base_url}/embeddings"
-        session = await self._session_getter()
+        client = await self._http_getter()
 
         def prepare(_u: str, _m: str, cross_origin: bool = False) -> dict:
             # 未配置 embed_api_key 时不带鉴权头；跨域重定向时一律剥离
-            headers = {} if cross_origin else (
-                {"Authorization": f"Bearer {self.embed_key}"} if self.embed_key else {}
+            headers = (
+                {}
+                if cross_origin
+                else ({"Authorization": f"Bearer {self.embed_key}"} if self.embed_key else {})
             )
             return {
                 "json": payload,
@@ -262,7 +291,7 @@ class VectorEngine:
             }
 
         try:
-            async with await guarded_request(session, "POST", url, prepare=prepare) as resp:
+            async with await client.request("POST", url, prepare=prepare) as resp:
                 text = await read_limited_text(resp)
                 if resp.status != 200:
                     if resp.status == 429:
@@ -280,26 +309,41 @@ class VectorEngine:
                             "；模型拒绝该图片输入，请核对 embed_model 是否支持图片，"
                             "或调整 embed_image_input（qwen-vl / nemotron-vl / dataurl / jina-image）"
                         )
-                    raise VectorEngineError(f"embedding HTTP {resp.status}{hint}: {text[:200]}")
+                    raise VectorEngineError(
+                        f"向量服务 HTTP {resp.status}{hint}",
+                        detail=f"embedding HTTP {resp.status}: {text[:500]}",
+                    )
                 obj = json.loads(text)
                 emb = obj["data"][0]["embedding"]
         except VectorEngineError:
             raise
         except UrlBlockedError as e:
-            raise VectorEngineError(f"embedding 目标地址被安全策略拒绝: {e}") from e
+            raise VectorEngineError(
+                "embedding 目标地址被安全策略拒绝",
+                detail=f"embedding 目标地址被安全策略拒绝: {e}",
+            ) from e
         except ResponseTooLargeError as e:
             raise VectorEngineError(f"embedding 响应体过大，已中止: {e}") from e
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-            raise VectorEngineError(f"embedding 请求失败: {e}") from e
+            raise VectorEngineError(
+                "embedding 请求失败（详情见日志）",
+                detail=f"embedding 请求失败: {url}: {e}",
+            ) from e
         except (KeyError, IndexError, ValueError) as e:
-            raise VectorEngineError(f"embedding 响应解析失败: {e}") from e
+            raise VectorEngineError(
+                "向量服务响应解析失败",
+                detail=f"embedding 响应解析失败: {e}",
+            ) from e
 
         if not isinstance(emb, list) or not emb:
             raise VectorEngineError("embedding 响应缺少 data[0].embedding")
         for n in emb:
             if not isinstance(n, (int, float)):
                 raise VectorEngineError("embedding 结果含非数值元素")
-        return [float(n) for n in emb]
+        vector = [float(n) for n in emb]
+        if any(not math.isfinite(value) for value in vector):
+            raise VectorEngineError("向量服务返回了非有限数值")
+        return vector
 
     async def embed_file(self, path: str) -> list:
         data = await asyncio.to_thread(_read_bytes, path)
@@ -312,24 +356,57 @@ class VectorEngine:
     def _qd_headers(self) -> dict:
         return {"api-key": self.qdrant_key} if self.qdrant_key else {}
 
-    async def search(self, vector: list, limit: Optional[int] = None) -> list:
+    def _points_url(self, operation: str = "") -> str:
+        collection = quote(self.collection, safe="")
+        url = f"{self.qdrant_url}/collections/{collection}/points"
+        return f"{url}/{operation}" if operation else url
+
+    async def search(self, vector: list, limit: int | None = None) -> list:
         """Qdrant 相似度检索，返回 [{id, score, payload}] 列表。
 
         返回的是 Qdrant 原始分数（未做阈值过滤，排序由 Qdrant 给出）；
         阈值过滤与排序展示由调用方完成。
         """
-        url = f"{self.qdrant_url}/collections/{self.collection}/points/search"
-        body = {
-            "vector": vector,
-            "limit": limit or self.top_k,
-            "with_payload": True,
-        }
-        obj = await self._request_json("POST", url, json_body=body, headers=self._qd_headers())
-        result = obj.get("result") or []
-        if not isinstance(result, list):
-            return []
+        if (
+            not isinstance(vector, list)
+            or not vector
+            or any(
+                not isinstance(value, (int, float)) or not math.isfinite(value) for value in vector
+            )
+        ):
+            raise VectorEngineError("查询向量无效")
+        effective_limit = self.top_k if limit is None else max(1, limit)
+        try:
+            obj = await self._request_json(
+                "POST",
+                self._points_url("query"),
+                json_body={
+                    "query": vector,
+                    "limit": effective_limit,
+                    "with_payload": True,
+                },
+                headers=self._qd_headers(),
+            )
+            result = obj.get("result") or {}
+            raw_hits = result.get("points", []) if isinstance(result, dict) else []
+        except HttpError as exc:
+            if exc.status != 404:
+                raise
+            obj = await self._request_json(
+                "POST",
+                self._points_url("search"),
+                json_body={
+                    "vector": vector,
+                    "limit": effective_limit,
+                    "with_payload": True,
+                },
+                headers=self._qd_headers(),
+            )
+            raw_hits = obj.get("result") or []
+        if not isinstance(raw_hits, list):
+            raw_hits = []
         hits = []
-        for h in result:
+        for h in raw_hits:
             if not isinstance(h, dict):
                 continue
             payload = h.get("payload") or {}
@@ -348,7 +425,7 @@ class VectorEngine:
 
     async def count(self) -> int:
         """返回集合点数；集合不存在按 0；连接/鉴权失败抛 VectorEngineError。"""
-        url = f"{self.qdrant_url}/collections/{self.collection}/points/count"
+        url = self._points_url("count")
         try:
             obj = await self._request_json(
                 "POST", url, json_body={"exact": True}, headers=self._qd_headers()
@@ -357,7 +434,7 @@ class VectorEngine:
             return int((obj.get("result") or {}).get("count") or 0)
         except HttpError as e:
             # 按状态码判定集合缺失，避免响应体偶然含 "404" 字样时误判
-            if e.status == 404 or "doesn't exist" in str(e):
+            if e.status == 404:
                 return 0
             raise
 
@@ -376,8 +453,8 @@ class VectorEngine:
         point_key: str,
         image_url: str,
         file_size: int,
-        width: Optional[int],
-        height: Optional[int],
+        width: int | None,
+        height: int | None,
         src: str = "",
     ) -> None:
         """写入/覆盖一个向量点。
@@ -401,7 +478,7 @@ class VectorEngine:
         }
         # Qdrant point ID 只接受整数或 UUID；用 UUID5 从内容指纹派生，保证幂等
         point_id = self.point_id_for(point_key)
-        url = f"{self.qdrant_url}/collections/{self.collection}/points?wait=true"
+        url = f"{self._points_url()}?wait=true"
         body = {"points": [{"id": point_id, "vector": vector, "payload": payload}]}
         await self._request_json("PUT", url, json_body=body, headers=self._qd_headers())
 
@@ -411,7 +488,7 @@ class VectorEngine:
         只清理插件侧以同规则写入的点（point_key = f"phash:{phash}"）；
         图床侧钩子写入的点使用图床自己的 key 约定，其清理需在图床侧完成。
         """
-        url = f"{self.qdrant_url}/collections/{self.collection}/points/delete?wait=true"
+        url = f"{self._points_url('delete')}?wait=true"
         body = {"points": [self.point_id_for(point_key)]}
         try:
             await self._request_json("POST", url, json_body=body, headers=self._qd_headers())

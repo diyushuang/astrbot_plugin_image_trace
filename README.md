@@ -1,6 +1,6 @@
 # astrbot_plugin_image_trace 图片溯源
 
-[![version](https://img.shields.io/badge/version-v1.3.2-blue)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.3.3-blue)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](./LICENSE)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
@@ -99,7 +99,17 @@ flowchart LR
 
 ## 向量引擎（Qdrant + 多模态向量 AI，v1.2.0）
 
-典型部署：图床（如 CloudFlare-ImgBed）与 Qdrant 跑在服务器上——**图床每上传一张图，由图床侧钩子/入库服务实时调向量 AI 算向量并写入 Qdrant**（入库侧属服务器侧部署，不属本插件范畴）；本插件只负责查询侧：收到 `/溯源` 图后调同一个向量 AI 向量化，再 `points/search` 检索，相似度 ≥ 阈值即把 Qdrant payload 里的图床原图 URL 回传（payload 需含原图直链 `image_url` 字段）。
+典型部署：图床（如 CloudFlare-ImgBed）与 Qdrant 跑在服务器上——**图床每上传一张图，由图床侧钩子/入库服务实时调向量 AI 算向量并写入 Qdrant**（入库侧属服务器侧部署，不属本插件范畴）；本插件只负责查询侧：收到 `/溯源` 图后调同一个向量 AI 向量化，再优先调用 Qdrant Query API `points/query` 检索（旧版服务端自动回退 `points/search`），相似度 ≥ 阈值即把 Qdrant payload 里的图床原图 URL 回传（payload 需含原图直链 `image_url` 字段）。
+
+**Qdrant 兼容矩阵（1.3.3 起）**
+
+| Qdrant 版本 | 检索接口 | 说明 |
+| --- | --- | --- |
+| 1.0 ~ 1.9 | `POST /points/search` | Query API 返回 404 时自动回退 |
+| 1.10 ~ 1.18 | `POST /points/query` | 优先使用官方 Query API |
+| 1.19+ | `POST /points/query` | `points/search` 已移除，必须使用 Query API |
+
+集合需使用默认未命名向量；若使用命名向量或多向量，需要在入库侧与查询侧统一调整请求结构。
 
 **为什么插件也要填向量 AI？** Qdrant 向量库里只存"向量数字"，不存图片本身。`/溯源` 时插件收到的是一张查询图，必须先用与入库侧**相同**的多模态向量 AI 把这张查询图转成向量，才能去 Qdrant 检索——没有这一步，向量库无法比对图片。因此 `embed_base_url` / `embed_model` 必填（`embed_api_key` 在网关未开启鉴权时可留空），且必须与入库侧一致，否则两边向量不在同一空间、相似度无意义。
 
@@ -246,7 +256,7 @@ v1.3.0 起，两种对象存储从图床模式中独立为单独的**储存桶�
 | `ai_verify` | `false` | 是否用视觉大模型复核命中结果 |
 | `register_admin_only` | `true` | 仅管理员可登记原图 |
 | `advanced_settings` | `false` | 面板收纳开关：开启后才显示下方四个进阶项 |
-| `hash_size` | `16` | pHash 精度：16→256bit（推荐），8→64bit；**取值必须为 4~32 之间 4 的倍数**；修改后需 `/溯源重扫 force` |
+| `hash_size` | `16` | pHash 精度：16→256bit（推荐）；可选 4/8/12/16/20/24/28/32，均为 4 的倍数；修改后需 `/溯源重扫 force` |
 | `top_n` | `3` | 未命中时提示的最接近候选数，0 表示不提示 |
 | `max_images_per_query` | `3` | 单次溯源最大处理图片数 |
 | `max_download_mb` | `20` | 单张图片大小上限（MB） |
@@ -261,17 +271,18 @@ v1.3.0 起，两种对象存储从图床模式中独立为单独的**储存桶�
 
 ## 项目结构与开发
 
-代码按职责拆分为 8 个模块，依赖方向单向（`main` → 各子模块；子模块 → `common` / `url_guard`）：
+代码按职责拆分为 9 个模块，依赖方向单向（`main` → 各子模块；子模块 → `common` / `http_client` / `url_guard`）：
 
 | 文件 | 职责 | 关键约束 |
 | --- | --- | --- |
 | `main.py` | 插件入口：指令、图片提取、引擎调度、AI 复核、生命周期 | auto 引擎的"向量优先、失败回退哈希"由本层编排 |
+| `http_client.py` | 共享受管 HTTP 客户端 | 统一持有启用 IP pinning 的 `aiohttp` 会话 |
 | `features.py` | pHash / dHash / aHash 感知特征计算（纯 Pillow + numpy） | pHash 十六进制长度统一由 `phash_hex_len()` 提供，任何处不得自行推导 |
 | `library.py` | SQLite 图库 + 内存哈希位矩阵检索 | 写路径持锁，缓存整体替换 + 快照读；重操作需经 `asyncio.to_thread` 调用 |
 | `image_bed.py` | 图床与储存桶各模式的上传、直链反解、远端删除 | 上传失败一律回退本地副本，登记流程不中断 |
 | `s3_store.py` | 纯标准库 AWS SigV4 签名 + 最小 S3 兼容客户端 | 签名与 URL/方法绑定，被重定向即报错而非复用签名 |
 | `vector_search.py` | Qdrant 检索 + OpenAI 兼容 embeddings 客户端 | embed 三值须与图床入库侧一致；错误统一归为 `VectorEngineError` |
-| `url_guard.py` | SSRF 防护：逐跳校验、IP 钉扎、响应限长 | 所有出网会话必须用 `make_pinned_connector()` 建连接器 |
+| `url_guard.py` | SSRF 防护：逐跳校验、IP 钉扎、响应限长 | 所有出网经共享 HTTP 客户端调用，不绕过防护 |
 | `common.py` | 配置解析工具与共享常量 | 真值表/常量只在此维护一份，各模块不得自备 |
 
 两条核心数据流：
@@ -285,7 +296,7 @@ v1.3.0 起，两种对象存储从图床模式中独立为单独的**储存桶�
 
 /溯源：
   图片段 → _resolve_local_file
-        → 向量引擎：embed_file → Qdrant points/search → 阈值过滤（命中全回传）
+        → 向量引擎：embed_file → Qdrant points/query（旧版回退 points/search）→ 阈值过滤（命中全回传）
         或 哈希引擎：library.search（汉明距离）→ 阈值过滤 → 可选 AI 复核
         → 回传原图（直链优先，其次本地文件）
 ```
@@ -335,7 +346,7 @@ v1.3.0 起，两种对象存储从图床模式中独立为单独的**储存桶�
 - Issue 请附 `/溯源状态` 输出与关键日志（注意先脱敏，不要贴 Key / 内网地址）；
 - 开发约束见「项目结构与开发」：出网一律经 `url_guard`，配置解析用 `common`，
   群聊回复文案脱敏，SQLite / 大文件等重操作包 `asyncio.to_thread`；
-- 提交前确认 `metadata.yaml` 与 `main.py` 顶部 `@register(...)` 的版本号一致。
+- 提交前确认 `metadata.yaml` 的 `version` 使用无 `v` 前缀的 SemVer，并与 `CHANGELOG.md` 一致。
 
 ## 许可证
 

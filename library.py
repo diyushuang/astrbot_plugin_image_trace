@@ -16,7 +16,6 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
 
@@ -62,20 +61,22 @@ _INSERT_SQL = (
 class MatchResult:
     id: int
     similarity: float
-    image_url: Optional[str]
-    file_path: Optional[str]
-    note: Optional[str]
-    source: Optional[str]
-    width: Optional[int]
-    height: Optional[int]
-    created_at: Optional[str]
+    image_url: str | None
+    file_path: str | None
+    note: str | None
+    source: str | None
+    width: int | None
+    height: int | None
+    created_at: str | None
 
 
 def _under_any(path: str, dirs: set) -> bool:
     """path 是否位于 dirs 中任一目录之下（含大小写/分隔符归一化）。"""
+    normalized_path = os.path.normcase(os.path.abspath(path))
     for d in dirs:
         try:
-            if os.path.commonpath([path, d]) == d:
+            normalized_dir = os.path.normcase(os.path.abspath(d))
+            if os.path.commonpath([normalized_path, normalized_dir]) == normalized_dir:
                 return True
         except ValueError:  # Windows 跨盘符等无法比较根的情形
             continue
@@ -85,7 +86,7 @@ def _under_any(path: str, dirs: set) -> bool:
 class ImageLibrary:
     """本地图库：SQLite 元数据 + 内存哈希位矩阵。"""
 
-    def __init__(self, db_path: str, expected_phash_hex_len: Optional[int] = None):
+    def __init__(self, db_path: str, expected_phash_hex_len: int | None = None):
         self.db_path = db_path
         # 与当前 hash_size 匹配的 pHash 十六进制长度（统一由
         # features.phash_hex_len 计算）；不匹配的旧数据留在库中但不参与检索
@@ -111,20 +112,16 @@ class ImageLibrary:
         v1 -> v2：v1 的 phash 无唯一约束，重复登记/并发重扫可能产生重复行；
         迁移时每个 phash 保留最早一条，再建唯一索引使后续写入天然幂等。
         """
-        row = self._conn.execute(
-            "SELECT value FROM meta WHERE key = 'schema_version'"
-        ).fetchone()
+        row = self._conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
         version = int(row["value"]) if row else 1
         if version >= _SCHEMA_VERSION:
             return
         if version < 2:
             self._conn.execute(
-                "DELETE FROM images WHERE id NOT IN"
-                " (SELECT MIN(id) FROM images GROUP BY phash)"
+                "DELETE FROM images WHERE id NOT IN (SELECT MIN(id) FROM images GROUP BY phash)"
             )
             self._conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_images_phash_unique"
-                " ON images (phash)"
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_images_phash_unique ON images (phash)"
             )
         self._conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
@@ -135,9 +132,7 @@ class ImageLibrary:
     def _reload_cache(self) -> None:
         """从数据库重建内存哈希矩阵（整体替换，读侧取快照）。"""
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT id, phash FROM images ORDER BY id"
-            ).fetchall()
+            rows = self._conn.execute("SELECT id, phash FROM images ORDER BY id").fetchall()
         ids: list = []
         raw_parts: list = []
         skipped = 0
@@ -216,6 +211,14 @@ class ImageLibrary:
                 return None, dup
             cursor = self._conn.execute(_INSERT_SQL, params)
             self._conn.commit()
+            if cursor.rowcount == 0:
+                dup = self._conn.execute(
+                    "SELECT * FROM images WHERE phash = ? LIMIT 1",
+                    (row.get("phash", ""),),
+                ).fetchone()
+                if dup is not None:
+                    return None, dup
+                raise RuntimeError("插入图库记录失败：唯一索引冲突但未找到重复记录")
             entry_id = int(cursor.lastrowid)
         self._reload_cache()
         return entry_id, None
@@ -241,7 +244,7 @@ class ImageLibrary:
         inserted = 0
         with self._lock:
             for start in range(0, len(params), max(1, batch_size)):
-                cursor = self._conn.executemany(_INSERT_SQL, params[start:start + batch_size])
+                cursor = self._conn.executemany(_INSERT_SQL, params[start : start + batch_size])
                 self._conn.commit()
                 inserted += max(0, cursor.rowcount)
         if reload_cache:
@@ -263,24 +266,22 @@ class ImageLibrary:
 
     def delete_by_source(self, source: str) -> int:
         with self._lock:
-            cursor = self._conn.execute(
-                "DELETE FROM images WHERE source = ?", (source,)
-            )
+            cursor = self._conn.execute("DELETE FROM images WHERE source = ?", (source,))
             self._conn.commit()
             deleted = cursor.rowcount
         if deleted:
             self._reload_cache()
         return deleted
 
-    def prune_scan_missing(self, keep_paths: set, scanned_dirs: Optional[set] = None) -> int:
+    def prune_scan_missing(self, keep_paths: set, scanned_dirs: set | None = None) -> int:
         """删除来源为 scan、文件路径不在 keep_paths 中的条目，返回删除数量。
 
         scanned_dirs 限定清理范围：只处理 file_path 落在这些目录之下的
         条目。目录临时不可见（网络盘/移动盘掉线）时该目录不会进入
         scanned_dirs，其中的索引不会被误清，恢复后无需全量重扫。
         """
-        keep = {os.path.normcase(p) for p in keep_paths}
-        dirs = {os.path.normcase(d) for d in (scanned_dirs or set())}
+        keep = {os.path.normcase(os.path.abspath(p)) for p in keep_paths}
+        dirs = {os.path.normcase(os.path.abspath(d)) for d in (scanned_dirs or set())}
         with self._lock:
             rows = self._conn.execute(
                 "SELECT id, file_path FROM images WHERE source = 'scan'"
@@ -310,9 +311,7 @@ class ImageLibrary:
     def stats(self) -> dict:
         ids, _matrix, _bits, skipped = self._cache
         with self._lock:
-            total_row = self._conn.execute(
-                "SELECT COUNT(*) AS c FROM images"
-            ).fetchone()
+            total_row = self._conn.execute("SELECT COUNT(*) AS c FROM images").fetchone()
             source_rows = self._conn.execute(
                 "SELECT source, COUNT(*) AS c FROM images GROUP BY source"
             ).fetchall()
@@ -323,11 +322,9 @@ class ImageLibrary:
             "skipped": skipped,
         }
 
-    def get(self, entry_id: int) -> Optional[sqlite3.Row]:
+    def get(self, entry_id: int) -> sqlite3.Row | None:
         with self._lock:
-            return self._conn.execute(
-                "SELECT * FROM images WHERE id = ?", (entry_id,)
-            ).fetchone()
+            return self._conn.execute("SELECT * FROM images WHERE id = ?", (entry_id,)).fetchone()
 
     def get_many(self, entry_ids: list) -> list:
         """按 id 批量取回整行（检索 top-N 回表用，避免逐条查询）。"""
@@ -340,7 +337,7 @@ class ImageLibrary:
                 tuple(entry_ids),
             ).fetchall()
 
-    def find_by_phash(self, phash: str) -> Optional[sqlite3.Row]:
+    def find_by_phash(self, phash: str) -> sqlite3.Row | None:
         """按 pHash 精确查找（用于登记去重的快速预检）。"""
         with self._lock:
             return self._conn.execute(
@@ -375,7 +372,7 @@ class ImageLibrary:
         wanted = [ids[int(idx)] for idx in order]
         by_id = {r["id"]: r for r in self.get_many(wanted)}
         results: list = []
-        for idx, entry_id in zip(order, wanted):
+        for idx, entry_id in zip(order, wanted, strict=True):
             row = by_id.get(entry_id)
             if row is None:
                 continue

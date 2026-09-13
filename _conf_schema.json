@@ -440,7 +440,7 @@
   "hash_size": {
     "description": "【选填】感知哈希精度",
     "type": "int",
-    "options": [8, 16],
+    "options": [4, 8, 12, 16, 20, 24, 28, 32],
     "default": 16,
     "condition": {
       "advanced_settings": true

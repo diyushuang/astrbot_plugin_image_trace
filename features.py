@@ -13,27 +13,20 @@
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
+from functools import cache
 
 import numpy as np
 from PIL import Image, ImageOps
 
-# 防解压炸弹：放宽 Pillow 默认的像素数告警阈值。放在模块级是因为 Pillow
-# 按图片打开时的全局值判断，无法按单张图覆盖；这会影响宿主进程内其它
-# Pillow 使用方（仅放宽告警阈值，真正的 DecompressionBombError 仍在两倍
-# 值处抛出）。超限拒绝逻辑见 _load_rgb 的像素数预检。
-Image.MAX_IMAGE_PIXELS = 50_000_000
-_MAX_LOAD_PIXELS = 100_000_000  # 告警阈值的两倍：达到 DecompressionBombError 前先拒绝
+# 防解压炸弹：打开后、解码前先按尺寸拒绝；不修改 Pillow 的进程级全局配置。
+_MAX_LOAD_PIXELS = 50_000_000
 
 try:  # Pillow >= 9.1
     _RESAMPLE = Image.Resampling.LANCZOS
 except AttributeError:  # 旧版本兜底
     _RESAMPLE = Image.LANCZOS
-
-# DCT 正交矩阵缓存，key 为矩阵边长。compute_features 在 to_thread 中并发
-# 首次遇到同一尺寸时会重复计算一次（CPython 下良性竞争，结果一致），
-# 因此不加锁。
-_DCT_CACHE: dict[int, np.ndarray] = {}
 
 
 def phash_hex_len(hash_size: int) -> int:
@@ -56,31 +49,25 @@ class ImageFeatures:
     height: int
 
 
+@cache
 def _dct_matrix(n: int) -> np.ndarray:
     """归一化正交 DCT-II 变换矩阵。"""
-    mat = _DCT_CACHE.get(n)
-    if mat is None:
-        k = np.arange(n, dtype=np.float64)
-        mat = np.cos(np.pi * (2 * k[None, :] + 1) * k[:, None] / (2 * n))
-        mat[0, :] *= np.sqrt(1.0 / n)
-        mat[1:, :] *= np.sqrt(2.0 / n)
-        _DCT_CACHE[n] = mat
+    k = np.arange(n, dtype=np.float64)
+    mat = np.cos(np.pi * (2 * k[None, :] + 1) * k[:, None] / (2 * n))
+    mat[0, :] *= np.sqrt(1.0 / n)
+    mat[1:, :] *= np.sqrt(2.0 / n)
     return mat
 
 
 def _load_rgb(path: str) -> Image.Image:
     with Image.open(path) as src:  # with 退出时释放原文件句柄
         if src.width * src.height > _MAX_LOAD_PIXELS:
-            raise ValueError(
-                f"图片像素数 {src.width}x{src.height} 超过上限 {_MAX_LOAD_PIXELS}"
-            )
+            raise ValueError(f"图片像素数 {src.width}x{src.height} 超过上限 {_MAX_LOAD_PIXELS}")
         im = src
-        try:
-            im = ImageOps.exif_transpose(im)  # 总是返回新对象（副本/转正副本）
-        except Exception:
-            pass
-        if getattr(im, "is_animated", False):  # 动图取第一帧
+        if getattr(im, "is_animated", False):  # 动图先取首帧，再处理方向
             im.seek(0)
+        with contextlib.suppress(Exception):
+            im = ImageOps.exif_transpose(im)  # 总是返回新对象（副本/转正副本）
         if im.mode not in ("RGB", "L"):  # 灰度图不必经 RGB 往返
             im = im.convert("RGB")
         elif im is src:

@@ -31,24 +31,23 @@ import os
 import secrets
 import shutil
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple
+from typing import Any
 from urllib.parse import quote, unquote, urlencode, urlparse
 
 import aiohttp
 
 try:
-    from .common import USER_AGENT, truthy
+    from .common import USER_AGENT, as_int, truthy
+    from .http_client import GuardedHttpClient
     from .s3_store import S3CompatClient
-    from .url_guard import guarded_request, make_pinned_connector, read_limited_text
+    from .url_guard import read_limited_text
 except ImportError:  # 兼容插件以独立模块方式加载
-    from common import USER_AGENT, truthy  # type: ignore[no-redef]
+    from common import USER_AGENT, as_int, truthy  # type: ignore[no-redef]
+    from http_client import GuardedHttpClient  # type: ignore[no-redef]
     from s3_store import S3CompatClient  # type: ignore[no-redef]
-    from url_guard import (  # type: ignore[no-redef]
-        guarded_request,
-        make_pinned_connector,
-        read_limited_text,
-    )
+    from url_guard import read_limited_text  # type: ignore[no-redef]
 
 try:
     from astrbot.api import logger
@@ -67,8 +66,8 @@ MODE_CFB = "cloudflare_imgbed"
 @dataclass
 class StoreResult:
     ok: bool
-    url: Optional[str] = None  # 图床直链（若有）
-    file_path: Optional[str] = None  # 本地文件路径（若有）
+    url: str | None = None  # 图床直链（若有）
+    file_path: str | None = None  # 本地文件路径（若有）
     message: str = ""
 
 
@@ -98,7 +97,7 @@ def _public_url(base: str, key: str) -> str:
     return f"{base.rstrip('/')}/{quote(key)}"
 
 
-def _host_port(parsed) -> Tuple[str, Optional[int]]:
+def _host_port(parsed) -> tuple[str, int | None]:
     """URL 的归一化 (主机名小写, 端口)，端口缺省按协议补全。"""
     try:
         port = parsed.port
@@ -122,12 +121,18 @@ def _read_bytes(path: str) -> bytes:
 
 
 class ImageBedClient:
-    def __init__(self, data_dir: str, bed_config: dict):
+    def __init__(
+        self,
+        data_dir: str,
+        bed_config: dict,
+        http_getter: Callable[[], Awaitable[GuardedHttpClient]],
+    ):
         self.mode = str(bed_config.get("mode") or MODE_LOCAL).strip()
         self.config = bed_config or {}
         self.local_dir = os.path.join(data_dir, "images")
         os.makedirs(self.local_dir, exist_ok=True)
-        # S3 兼容客户端按模式缓存复用（会话懒建，close() 统一释放）
+        self._http_getter = http_getter
+        # S3 兼容客户端按模式缓存复用；HTTP 会话由共享客户端统一释放
         self._s3_clients: dict = {}
 
     # ---------- 对外接口 ----------
@@ -139,22 +144,24 @@ class ImageBedClient:
                 url = await self._upload(src_path)
                 return StoreResult(ok=True, url=url, message="已上传至图床")
             except Exception as e:
+                logger.warning(f"图床上传失败: {e}", exc_info=True)
                 local = await self._copy_local(src_path)
                 return StoreResult(
                     ok=True,
                     file_path=local,
-                    message=f"图床上传失败，已保存本地副本（{e}）",
+                    message="图床上传失败，已保存本地副本（详情见日志）",
                 )
         if self.mode == MODE_CFB:
             try:
                 url = await self._upload_cf(src_path)
                 return StoreResult(ok=True, url=url, message="已上传至 CloudFlare-ImgBed")
             except Exception as e:
+                logger.warning(f"CloudFlare-ImgBed 上传失败: {e}", exc_info=True)
                 local = await self._copy_local(src_path)
                 return StoreResult(
                     ok=True,
                     file_path=local,
-                    message=f"CloudFlare-ImgBed 上传失败，已保存本地副本（{e}）",
+                    message="CloudFlare-ImgBed 上传失败，已保存本地副本（详情见日志）",
                 )
         if self.mode in (MODE_R2, MODE_OCI):
             provider = "Cloudflare R2" if self.mode == MODE_R2 else "OCI 对象存储"
@@ -162,11 +169,12 @@ class ImageBedClient:
                 url = await self._upload_object(src_path)
                 return StoreResult(ok=True, url=url, message=f"已上传至{provider}")
             except Exception as e:
+                logger.warning(f"{provider}上传失败: {e}", exc_info=True)
                 local = await self._copy_local(src_path)
                 return StoreResult(
                     ok=True,
                     file_path=local,
-                    message=f"{provider}上传失败，已保存本地副本（{e}）",
+                    message=f"{provider}上传失败，已保存本地副本（详情见日志）",
                 )
         local = await self._copy_local(src_path)
         if self.mode != MODE_LOCAL:
@@ -211,7 +219,7 @@ class ImageBedClient:
                 prefix = base_parsed.path.rstrip("/") + "/file/"
                 if not parsed.path.startswith(prefix):
                     return False
-                file_id = unquote(parsed.path[len(prefix):])
+                file_id = unquote(parsed.path[len(prefix) :])
                 if not file_id:
                     return False
                 token = str(self.config.get("cfi_token") or "").strip()
@@ -228,7 +236,7 @@ class ImageBedClient:
                 prefix = base_parsed.path.rstrip("/") + "/"
                 if not parsed.path.startswith(prefix):
                     return False
-                key = unquote(parsed.path[len(prefix):])
+                key = unquote(parsed.path[len(prefix) :])
                 if not key:
                     return False
                 client, bucket = self._r2_client()
@@ -262,7 +270,7 @@ class ImageBedClient:
                 base_parsed = urlparse(base)
                 prefix = base_parsed.path.rstrip("/") + "/file/"
                 if _same_origin(parsed, base_parsed) and parsed.path.startswith(prefix):
-                    return f"/file/{unquote(parsed.path[len(prefix):])}"
+                    return f"/file/{unquote(parsed.path[len(prefix) :])}"
             elif self.mode == MODE_R2:
                 base = self._public_base("r2_public_base_url", "r2_public_base_url")
                 if base:
@@ -270,7 +278,7 @@ class ImageBedClient:
                     if _same_origin(parsed, base_parsed):
                         prefix = base_parsed.path.rstrip("/") + "/"
                         if parsed.path.startswith(prefix):
-                            key = unquote(parsed.path[len(prefix):])
+                            key = unquote(parsed.path[len(prefix) :])
                             if key:
                                 return key
             elif self.mode == MODE_OCI:
@@ -282,10 +290,8 @@ class ImageBedClient:
         return image_url
 
     async def close(self) -> None:
-        """释放缓存的 S3 客户端会话（插件卸载时调用）。"""
-        for client, _bucket in self._s3_clients.values():
-            await client.aclose()
-        self._s3_clients.clear()
+        """保留兼容；HTTP 会话由共享客户端统一释放。"""
+        return None
 
     # ---------- 通用 HTTP 图床 ----------
 
@@ -294,7 +300,7 @@ class ImageBedClient:
         dest = os.path.join(
             self.local_dir, f"{time.strftime('%Y%m%d')}_{secrets.token_hex(8)}{ext}"
         )
-        # 最大 20MB 的整文件复制，放到线程里避免阻塞事件循环
+        # 文件复制放到线程里避免阻塞事件循环；大小上游已校验
         await asyncio.to_thread(shutil.copyfile, src_path, dest)
         return dest
 
@@ -336,14 +342,12 @@ class ImageBedClient:
             form.add_field(field, file_bytes, filename=filename, content_type=content_type)
             return {"data": form, "headers": headers}
 
-        timeout = aiohttp.ClientTimeout(total=int(self.config.get("timeout") or 30))
-        async with aiohttp.ClientSession(
-            timeout=timeout, connector=make_pinned_connector()
-        ) as session:
-            async with await guarded_request(session, "POST", api_url, prepare=prepare) as resp:
-                body = await read_limited_text(resp)
-                if not 200 <= resp.status < 300:
-                    raise RuntimeError(f"图床返回 HTTP {resp.status}: {body[:200]}")
+        timeout = aiohttp.ClientTimeout(total=max(5, as_int(self.config.get("timeout"), 30)))
+        client = await self._http_getter()
+        async with await client.request("POST", api_url, prepare=prepare, timeout=timeout) as resp:
+            body = await read_limited_text(resp)
+            if not 200 <= resp.status < 300:
+                raise RuntimeError(f"图床返回 HTTP {resp.status}: {body[:500]}")
 
         try:
             payload = json.loads(body)
@@ -417,14 +421,12 @@ class ImageBedClient:
             form.add_field("file", file_bytes, filename=filename, content_type=content_type)
             return {"data": form, "headers": headers}
 
-        timeout = aiohttp.ClientTimeout(total=int(self.config.get("timeout") or 30))
-        async with aiohttp.ClientSession(
-            timeout=timeout, connector=make_pinned_connector()
-        ) as session:
-            async with await guarded_request(session, "POST", api_url, prepare=prepare) as resp:
-                body = await read_limited_text(resp)
-                if not 200 <= resp.status < 300:
-                    raise RuntimeError(f"CloudFlare-ImgBed 返回 HTTP {resp.status}: {body[:200]}")
+        timeout = aiohttp.ClientTimeout(total=max(5, as_int(self.config.get("timeout"), 30)))
+        client = await self._http_getter()
+        async with await client.request("POST", api_url, prepare=prepare, timeout=timeout) as resp:
+            body = await read_limited_text(resp)
+            if not 200 <= resp.status < 300:
+                raise RuntimeError(f"CloudFlare-ImgBed 返回 HTTP {resp.status}: {body[:500]}")
 
         try:
             payload = json.loads(body)
@@ -435,10 +437,7 @@ class ImageBedClient:
         src = str(payload[0].get("src") or "").strip()
         if not src:
             raise RuntimeError(f"上传响应缺少 src 字段: {body[:200]}")
-        if src.startswith(("http://", "https://")):
-            url = src
-        else:
-            url = f"{base}/{src.lstrip('/')}"
+        url = src if src.startswith(("http://", "https://")) else f"{base}/{src.lstrip('/')}"
         if not url.startswith(("http://", "https://")):
             raise RuntimeError(f"未能从上传响应提取到图片直链: {body[:200]}")
         return url
@@ -460,16 +459,14 @@ class ImageBedClient:
                 "headers": {**headers, "Content-Type": "application/json"},
             }
 
-        timeout = aiohttp.ClientTimeout(total=int(self.config.get("timeout") or 30))
-        async with aiohttp.ClientSession(
-            timeout=timeout, connector=make_pinned_connector()
-        ) as session:
-            async with await guarded_request(session, "POST", api_url, prepare=prepare) as resp:
-                resp_body = await read_limited_text(resp)
-                if not 200 <= resp.status < 300:
-                    raise RuntimeError(
-                        f"CloudFlare-ImgBed 删除返回 HTTP {resp.status}: {resp_body[:200]}"
-                    )
+        timeout = aiohttp.ClientTimeout(total=max(5, as_int(self.config.get("timeout"), 30)))
+        client = await self._http_getter()
+        async with await client.request("POST", api_url, prepare=prepare, timeout=timeout) as resp:
+            resp_body = await read_limited_text(resp)
+            if not 200 <= resp.status < 300:
+                raise RuntimeError(
+                    f"CloudFlare-ImgBed 删除返回 HTTP {resp.status}: {resp_body[:500]}"
+                )
         try:
             payload = json.loads(resp_body)
         except json.JSONDecodeError:
@@ -479,7 +476,7 @@ class ImageBedClient:
     # ---------- 对象存储（R2 / OCI，S3 兼容 API） ----------
 
     @staticmethod
-    def _object_name(src_path: str) -> Tuple[str, str]:
+    def _object_name(src_path: str) -> tuple[str, str]:
         """生成对象名与 Content-Type（形如 trace_20260906_ab12cd34ef56ab78.jpg）。"""
         ext = os.path.splitext(src_path)[1].lower() or ".jpg"
         key = f"trace_{time.strftime('%Y%m%d')}_{secrets.token_hex(8)}{ext}"
@@ -492,7 +489,7 @@ class ImageBedClient:
         if missing:
             raise ValueError(f"缺少必填配置: {'、'.join(missing)}")
 
-    def _r2_client(self) -> Tuple[S3CompatClient, str]:
+    def _r2_client(self) -> tuple[S3CompatClient, str]:
         cached = self._s3_clients.get("r2")
         if cached is not None:
             return cached
@@ -517,12 +514,13 @@ class ImageBedClient:
             access_key,
             secret_key,
             region="auto",  # R2 官方文档：签名 region 固定为 auto
-            timeout=int(cfg.get("timeout") or 30),
+            timeout=max(5, as_int(cfg.get("timeout"), 30)),
+            http_getter=self._http_getter,
         )
         self._s3_clients["r2"] = (client, bucket)
         return client, bucket
 
-    def _oci_client(self) -> Tuple[S3CompatClient, str]:
+    def _oci_client(self) -> tuple[S3CompatClient, str]:
         cached = self._s3_clients.get("oci")
         if cached is not None:
             return cached
@@ -550,7 +548,8 @@ class ImageBedClient:
             access_key,
             secret_key,
             region=region,  # 签名 region 使用 OCI 区域标识
-            timeout=int(cfg.get("timeout") or 30),
+            timeout=max(5, as_int(cfg.get("timeout"), 30)),
+            http_getter=self._http_getter,
         )
         self._s3_clients["oci"] = (client, bucket)
         return client, bucket
@@ -600,7 +599,7 @@ class ImageBedClient:
                 hosts.add(host.lower())
         return hosts
 
-    def _oci_key_from_url(self, image_url: str) -> Tuple[str, bool]:
+    def _oci_key_from_url(self, image_url: str) -> tuple[str, bool]:
         """从 OCI 公开直链反解对象名；仅接受与当前配置同源的 URL。
 
         必须校验主机：否则任何形如 https://任意域名/n/<命名空间>/b/<桶>/o/<对象名>
@@ -619,7 +618,7 @@ class ImageBedClient:
             if _same_origin(parsed, base_parsed):
                 prefix = base_parsed.path.rstrip("/") + "/"
                 if key_path.startswith(prefix):
-                    key = unquote(key_path[len(prefix):])
+                    key = unquote(key_path[len(prefix) :])
                     if key:
                         return key, True
 
@@ -632,11 +631,16 @@ class ImageBedClient:
             if len(parts) == 2 and key_path.startswith("/n/"):
                 seg = parts[0].strip("/").split("/")
                 # /n/{namespace}/b/{bucket}/o/{key}
-                if len(seg) == 4 and seg[0] == "n" and seg[2] == "b":
-                    if seg[1] == namespace and seg[3] == bucket:
-                        key = unquote(parts[1])
-                        if key:
-                            return key, True
+                if (
+                    len(seg) == 4
+                    and seg[0] == "n"
+                    and seg[1] == namespace
+                    and seg[2] == "b"
+                    and seg[3] == bucket
+                ):
+                    key = unquote(parts[1])
+                    if key:
+                        return key, True
         return "", False
 
     async def _upload_object(self, src_path: str) -> str:

@@ -18,15 +18,14 @@ import asyncio
 import os
 import secrets
 import time
-from typing import AsyncGenerator, Optional, Tuple
+from collections.abc import AsyncGenerator
 
 import aiohttp
-
+import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
-
-import astrbot.api.message_components as Comp
+from astrbot.api.star import Context, Star
+from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 try:
     from .common import (
@@ -36,16 +35,15 @@ try:
         RESCAN_BATCH_SIZE,
         RESCAN_PROGRESS_EVERY,
         TMP_MAX_AGE_SECONDS,
-        USER_AGENT,
         as_float,
         as_int,
         is_blank,
         truthy,
     )
     from .features import ImageFeatures, compute_features, phash_hex_len
+    from .http_client import GuardedHttpClient
     from .image_bed import MODE_CFB, ImageBedClient
     from .library import ImageLibrary, MatchResult
-    from .url_guard import guarded_request, make_pinned_connector
     from .vector_search import VectorEngine, VectorEngineError
 except ImportError:  # 兼容插件以独立模块方式加载
     from common import (  # type: ignore[no-redef]
@@ -55,16 +53,15 @@ except ImportError:  # 兼容插件以独立模块方式加载
         RESCAN_BATCH_SIZE,
         RESCAN_PROGRESS_EVERY,
         TMP_MAX_AGE_SECONDS,
-        USER_AGENT,
         as_float,
         as_int,
         is_blank,
         truthy,
     )
     from features import ImageFeatures, compute_features, phash_hex_len  # type: ignore[no-redef]
+    from http_client import GuardedHttpClient  # type: ignore[no-redef]
     from image_bed import MODE_CFB, ImageBedClient  # type: ignore[no-redef]
     from library import ImageLibrary, MatchResult  # type: ignore[no-redef]
-    from url_guard import guarded_request, make_pinned_connector  # type: ignore[no-redef]
     from vector_search import VectorEngine, VectorEngineError  # type: ignore[no-redef]
 
 PLUGIN_NAME = "astrbot_plugin_image_trace"
@@ -109,19 +106,13 @@ BUCKET_LEGACY_FIELDS = (
 )
 
 
-@register(
-    "astrbot_plugin_image_trace",
-    "diyushuang",
-    "图片溯源：pHash 哈希 / Qdrant 多模态向量双引擎比对相似度并回传原图",
-    "v1.3.2",
-)
 class ImageTracePlugin(Star):
     """图片溯源插件主类。"""
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        self.data_dir = os.path.abspath(os.path.join("data", "plugin_data", PLUGIN_NAME))
+        self.data_dir = os.path.join(get_astrbot_data_path(), "plugin_data", PLUGIN_NAME)
         self.tmp_dir = os.path.join(self.data_dir, "tmp")
         os.makedirs(self.tmp_dir, exist_ok=True)
 
@@ -140,16 +131,21 @@ class ImageTracePlugin(Star):
             os.path.join(self.data_dir, "library.db"),
             expected_phash_hex_len=phash_hex_len(hash_size),
         )
+        self.hash_threshold = max(0.0, min(1.0, self._float_cfg("similarity_threshold", 0.85)))
+        self.top_n = max(0, self._int_cfg("top_n", 3))
+        self.max_images_per_query = max(1, self._int_cfg("max_images_per_query", 3))
         # v1.2.x 的储存桶配置先迁移，再合并（储存桶完整时优先于图床）
         self._migrate_bucket_config()
         self._bed_cfg = self._effective_bed_cfg()
-        self.bed = ImageBedClient(self.data_dir, self._bed_cfg)
-        self._http: Optional[aiohttp.ClientSession] = None
+        self._http: GuardedHttpClient | None = None
+        self.bed = ImageBedClient(self.data_dir, self._bed_cfg, self._get_http)
         self.vector = VectorEngine(config, self._get_http)
         self._cleanup_tmp()
         engine = self._engine_choice()
         vector_note = "（向量引擎已启用）" if self.vector.enabled and engine != "hash" else ""
-        bucket_note = f"（储存桶 {self._bed_mode()} 优先）" if self._bed_mode() in BUCKET_MODES else ""
+        bucket_note = (
+            f"（储存桶 {self._bed_mode()} 优先）" if self._bed_mode() in BUCKET_MODES else ""
+        )
         logger.info(
             f"图片溯源插件已加载，当前图库共 {self.library.count()} 条，"
             f"引擎={engine} {vector_note}{bucket_note}"
@@ -222,7 +218,7 @@ class ImageTracePlugin(Star):
             "storage_bucket 组，image_bed 组回归图床模式 local。"
         )
 
-    def _bucket_config(self) -> Optional[dict]:
+    def _bucket_config(self) -> dict | None:
         """储存桶配置完整时返回可并入图床配置的 dict（含 mode），否则 None。
 
         完整 = mode 已选 + 必填项齐全 + 公开直链条件满足（R2 需
@@ -246,8 +242,7 @@ class ImageTracePlugin(Star):
             )
         if missing:
             logger.warning(
-                f"储存桶 {mode} 配置不完整（缺 {'、'.join(missing)}），"
-                "登记原图将改用图床设置。"
+                f"储存桶 {mode} 配置不完整（缺 {'、'.join(missing)}），登记原图将改用图床设置。"
             )
             return None
         cfg = dict(raw)
@@ -322,7 +317,7 @@ class ImageTracePlugin(Star):
                         push(sub)
         return found
 
-    async def _resolve_local_file(self, seg) -> Tuple[str, bool]:
+    async def _resolve_local_file(self, seg) -> tuple[str, bool]:
         """把图片段解析为本地文件。返回 (路径, 是否为需要清理的临时文件)。
 
         优先走 AstrBot 内置媒体解析 convert_to_file_path()，失败时才兜底
@@ -344,17 +339,20 @@ class ImageTracePlugin(Star):
         return "", False
 
     async def _download(self, url: str) -> str:
-        session = await self._get_http()
+        client = await self._get_http()
         size_limit = max(1, self._int_cfg("max_download_mb", 20)) * 1024 * 1024
         timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)
         # 临时文件名完全不受外部输入影响（固定扩展名），
         # 图片解码由 Pillow 按内容判断，与扩展名无关
         path = os.path.join(self.tmp_dir, f"q_{secrets.token_hex(8)}.jpg")
         try:
-            async with await guarded_request(
+            async with await client.request(
+                "GET",
+                url,
                 # prepare 契约为三参（url, method, cross_origin），签名不符
                 # 会在请求发出前就 TypeError
-                session, "GET", url, prepare=lambda _u, _m, _c: {"timeout": timeout}
+                prepare=lambda _u, _m, _c: {},
+                timeout=timeout,
             ) as resp:
                 resp.raise_for_status()
                 declared = resp.headers.get("Content-Length", "")
@@ -372,12 +370,10 @@ class ImageTracePlugin(Star):
             raise
         return path
 
-    async def _get_http(self) -> aiohttp.ClientSession:
-        if self._http is None or self._http.closed:
+    async def _get_http(self) -> GuardedHttpClient:
+        if self._http is None:
             # 连接器启用 IP 钉扎：出网连接只允许落在 url_guard 校验过的地址上
-            self._http = aiohttp.ClientSession(
-                headers={"User-Agent": USER_AGENT}, connector=make_pinned_connector()
-            )
+            self._http = GuardedHttpClient()
         return self._http
 
     def _cleanup_tmp(self) -> None:
@@ -411,7 +407,7 @@ class ImageTracePlugin(Star):
             yield event.plain_result(self._usage())
             return
         engine = self._engine_choice()
-        budget = max(1, self._int_cfg("max_images_per_query", 3))
+        budget = self.max_images_per_query
         if engine == "vector":
             if not self.vector.enabled:
                 yield event.plain_result(self.vector.config_hint())
@@ -455,8 +451,8 @@ class ImageTracePlugin(Star):
         return fail_line
 
     async def _trace_hash(self, event: AstrMessageEvent, seg) -> AsyncGenerator:
-        threshold = self._float_cfg("similarity_threshold", 0.85)
-        top_n = self._int_cfg("top_n", 3)
+        threshold = self.hash_threshold
+        top_n = self.top_n
         local_path = ""
         is_tmp = False
         try:
@@ -470,9 +466,7 @@ class ImageTracePlugin(Star):
             )
             # 至少取回 5 条候选：即便 top_n 配置为 0/较小值，AI 复核也需要
             # 足够的候选池才能剔除误报
-            candidates = await asyncio.to_thread(
-                self.library.search, feats.phash, max(5, top_n)
-            )
+            candidates = await asyncio.to_thread(self.library.search, feats.phash, max(5, top_n))
             hits = [m for m in candidates if m.similarity >= threshold]
             if hits and self._bool_cfg("ai_verify", False):
                 hits = await self._ai_verify(local_path, hits)
@@ -489,10 +483,14 @@ class ImageTracePlugin(Star):
                     )
                 return
 
-            candidate_lines = [
-                f"· #{m.id} 相似度 {m.similarity * 100:.1f}%{f'（{m.note}）' if m.note else ''}"
-                for m in candidates[:top_n]
-            ] if top_n > 0 else []
+            candidate_lines = (
+                [
+                    f"· #{m.id} 相似度 {m.similarity * 100:.1f}%{f'（{m.note}）' if m.note else ''}"
+                    for m in candidates[:top_n]
+                ]
+                if top_n > 0
+                else []
+            )
             yield event.plain_result(
                 self._miss_message(
                     f"❌ 图库中未找到相似度达标的原图（阈值 {threshold * 100:.0f}%）。",
@@ -515,7 +513,7 @@ class ImageTracePlugin(Star):
 
         hit/miss/nofile 时 item 为可直接 yield 的结果对象；error 时 item 为错误说明字符串。
         """
-        top_n = self._int_cfg("top_n", 3)
+        top_n = self.top_n
         local_path = ""
         is_tmp = False
         try:
@@ -547,7 +545,7 @@ class ImageTracePlugin(Star):
                 )
             )
         except VectorEngineError as e:
-            logger.warning(f"向量检索出错: {e}")
+            logger.warning(f"向量检索出错: {getattr(e, 'detail', e)}")
             return "error", str(e)
         except Exception:
             logger.error("向量检索异常", exc_info=True)
@@ -724,6 +722,8 @@ class ImageTracePlugin(Star):
         seg = images[0]
         local_path = ""
         is_tmp = False
+        stored = None
+        db_saved = False
         try:
             local_path, is_tmp = await self._resolve_local_file(seg)
             if not local_path:
@@ -760,8 +760,10 @@ class ImageTracePlugin(Star):
             # 登记不会产生重复行（不再依赖"检查与插入之间无 await"的约定）
             entry_id, dup = await asyncio.to_thread(self.library.add_if_absent, row)
             if dup is not None:
+                await self._cleanup_stored(stored)
                 yield event.plain_result(self._dup_message(dup))
                 return
+            db_saved = True
             lines = [
                 f"✅ 已登记原图 #{entry_id}（{stored.message}）",
                 f"尺寸：{feats.width}x{feats.height}",
@@ -799,6 +801,8 @@ class ImageTracePlugin(Star):
                         lines.append("（向量同步失败，可在图床侧触发钩子或对账补齐）")
             yield event.plain_result("\n".join(lines))
         except Exception as e:
+            if stored is not None and not db_saved:
+                await self._cleanup_stored(stored)
             logger.error(f"登记原图失败: {e}", exc_info=True)
             yield event.plain_result("⚠️ 登记失败，详情请查看机器人日志。")
         finally:
@@ -811,13 +815,13 @@ class ImageTracePlugin(Star):
         return f"该图片已登记过（#{dup['id']}{note}）。"
 
     @staticmethod
-    def _strip_command(message_str: str, keywords: Tuple[str, ...]) -> str:
+    def _strip_command(message_str: str, keywords: tuple[str, ...]) -> str:
         """取指令关键词之后的内容作为备注。"""
         text = (message_str or "").strip()
         for kw in keywords:
             idx = text.find(kw)
             if idx != -1:
-                return text[idx + len(kw):].strip()
+                return text[idx + len(kw) :].strip()
         return text
 
     # ------------------------------------------------------------------
@@ -839,13 +843,13 @@ class ImageTracePlugin(Star):
             lines.append(
                 "· 来源：" + "，".join(f"{k or '未知'} {v}" for k, v in stats["by_source"].items())
             )
-        lines.append(f"· pHash 精度：{self.hash_size * self.hash_size}bit（hash_size={self.hash_size}）")
-        lines.append(f"· 相似度阈值：{self._float_cfg('similarity_threshold', 0.85) * 100:.0f}%")
+        lines.append(
+            f"· pHash 精度：{self.hash_size * self.hash_size}bit（hash_size={self.hash_size}）"
+        )
+        lines.append(f"· 相似度阈值：{self.hash_threshold * 100:.0f}%")
         lines.append(self._storage_line())
         engine = self._engine_choice()
-        lines.append(
-            f"· 检索引擎：{engine}（向量{'已启用' if self.vector.enabled else '未启用'}）"
-        )
+        lines.append(f"· 检索引擎：{engine}（向量{'已启用' if self.vector.enabled else '未启用'}）")
         if self.vector.enabled:
             try:
                 vec_count = await self.vector.count()
@@ -873,13 +877,13 @@ class ImageTracePlugin(Star):
         for d in dirs:
             errors: list = []
 
-            def _onerror(err):
+            def _onerror(err, errors=errors):
                 errors.append(err)
 
             for root, _sub, names in os.walk(d, onerror=_onerror):
                 for name in names:
                     if os.path.splitext(name)[1].lower() in IMAGE_EXTS:
-                        files.append(os.path.join(root, name))
+                        files.append(os.path.abspath(os.path.join(root, name)))
             if errors:
                 logger.warning(f"扫描目录 {d} 时出错（已跳过该目录的失效清理）: {errors[0]}")
             else:
@@ -903,14 +907,11 @@ class ImageTracePlugin(Star):
 
             # 目录遍历可能耗时很久，放到线程里避免阻塞事件循环
             files, scanned_dirs = await asyncio.to_thread(self._collect_image_files, valid_dirs)
-            if not files:
-                yield event.plain_result("扫描目录中没有找到图片文件。")
-                return
-
             if force:
                 await asyncio.to_thread(self.library.delete_by_source, "scan")
             known_paths = {
-                os.path.normcase(p) for p in self.library.get_paths_for_source("scan")
+                os.path.normcase(os.path.abspath(p))
+                for p in self.library.get_paths_for_source("scan")
             }
             # 一次性取回全部 pHash，在内存里去重，避免逐张查库；
             # 即便跨任务并发重扫漏判，phash 唯一索引 + INSERT OR IGNORE 也能兜底
@@ -964,9 +965,7 @@ class ImageTracePlugin(Star):
             if pending:
                 batch = list(pending)
                 pending.clear()
-                added += await asyncio.to_thread(
-                    self.library.add_many, batch, reload_cache=False
-                )
+                added += await asyncio.to_thread(self.library.add_many, batch, reload_cache=False)
             if added:
                 await asyncio.to_thread(self.library.reload_cache)
             # 只清理"本次成功遍历的目录"下的失效条目，目录临时掉线不清索引
@@ -1027,17 +1026,35 @@ class ImageTracePlugin(Star):
         """删除登记流程产生的本地副本（仅限插件 images/ 目录内，绝不碰扫描目录的原图）。"""
         if row["source"] != "register":
             return
-        path = row["file_path"] or ""
+        self._remove_local_path_if_owned(row["file_path"] or "")
+
+    def _remove_local_path_if_owned(self, path: str) -> None:
+        """仅删除插件 images 目录内的本地副本。"""
         if not path:
             return
         real = os.path.abspath(path)
         images_root = os.path.abspath(self.bed.local_dir)
         try:
             inside = os.path.commonpath([real, images_root]) == images_root
-        except ValueError:  # 跨盘符等无法比较根的情形
+        except ValueError:
             inside = False
         if inside and os.path.isfile(real):
             self._remove_quiet(real)
+
+    async def _cleanup_stored(self, stored) -> None:
+        """补偿清理本次上传但未落入图库的远端对象/本地副本。"""
+        if stored is None:
+            return
+        if stored.url:
+            try:
+                await self.bed.delete_remote(stored.url)
+            except Exception as e:
+                logger.warning(f"补偿删除远端对象失败: {e}")
+        if stored.file_path:
+            try:
+                self._remove_local_path_if_owned(stored.file_path)
+            except Exception as e:
+                logger.warning(f"补偿删除本地副本失败: {e}")
 
     @filter.command("溯源帮助")
     async def trace_help(self, event: AstrMessageEvent):
@@ -1062,9 +1079,24 @@ class ImageTracePlugin(Star):
     # ------------------------------------------------------------------
 
     async def terminate(self):
-        if self._http and not self._http.closed:
-            await self._http.close()
-        await self.bed.close()
-        self._cleanup_tmp()
-        self.library.close()
+        errors: list[str] = []
+        if self._http is not None:
+            try:
+                await self._http.close()
+            except Exception as e:
+                errors.append(f"HTTP 会话: {e}")
+        try:
+            await self.bed.close()
+        except Exception as e:
+            errors.append(f"图床客户端: {e}")
+        try:
+            self._cleanup_tmp()
+        except Exception as e:
+            errors.append(f"临时文件: {e}")
+        try:
+            self.library.close()
+        except Exception as e:
+            errors.append(f"图库数据库: {e}")
+        if errors:
+            logger.error("图片溯源插件卸载时部分资源清理失败: " + "；".join(errors))
         logger.info("图片溯源插件已卸载。")

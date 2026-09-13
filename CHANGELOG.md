@@ -1,5 +1,27 @@
 # 更新日志
 
+## 1.3.3（2026-09-13，规范与 Qdrant 兼容修复）
+
+- **Qdrant 1.19 兼容**：向量检索优先使用官方 Query API
+  `POST /collections/{collection}/points/query`（请求体 `query` / `limit` /
+  `with_payload`）；当服务端返回 404 时自动回退旧版 `points/search`，继续支持
+  Qdrant 1.0~1.9，同时兼容 1.10~1.19。集合名统一 URL 编码，embedding 向量
+  增加非空与有限数值校验。
+- **AstrBot 插件规范**：移除已废弃的 `@register` 装饰器，完全以
+  `metadata.yaml` 为元数据来源；版本号改为无 `v` 前缀的 SemVer `1.3.3`；
+  数据目录改用官方 `get_astrbot_data_path()` 推导，不再依赖进程当前目录。
+- **网络与资源**：新增共享 `GuardedHttpClient`，向量检索、图片下载、图床、
+  CloudFlare-ImgBed 与 R2/OCI S3 请求复用同一个启用 IP pinning 的
+  `aiohttp` 会话；卸载时逐项清理资源，单项失败不阻断后续释放。
+- **数据一致性**：登记原图在数据库失败或并发重复时补偿清理本次上传对象；
+  空目录重扫不再提前返回，`force` 与失效索引清理可正常执行；跨进程唯一索引
+  冲突后重新查询重复行；Windows 路径统一绝对路径与大小写归一化。
+- **图像处理**：不再修改 Pillow 进程级 `MAX_IMAGE_PIXELS`，改为显式像素上限；
+  DCT 矩阵缓存改用线程安全的 `functools.lru_cache`；动图先取首帧再处理
+  EXIF 方向。
+- **配置与文档**：`hash_size` 下拉补齐 4~32 的全部 4 倍数；哈希阈值与
+  `top_n` 做安全钳制；文档补充 Qdrant 兼容矩阵并更新发版流程。
+
 ## v1.3.2（2026-09-13，配置面板重构）
 
 - **配置项重新排序**：面板按使用顺序重排——检索引擎 → 本地图库目录 →
