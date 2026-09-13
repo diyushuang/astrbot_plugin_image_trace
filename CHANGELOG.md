@@ -1,5 +1,19 @@
 # 更新日志
 
+## 1.3.6（2026-09-13，响应体截断修复）
+
+- **完整读取响应体**：`read_limited_bytes` 原先只做单次
+  `content.read(limit + 1)`，而 aiohttp 的 `read(n)` 只承诺「最多 n
+  字节」——缓冲区里有多少就返回多少、并不等待读满。embedding 响应
+  39841 字节分块到达时只读到当前缓冲的 3893 字节就被送去解析 JSON，
+  报「Expecting ',' delimiter」，且重试再次命中同一竞态。现在循环读到
+  EOF 才返回，1 MiB 上限的超限即时中止与 Content-Length 预检保持不变；
+  响应中途断流仍由 aiohttp 帧校验抛 `ClientPayloadError` 走既有错误
+  分支。Qdrant、图床 API、S3 等所有走该函数的请求一并受益。
+- **测试**：新增「响应分块到达仍返回完整响应体」「embedding 响应分
+  两块到达仍解析成功」回归测试；测试桩的响应体读取改为读后消耗语义，
+  与 aiohttp `StreamReader` 行为一致。
+
 ## 1.3.5（2026-09-13，坏图片与无效 JSON 修复）
 
 - **坏下载拦截**：QQ 图床 URL 带 rkey 签名会过期、NTQQ

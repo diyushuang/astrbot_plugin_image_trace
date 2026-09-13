@@ -218,14 +218,27 @@ def prepare_headers(
 async def read_limited_bytes(
     resp: aiohttp.ClientResponse, limit: int = DEFAULT_MAX_RESPONSE_BYTES
 ) -> bytes:
-    """读取响应体字节，超过 limit 立即中止，避免异常端点撑爆内存。"""
+    """读取完整响应体，超过 limit 立即中止，避免异常端点撑爆内存。
+
+    aiohttp 的 content.read(n) 只承诺"最多 n 字节"：缓冲区里已有多少就
+    返回多少、并不等待读满，单次调用会把分块到达的较大响应体静默截断
+    （线上曾因此把 39841 字节的 embedding 响应截成 3893 字节），
+    必须循环读到 EOF；响应中途断流由 aiohttp 帧校验抛 ClientPayloadError。
+    """
     declared = resp.headers.get("Content-Length", "")
     if declared.isdigit() and int(declared) > limit:
         raise ResponseTooLargeError(f"响应体声明长度 {declared} 超过上限 {limit} 字节")
-    raw = await resp.content.read(limit + 1)
-    if len(raw) > limit:
-        raise ResponseTooLargeError(f"响应体超过上限 {limit} 字节")
-    return raw
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await resp.content.read(limit + 1 - total)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > limit:
+            raise ResponseTooLargeError(f"响应体超过上限 {limit} 字节")
+    return b"".join(chunks)
 
 
 async def read_limited_text(
