@@ -1,6 +1,6 @@
 # astrbot_plugin_image_trace 图片溯源
 
-[![version](https://img.shields.io/badge/version-v1.3.1-blue)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-v1.3.2-blue)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](./LICENSE)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
@@ -224,24 +224,32 @@ v1.3.0 起，两种对象存储从图床模式中独立为单独的**储存桶�
 
 ## 配置项
 
+**面板标签与显隐说明**（v1.3.2 起）：
+
+- 每个配置项标签带必填标注：【必填】=启用对应功能后必须填写；【R2 必填】【OCI 必填】【generic_http 必填】【imgbed 必填】=仅在所选模式下必填；【OCI 必填·二选一】=两项至少填一个；【按需必填】=取决于使用方式（见提示）；【选填】=可留空保持默认。
+- **按需显隐**：储存桶组选择 `cloudflare_r2` / `oracle_oci` 后才展开对应字段，图床组选择 `generic_http` / `cloudflare_imgbed` 后才展开对应字段；进阶调优项收纳在顶层「显示进阶设置」与 `vector_search` 组内「显示进阶配置」两个开关后（默认关），开启后才显示。
+- 被隐藏字段的已填值保留，切换模式不丢失；旧版 WebUI 忽略显隐规则时所有字段照常显示，不影响使用。
+
 | 配置 | 默认 | 说明 |
 | --- | --- | --- |
-| `similarity_threshold` | `0.85` | 相似度阈值（0~1），相似度 = 1 - 汉明距离/总位数 |
-| `hash_size` | `16` | pHash 精度：16→256bit（推荐），8→64bit；**取值必须为 4~32 之间 4 的倍数**；修改后需 `/溯源重扫 force` |
-| `top_n` | `3` | 未命中时提示的最接近候选数，0 表示不提示 |
-| `max_images_per_query` | `3` | 单次溯源最大处理图片数 |
-| `max_download_mb` | `20` | 单张图片大小上限（MB） |
-| `scan_dirs` | `[]` | 本地图库目录列表（绝对路径） |
 | `search_engine` | `auto` | `auto`=向量优先（未命中/不可用回退哈希）/ `vector` / `hash` |
+| `scan_dirs` | `[]` | 本地图库目录列表（绝对路径）；检索已有本地图库时必填，仅用 /登记原图 建库可留空 |
 | `vector_search.*` | - | Qdrant 地址/Key/集合、向量 AI 地址/Key/模型/输入格式、向量阈值/top_k/超时/登记同步开关（详见上方章节） |
-| `storage_bucket.mode` | `none` | 储存桶模式：`none`（不使用）/ `cloudflare_r2` / `oracle_oci`；**配置完整时优先于图床设置** |
+| `vector_search.advanced` | `false` | 面板收纳开关：开启后才显示 `embed_image_input` / `embed_input_type` / `top_k` / `request_timeout` |
+| `similarity_threshold` | `0.85` | 相似度阈值（0~1，哈希引擎），相似度 = 1 - 汉明距离/总位数 |
+| `storage_bucket.mode` | `none` | 储存桶模式：`none`（不使用）/ `cloudflare_r2` / `oracle_oci`；**配置完整时优先于图床设置**；选定模式后组内展开对应字段 |
 | `storage_bucket.r2_*` | - | cloudflare_r2：账户 ID、API 令牌凭据、存储桶、endpoint、公开访问域名 |
 | `storage_bucket.oci_*` | - | oracle_oci：命名空间、区域、Customer Secret Key 凭据、存储桶、公开桶开关/自定义公开地址 |
-| `image_bed.mode` | `local` | 图床模式：`local` / `generic_http` / `cloudflare_imgbed` |
+| `image_bed.mode` | `local` | 图床模式：`local` / `generic_http` / `cloudflare_imgbed`；选定模式后组内展开对应字段 |
 | `image_bed.api_url` 等 | - | generic_http 模式的上传接口、鉴权、字段名、响应直链 JSON 路径等 |
 | `image_bed.cfi_*` | - | cloudflare_imgbed 模式：站点地址、API Token、鉴权码、存储渠道、渠道名、上传目录 |
 | `ai_verify` | `false` | 是否用视觉大模型复核命中结果 |
 | `register_admin_only` | `true` | 仅管理员可登记原图 |
+| `advanced_settings` | `false` | 面板收纳开关：开启后才显示下方四个进阶项 |
+| `hash_size` | `16` | pHash 精度：16→256bit（推荐），8→64bit；**取值必须为 4~32 之间 4 的倍数**；修改后需 `/溯源重扫 force` |
+| `top_n` | `3` | 未命中时提示的最接近候选数，0 表示不提示 |
+| `max_images_per_query` | `3` | 单次溯源最大处理图片数 |
+| `max_download_mb` | `20` | 单张图片大小上限（MB） |
 
 ## 工作原理
 
