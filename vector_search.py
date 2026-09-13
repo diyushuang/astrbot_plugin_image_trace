@@ -291,30 +291,47 @@ class VectorEngine:
             }
 
         try:
-            async with await client.request("POST", url, prepare=prepare) as resp:
-                text = await read_limited_text(resp)
-                if resp.status != 200:
-                    if resp.status == 429:
-                        # NVIDIA 限流：给出冷静提示，避免插件侧重复请求加重流控
-                        try:
-                            retry_after = max(1, int(float(resp.headers.get("retry-after") or 5)))
-                        except (TypeError, ValueError):
-                            retry_after = 5
+            for attempt in (1, 2):
+                async with await client.request("POST", url, prepare=prepare) as resp:
+                    text = await read_limited_text(resp)
+                    if resp.status != 200:
+                        if resp.status == 429:
+                            # NVIDIA 限流：给出冷静提示，避免插件侧重复请求加重流控
+                            try:
+                                retry_after = max(1, int(float(resp.headers.get("retry-after") or 5)))
+                            except (TypeError, ValueError):
+                                retry_after = 5
+                            raise VectorEngineError(
+                                f"向量服务限流（HTTP 429），请在约 {retry_after} 秒后重试"
+                            )
+                        mismatch_hint = "'dict' object has no attribute" in text
+                        if resp.status in (500, 502, 503, 504) and attempt == 1 and not mismatch_hint:
+                            # 部分网关对中等体积请求会偶发 500/502（如 NVIDIA 的
+                            # "Missing request extension"），短暂退避后单次重试；
+                            # 格式不匹配类 500 是确定性错误，重试无意义
+                            await asyncio.sleep(2)
+                            continue
+                        hint = ""
+                        if resp.status == 400:
+                            hint = (
+                                "；模型拒绝该图片输入，请核对 embed_model 是否支持图片，"
+                                "或调整 embed_image_input（qwen-vl / nemotron-vl / dataurl / jina-image）"
+                            )
+                        elif mismatch_hint:
+                            # 服务端把 input 逐项当字符串处理却收到 content 数组字典：
+                            # embed_image_input 的序列化格式与该模型实际接受的不一致
+                            hint = (
+                                "；embedding 服务把 input 当纯文本解析，"
+                                "embed_image_input 与该模型不匹配，"
+                                "请改成模型/入库侧实际使用的格式（如 nemotron-vl / dataurl）"
+                            )
                         raise VectorEngineError(
-                            f"向量服务限流（HTTP 429），请在约 {retry_after} 秒后重试"
+                            f"向量服务 HTTP {resp.status}{hint}",
+                            detail=f"embedding HTTP {resp.status}: {text[:500]}",
                         )
-                    hint = ""
-                    if resp.status == 400:
-                        hint = (
-                            "；模型拒绝该图片输入，请核对 embed_model 是否支持图片，"
-                            "或调整 embed_image_input（qwen-vl / nemotron-vl / dataurl / jina-image）"
-                        )
-                    raise VectorEngineError(
-                        f"向量服务 HTTP {resp.status}{hint}",
-                        detail=f"embedding HTTP {resp.status}: {text[:500]}",
-                    )
-                obj = json.loads(text)
-                emb = obj["data"][0]["embedding"]
+                    obj = json.loads(text)
+                    emb = obj["data"][0]["embedding"]
+                break
         except VectorEngineError:
             raise
         except UrlBlockedError as e:
