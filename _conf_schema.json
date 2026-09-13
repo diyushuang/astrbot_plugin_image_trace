@@ -82,12 +82,12 @@
       "embed_image_input": {
         "description": "【选填】图片输入序列化格式",
         "type": "string",
-        "options": ["qwen-vl", "nemotron-vl", "dataurl", "jina-image"],
-        "default": "qwen-vl",
+        "options": ["nemotron-vl", "qwen-vl", "dataurl", "jina-image"],
+        "default": "nemotron-vl",
         "condition": {
           "advanced": true
         },
-        "hint": "qwen-vl=content 数组 [{\"type\":\"image\",\"image\":<dataURL>}]（Qwen3-VL-Embedding 系）；nemotron-vl=裸 dataURL 字符串 + input_type=passage（NVIDIA llama-nemotron-embed-vl 系）；dataurl=直接传 dataURL 字符串；jina-image=[{\"image\":<base64>}]（jina-clip 系）。模型报 400 时在此切换，需与图床入库侧一致。"
+        "hint": "默认 nemotron-vl=裸 dataURL 字符串 + input_type=passage（NVIDIA llama-nemotron-embed-vl 系只接受这一种，integrate.api.nvidia.com 即属此类）；qwen-vl=content 数组 [{\"type\":\"image\",\"image\":<dataURL>}]（仅 Qwen3-VL-Embedding 系需要）；dataurl=直接传 dataURL 字符串；jina-image=[{\"image\":<base64>}]（jina-clip 系）。请求报 500 'dict' object has no attribute 'strip'（把 qwen-vl 格式发给了只收字符串的模型）或 400 时在此切换，需与图床入库侧一致。"
       },
       "embed_input_type": {
         "description": "【选填】NVIDIA 非对称模型 input_type",

@@ -1,5 +1,21 @@
 # 更新日志
 
+## 1.3.7（2026-09-13，图片输入格式默认值修正）
+
+- **`embed_image_input` 默认值改为 `nemotron-vl`**：旧默认 `qwen-vl` 把图片
+  序列化成 content 数组发给 embedding 服务，而 NVIDIA
+  `llama-nemotron-embed-vl` 系（`integrate.api.nvidia.com`）只接受裸
+  dataURL 字符串，服务端逐项 `.strip()` 遇字典即报
+  `HTTP 500: 'dict' object has no attribute 'strip'`——从 GitHub
+  全新安装插件的实例开箱即命中此错。现在默认值、选项顺序（nemotron-vl
+  提前）、schema hint、代码内非法值回退（`vector_search.py`）与 README
+  配置表全部对齐 NVIDIA 实际行为；hint 补充该 500 签名便于自诊。
+  使用 Qwen3-VL-Embedding 系模型的用户需手动改回 `qwen-vl`。
+- **注意**：已有安装的实例配置不受 schema 默认值影响（AstrBot 保留现有
+  配置值），升级后若仍报该 500，请在 WebUI 插件配置里把「图片输入序列化
+  格式」改为 `nemotron-vl`（进阶项，需先开启 advanced 收纳开关）。
+- README 版本徽章补升（1.3.6 时漏改，仍标 1.3.5）。
+
 ## 1.3.6（2026-09-13，响应体截断修复）
 
 - **完整读取响应体**：`read_limited_bytes` 原先只做单次

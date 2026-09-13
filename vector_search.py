@@ -4,8 +4,10 @@
 -> Qdrant REST 检索最相似的图床图片（相似度 = Qdrant cosine score）。
 
 与服务器侧图床入库服务使用同一套协议与输入序列化，保证同一向量空间：
+- embed_image_input=nemotron-vl:  裸 dataURL 字符串 + input_type（非对称模型，默认；
+  NVIDIA llama-nemotron-embed-vl 系只接受这一种）
 - embed_image_input=qwen-vl:      content 数组 [{"type":"image","image":<dataURL>}]
-- embed_image_input=nemotron-vl:  裸 dataURL 字符串 + input_type（非对称模型）
+  （仅 Qwen3-VL-Embedding 系需要）
 - embed_image_input=dataurl:      裸 dataURL 字符串
 - embed_image_input=jina-image:   [{"image":<base64 无前缀>}]
 
@@ -139,14 +141,14 @@ class VectorEngine:
         self.embed_base_url = self._normalize_base_url(raw.get("embed_base_url"))
         self.embed_key = str(raw.get("embed_api_key") or "")
         self.embed_model = str(raw.get("embed_model") or "")
-        self.image_input = str(raw.get("embed_image_input") or "qwen-vl")
+        self.image_input = str(raw.get("embed_image_input") or "nemotron-vl")
         if self.image_input not in IMAGE_INPUTS:
             # 配置错误在加载期就暴露（日志可见），而不是拖到第一次请求才失败
             logger.warning(
                 f"embed_image_input 配置无效: {self.image_input!r}，"
-                f"可选 {' / '.join(IMAGE_INPUTS)}；已回退为 qwen-vl。"
+                f"可选 {' / '.join(IMAGE_INPUTS)}；已回退为 nemotron-vl。"
             )
-            self.image_input = "qwen-vl"
+            self.image_input = "nemotron-vl"
         # 仅 nemotron-vl 的非对称模型区分 input_type；图片侧只能走 passage，
         # 这里保留配置值供诊断展示，实际请求强制 passage（见 embed_bytes）
         self.input_type = str(raw.get("embed_input_type") or "passage")

@@ -1,6 +1,6 @@
 # astrbot_plugin_image_trace 图片溯源
 
-[![version](https://img.shields.io/badge/version-1.3.5-blue)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.3.7-blue)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](./LICENSE)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
@@ -123,7 +123,7 @@ flowchart LR
 | `embed_base_url` | 多模态向量 AI 的 base，如 `https://<你的网关域名>/v1`（实际请求 `POST {base}/embeddings`） |
 | `embed_api_key` | 该向量 AI 的 API Key；网关未开启鉴权时**可留空**（留空则不带鉴权头） |
 | `embed_model` | **接受图片输入**的 embedding 模型 ID（文本 embedding 模型无法对图片向量化），如 `Qwen/Qwen3-VL-Embedding-8B` |
-| `embed_image_input` | 图片输入序列化：`qwen-vl`（content 数组）/ `nemotron-vl`（裸 dataURL + input_type，NVIDIA llama-nemotron-embed-vl 系）/ `dataurl`（裸 dataURL）/ `jina-image`（base64 对象），模型 400 时切换 |
+| `embed_image_input` | 图片输入序列化，**默认 `nemotron-vl`**（裸 dataURL + input_type，NVIDIA llama-nemotron-embed-vl 系只接受这一种）；备选 `qwen-vl`（content 数组，仅 Qwen3-VL-Embedding 系需要）/ `dataurl`（裸 dataURL）/ `jina-image`（base64 对象）。报 500 `'dict' object has no attribute 'strip'`（格式发给了只收字符串的模型）或 400 时切换 |
 | `embed_input_type` | 仅 nemotron-vl 模式相关：非对称模型的 input_type，图片只能走 passage 侧（插件固定使用 passage），需与图床入库侧核对一致 |
 | `similarity_threshold` | cosine 相似度阈值，默认 `0.80`（同图变体通常 0.85+，建议用成对图片实测校准） |
 | `top_k` | 每次取回候选数，默认 `5` |
