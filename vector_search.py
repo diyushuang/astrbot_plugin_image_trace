@@ -36,6 +36,7 @@ except Exception:  # 兼容独立模块加载/本地自测环境
 
 try:
     from .common import as_float, as_int
+    from .features import image_mime
     from .http_client import HttpClientGetter
     from .url_guard import (
         ResponseTooLargeError,
@@ -44,6 +45,7 @@ try:
     )
 except ImportError:  # 兼容插件以独立模块方式加载
     from common import as_float, as_int  # type: ignore[no-redef]
+    from features import image_mime  # type: ignore[no-redef]
     from http_client import HttpClientGetter  # type: ignore[no-redef]
     from url_guard import (  # type: ignore[no-redef]
         ResponseTooLargeError,
@@ -51,17 +53,6 @@ except ImportError:  # 兼容插件以独立模块方式加载
         read_limited_text,
     )
 
-
-IMAGE_MIME = {
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".jfif": "image/jpeg",
-    ".png": "image/png",
-    ".gif": "image/gif",
-    ".webp": "image/webp",
-    ".bmp": "image/bmp",
-    ".avif": "image/avif",
-}
 
 IMAGE_INPUTS = ("qwen-vl", "nemotron-vl", "dataurl", "jina-image")
 
@@ -82,8 +73,46 @@ class HttpError(VectorEngineError):
         self.status = status
 
 
+class InvalidEmbeddingJSON(Exception):
+    """Embedding 服务返回 HTTP 200，但响应体不是合法 JSON。"""
+
+    def __init__(self, message: str, position: int | None = None):
+        super().__init__(message)
+        self.position = position
+
+
+def parse_embedding_response(text: str) -> list[float]:
+    """解析并校验 OpenAI 兼容 embeddings 响应中的 data[0].embedding。"""
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise InvalidEmbeddingJSON(str(exc), exc.pos) from exc
+
+    try:
+        embedding = obj["data"][0]["embedding"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValueError("embedding 响应缺少 data[0].embedding") from exc
+    if not isinstance(embedding, list) or not embedding:
+        raise ValueError("embedding 响应缺少 data[0].embedding")
+    if any(
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        for value in embedding
+    ):
+        raise ValueError("embedding 结果含非数值或非有限数值元素")
+    return [float(value) for value in embedding]
+
+
+def _invalid_json_context(text: str, exc: InvalidEmbeddingJSON) -> str:
+    position = exc.position if exc.position is not None else 0
+    start = max(0, position - 80)
+    end = min(len(text), position + 80)
+    return text[start:end]
+
+
 def _mime_for(path: str) -> str:
-    return IMAGE_MIME.get(os.path.splitext(path)[1].lower(), "image/jpeg")
+    return image_mime(path) or "image/jpeg"
 
 
 def _read_bytes(path: str) -> bytes:
@@ -313,10 +342,16 @@ class VectorEngine:
                             continue
                         hint = ""
                         if resp.status == 400:
-                            hint = (
-                                "；模型拒绝该图片输入，请核对 embed_model 是否支持图片，"
-                                "或调整 embed_image_input（qwen-vl / nemotron-vl / dataurl / jina-image）"
-                            )
+                            if "cannot identify image" in text.lower():
+                                hint = (
+                                    "；图片内容无效（下载不完整、链接已过期或格式不受支持），"
+                                    "请重新发送图片再试"
+                                )
+                            else:
+                                hint = (
+                                    "；模型拒绝该图片输入，请核对 embed_model 是否支持图片，"
+                                    "或调整 embed_image_input（qwen-vl / nemotron-vl / dataurl / jina-image）"
+                                )
                         elif mismatch_hint:
                             # 服务端把 input 逐项当字符串处理却收到 content 数组字典：
                             # embed_image_input 的序列化格式与该模型实际接受的不一致
@@ -329,8 +364,24 @@ class VectorEngine:
                             f"向量服务 HTTP {resp.status}{hint}",
                             detail=f"embedding HTTP {resp.status}: {text[:500]}",
                         )
-                    obj = json.loads(text)
-                    emb = obj["data"][0]["embedding"]
+                    try:
+                        emb = parse_embedding_response(text)
+                    except InvalidEmbeddingJSON as exc:
+                        context = _invalid_json_context(text, exc)
+                        logger.error(
+                            "embedding 响应无效 JSON: "
+                            f"响应长度={len(text)}, "
+                            f"Content-Length={resp.headers.get('Content-Length', '<missing>')}, "
+                            f"Content-Type={resp.headers.get('Content-Type', '<missing>')}, "
+                            f"解析位置={exc.position}, 错误={exc}, 片段={context!r}"
+                        )
+                        if attempt == 1:
+                            await asyncio.sleep(2)
+                            continue
+                        raise VectorEngineError(
+                            "向量服务返回无效 JSON（已重试一次）",
+                            detail=f"embedding JSON 解析失败: {exc}; 片段: {context}",
+                        ) from exc
                 break
         except VectorEngineError:
             raise
@@ -363,8 +414,11 @@ class VectorEngine:
         return vector
 
     async def embed_file(self, path: str) -> list:
+        mime = await asyncio.to_thread(image_mime, path)
+        if mime is None:
+            raise VectorEngineError("图片内容无效（下载不完整、链接已过期或格式不受支持）")
         data = await asyncio.to_thread(_read_bytes, path)
-        return await self.embed_bytes(data, _mime_for(path))
+        return await self.embed_bytes(data, mime)
 
     # ------------------------------------------------------------------
     # Qdrant 检索与状态

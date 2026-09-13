@@ -19,6 +19,7 @@ import os
 import secrets
 import time
 from collections.abc import AsyncGenerator
+from urllib.parse import urlparse
 
 import aiohttp
 import astrbot.api.message_components as Comp
@@ -38,9 +39,10 @@ try:
         as_float,
         as_int,
         is_blank,
+        is_qq_image_bed_host,
         truthy,
     )
-    from .features import ImageFeatures, compute_features, phash_hex_len
+    from .features import ImageFeatures, compute_features, image_file_ok, phash_hex_len
     from .http_client import GuardedHttpClient
     from .image_bed import MODE_CFB, ImageBedClient
     from .library import ImageLibrary, MatchResult
@@ -56,9 +58,15 @@ except ImportError:  # 兼容插件以独立模块方式加载
         as_float,
         as_int,
         is_blank,
+        is_qq_image_bed_host,
         truthy,
     )
-    from features import ImageFeatures, compute_features, phash_hex_len  # type: ignore[no-redef]
+    from features import (  # type: ignore[no-redef]
+        ImageFeatures,
+        compute_features,
+        image_file_ok,
+        phash_hex_len,
+    )
     from http_client import GuardedHttpClient  # type: ignore[no-redef]
     from image_bed import MODE_CFB, ImageBedClient  # type: ignore[no-redef]
     from library import ImageLibrary, MatchResult  # type: ignore[no-redef]
@@ -320,23 +328,46 @@ class ImageTracePlugin(Star):
     async def _resolve_local_file(self, seg) -> tuple[str, bool]:
         """把图片段解析为本地文件。返回 (路径, 是否为需要清理的临时文件)。
 
-        优先走 AstrBot 内置媒体解析 convert_to_file_path()，失败时才兜底
-        自行下载 URL（下载前经 SSRF 校验）。
+        优先走 AstrBot 内置媒体解析 convert_to_file_path()；其产物或兜底
+        下载的内容都会先经 image_file_ok 校验——QQ 图床 URL 带 rkey 签名
+        会过期、NTQQ/gchat 图床有防盗链，失败时常返回几十~几百字节的错误
+        体而非图片，必须拦在引擎之前。两条路都无效时返回空路径，由调用方
+        给出统一的「未能获取图片内容」提示。
         """
         try:
             path = await seg.convert_to_file_path()
             if path and os.path.isfile(path):
-                return path, False
+                if await asyncio.to_thread(image_file_ok, path):
+                    return path, False
+                logger.warning(f"内置解析产物不是有效图片（{self._peek_sniff(path)}），改走兜底下载")
         except Exception as e:
             logger.debug(f"convert_to_file_path 失败，尝试兜底下载: {e}")
 
         url = getattr(seg, "url", None)
         if url and str(url).startswith(("http://", "https://")):
             try:
-                return await self._download(str(url)), True
+                path = await self._download(str(url))
             except Exception as e:
                 logger.warning(f"图片兜底下载失败: {e}")
+                return "", False
+            if await asyncio.to_thread(image_file_ok, path):
+                return path, True
+            logger.warning(
+                f"兜底下载内容不是有效图片（{self._peek_sniff(path)}），链接可能已过期或被防盗链拦截"
+            )
+            self._remove_quiet(path)
         return "", False
+
+    @staticmethod
+    def _peek_sniff(path: str) -> str:
+        """日志用的坏文件摘要：字节数 + 头部可打印片段，便于定位是谁返回的。"""
+        try:
+            with open(path, "rb") as f:
+                head = f.read(48)
+            text = "".join(chr(b) if 32 <= b < 127 else "." for b in head)
+            return f"{os.path.getsize(path)} 字节, 头部 {text!r}"
+        except OSError:
+            return "无法读取"
 
     async def _download(self, url: str) -> str:
         client = await self._get_http()
@@ -351,7 +382,7 @@ class ImageTracePlugin(Star):
                 url,
                 # prepare 契约为三参（url, method, cross_origin），签名不符
                 # 会在请求发出前就 TypeError
-                prepare=lambda _u, _m, _c: {},
+                prepare=self._image_download_headers,
                 timeout=timeout,
             ) as resp:
                 resp.raise_for_status()
@@ -369,6 +400,19 @@ class ImageTracePlugin(Star):
             self._remove_quiet(path)
             raise
         return path
+
+    @staticmethod
+    def _image_download_headers(u: str, _m: str, _c: bool) -> dict:
+        """图片兜底下载的请求头。
+
+        NTQQ（multimedia.nt.qq.com.cn）与旧版 gchat.qpic.cn 图床均启用了
+        防盗链：缺 Referer 时会返回 403 或只有几十~几百字节的错误体。
+        Referer 不是凭据，跨域重定向是否剥离交给 url_guard；重定向离开
+        QQ 图床域名后因 host 不匹配自然不再携带。
+        """
+        if is_qq_image_bed_host(urlparse(u).hostname or ""):
+            return {"headers": {"Referer": "https://gchat.qpic.cn/"}}
+        return {}
 
     async def _get_http(self) -> GuardedHttpClient:
         if self._http is None:

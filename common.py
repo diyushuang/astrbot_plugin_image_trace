@@ -34,6 +34,15 @@ RESCAN_PROGRESS_EVERY = 200
 _TRUTHY = frozenset({"1", "true", "yes", "on", "开"})
 
 
+def is_qq_image_bed_host(host: str) -> bool:
+    """精确匹配 QQ 图床根域，避免伪造后缀误触发 Referer。"""
+    normalized = (host or "").lower().rstrip(".")
+    return normalized in {
+        "multimedia.nt.qq.com.cn",
+        "gchat.qpic.cn",
+    } or normalized.endswith((".nt.qq.com.cn", ".qpic.cn"))
+
+
 def truthy(value: Any) -> bool:
     """按布尔语义解释配置值：bool 原样返回，其余查真值表。"""
     if isinstance(value, bool):

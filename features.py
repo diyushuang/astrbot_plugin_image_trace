@@ -99,6 +99,40 @@ def _ahash(gray: Image.Image) -> str:
     return _bits_to_hex((pixels > pixels.mean()).flatten())
 
 
+def image_mime(path: str) -> str | None:
+    """按真实内容识别受支持的图片格式，并完整解码以拒绝截断文件。"""
+    try:
+        with Image.open(path) as image:
+            # 与 _load_rgb 同一防解压炸弹闸门：load() 前按头部尺寸拒绝
+            if image.width * image.height > _MAX_LOAD_PIXELS:
+                return None
+            mime = {
+                "AVIF": "image/avif",
+                "BMP": "image/bmp",
+                "GIF": "image/gif",
+                "JPEG": "image/jpeg",
+                "MPO": "image/jpeg",
+                "PNG": "image/png",
+                "TIFF": "image/tiff",
+                "WEBP": "image/webp",
+            }.get(image.format or "")
+            if mime is None:
+                return None
+            image.load()
+            return mime
+    except Exception:
+        return None
+
+
+def image_file_ok(path: str) -> bool:
+    """校验文件是可完整解码且受支持的图片。
+
+    用于把「QQ 图床返回错误体 / 链接过期 / 格式不受支持」这类坏下载拦在
+    引擎之前，避免把无效字节送进哈希/向量引擎后报出晦涩的下游错误。
+    """
+    return image_mime(path) is not None
+
+
 def compute_features(path: str, hash_size: int = 16) -> ImageFeatures:
     """计算图片的感知特征。
 

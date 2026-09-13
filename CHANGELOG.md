@@ -1,5 +1,31 @@
 # 更新日志
 
+## 1.3.5（2026-09-13，坏图片与无效 JSON 修复）
+
+- **坏下载拦截**：QQ 图床 URL 带 rkey 签名会过期、NTQQ
+  （multimedia.nt.qq.com.cn）/ gchat.qpic.cn 有防盗链，失败时常返回几十~
+  几百字节的错误体。现在内置解析与兜底下载的产物都会先经 Pillow 完整解码
+  校验（`features.image_file_ok` / `features.image_mime`），截断、非图片或
+  不受支持内容不再送进哈希/向量引擎；解码前按 50M 像素防解压炸弹上限
+  拒绝超大图；日志记录字节数与头部片段便于定位。
+- **真实 MIME 识别**：`VectorEngine.embed_file()` 改用 Pillow 按内容识别
+  MIME 构造 data URL，不再依赖临时文件 `.jpg` 扩展名；扩展名错误的 PNG
+  等图片可正常向量化。
+- **QQ 图床防盗链**：兜底下载对 `*.nt.qq.com.cn` / `*.qpic.cn` 附带
+  `Referer: https://gchat.qpic.cn/`（防盗链要求）。域名改为精确匹配
+  `multimedia.nt.qq.com.cn`、`gchat.qpic.cn` 及其真实子域，避免
+  `eviltqpic.cn` 这类伪造后缀误触发；每一跳按当前 URL 重新判断，重定向
+  离开 QQ 图床域后不再携带。
+- **无效 JSON 重试与诊断**：embedding 返回 HTTP 200 但 JSON 无效/截断时，
+  记录响应长度、`Content-Length`、`Content-Type`、解析位置及错误位置前后
+  片段，退避 2 秒重试一次；两次仍失败时提示「向量服务返回无效 JSON
+  （已重试一次）」。该重试与既有 5xx 重试共享最多两次请求的总限制，
+  不叠加消耗配额。Schema 缺失、空向量、非数值、`NaN` / `Infinity`
+  等确定性错误不重试，继续给出明确错误。
+- **错误提示**：embedding 返回 400 且响应体含 `Cannot identify image`
+  时，提示改为「图片内容无效（下载不完整、链接已过期或格式不受支持）」，
+  不再误导用户去改模型配置。
+
 ## 1.3.4（2026-09-13，向量检索韧性与错误诊断）
 
 - **瞬时故障韧性**：embedding 返回 500/502/503/504 时自动退避 2 秒单次重试
