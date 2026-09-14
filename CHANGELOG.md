@@ -1,5 +1,21 @@
 # 更新日志
 
+## 1.4.0（2026-09-14，URL 直传、图片压缩与同图去重）
+
+- **图片回传改为 URL 直传优先**：QQ `aiocqhttp` 平台通过 OneBot 原生
+  `send_group_msg` / `send_private_msg` 直接下发图片 URL，避免 AstrBot
+  适配器把图片统一转 base64 造成协议端解析宽高失败；非该平台继续使用
+  标准消息链。
+- **加入图床缩放与本地压缩回退**：新增 `image_delivery` 配置组。默认
+  `scaled-url` 模式只给 CloudFlare-ImgBed 标准 `/file/` 直链附加官方
+  `width` / `height` / `fallback=original` 等比缩放参数；URL 直传失败后
+  下载并本地压缩（EXIF 转正、等比缩放、透明铺白底、JPEG 重编码），
+  动图保持原样。也支持 `original-url` 与 `local-compress`。
+- **向量命中同图去重**：Qdrant 查询携带 `with_vector=true`，先按
+  `src` / `image_url` 精确去重，再按候选向量 cosine 相似度合并
+  （默认阈值 `0.995`），每组只回传相似度最高的一张并显示合并数量；
+  Qdrant 未返回向量时仅做精确去重，兼容现有数据。
+
 ## 1.3.7（2026-09-13，图片输入格式默认值修正）
 
 - **`embed_image_input` 默认值改为 `nemotron-vl`**：旧默认 `qwen-vl` 把图片

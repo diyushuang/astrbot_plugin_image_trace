@@ -155,6 +155,10 @@ class VectorEngine:
         if self.input_type not in ("query", "passage"):
             self.input_type = "passage"
         self.threshold = max(0.0, min(1.0, as_float(raw.get("similarity_threshold"), 0.80)))
+        self.duplicate_threshold = max(
+            0.0,
+            min(1.0, as_float(raw.get("duplicate_vector_threshold"), 0.995)),
+        )
         self.top_k = max(1, as_int(raw.get("top_k"), 5))
         timeout_s = max(5, as_int(raw.get("request_timeout"), 30))
         self.timeout = aiohttp.ClientTimeout(total=timeout_s)
@@ -434,8 +438,10 @@ class VectorEngine:
         url = f"{self.qdrant_url}/collections/{collection}/points"
         return f"{url}/{operation}" if operation else url
 
-    async def search(self, vector: list, limit: int | None = None) -> list:
-        """Qdrant 相似度检索，返回 [{id, score, payload}] 列表。
+    async def search(
+        self, vector: list, limit: int | None = None, *, with_vector: bool = False
+    ) -> list:
+        """Qdrant 相似度检索，返回 [{id, score, payload, vector?}] 列表。
 
         返回的是 Qdrant 原始分数（未做阈值过滤，排序由 Qdrant 给出）；
         阈值过滤与排序展示由调用方完成。
@@ -457,6 +463,7 @@ class VectorEngine:
                     "query": vector,
                     "limit": effective_limit,
                     "with_payload": True,
+                    "with_vector": with_vector,
                 },
                 headers=self._qd_headers(),
             )
@@ -472,6 +479,7 @@ class VectorEngine:
                     "vector": vector,
                     "limit": effective_limit,
                     "with_payload": True,
+                    "with_vector": with_vector,
                 },
                 headers=self._qd_headers(),
             )
@@ -492,6 +500,7 @@ class VectorEngine:
                     "id": str(h.get("id")),
                     "score": score,
                     "payload": payload if isinstance(payload, dict) else {},
+                    **({"vector": h.get("vector")} if with_vector else {}),
                 }
             )
         return hits

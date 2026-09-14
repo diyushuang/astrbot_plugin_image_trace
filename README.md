@@ -1,6 +1,6 @@
 # astrbot_plugin_image_trace 图片溯源
 
-[![version](https://img.shields.io/badge/version-1.3.7-blue)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.4.0-blue)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](./LICENSE)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
@@ -10,7 +10,7 @@
 - **哈希引擎**（v1.1.0 起）：本地计算 pHash/dHash/aHash，与本地图库比对汉明距离；
 - **向量引擎**（v1.2.0 起）：调用多模态向量 AI 生成图片向量，在 Qdrant 向量库检索图床图片（图床侧每张上传经实时钩子自动入库，无需手动登记）。
 
-QQ 消息的收发完全通过 AstrBot 的事件与消息组件 API 完成，不依赖任何平台私有接口；日常查询只依赖配置好的向量 AI / Qdrant（哈希引擎可全程本地）。
+消息链处理基于 AstrBot 事件与组件 API；QQ `aiocqhttp` 的回图链路额外使用 OneBot 原生接口直传 URL，避免适配器把图片转 base64。日常查询只依赖配置好的向量 AI / Qdrant（哈希引擎可全程本地）。
 
 > 🤖 **AI 生成声明**：本项目代码由 AI 编程助手（ZCode，GLM 模型）辅助生成，经人工审查与多轮安全审计后发布；文档中的服务对接内容依据各服务官方文档整理。使用或二次分发前请自行审阅代码。
 
@@ -53,6 +53,7 @@ flowchart LR
 
 - **发图溯源**：与图片同条消息发送 `/溯源`，或引用一张图片发送 `/溯源`，插件按当前引擎检索最相似的原图，达标即自动回传原图与相似度信息。
 - **向量引擎（可选，v1.2.0）**：配置 `vector_search` 后，用多模态向量 AI（OpenAI 兼容 `/v1/embeddings`，如 Qwen3-VL-Embedding 系）把查询图转成向量，到 Qdrant 向量库检索图床图片；图床侧每张上传由服务器钩子实时向量化入库。检索走 cosine 相似度，对压缩、缩放、裁剪、水印等改动比哈希更鲁棒，覆盖哈希难判定的构图近似变体。
+- **URL 直传与去重（v1.4.0）**：QQ `aiocqhttp` 平台优先用 OneBot 原生接口直传图床 URL；CloudFlare-ImgBed 直链默认附加官方 `width` / `height` / `fallback=original` 等比缩放参数，失败后回退本地压缩。向量命中先按 `src` / `image_url` 与候选向量相似度合并重复图，每组只回传一张代表图。
 - **感知哈希特征**：pHash（DCT 感知哈希，默认 256bit）+ dHash + aHash，对压缩、缩放、轻微水印、EXIF 旋转均有较强鲁棒性；GIF 取首帧。纯 Pillow + numpy 实现，无需 scipy/GPU。
 - **可选 AI 复核**：开启 `ai_verify` 后，哈希命中的候选图会交给当前会话的视觉大模型二次确认"是否同一张图"，进一步降低误报；未配置视觉模型时自动跳过。
 - **泛用图床与储存桶接口**：登记原图的存储位置分两组配置，二选一即可——
@@ -126,6 +127,7 @@ flowchart LR
 | `embed_image_input` | 图片输入序列化，**默认 `nemotron-vl`**（裸 dataURL + input_type，NVIDIA llama-nemotron-embed-vl 系只接受这一种）；备选 `qwen-vl`（content 数组，仅 Qwen3-VL-Embedding 系需要）/ `dataurl`（裸 dataURL）/ `jina-image`（base64 对象）。报 500 `'dict' object has no attribute 'strip'`（格式发给了只收字符串的模型）或 400 时切换 |
 | `embed_input_type` | 仅 nemotron-vl 模式相关：非对称模型的 input_type，图片只能走 passage 侧（插件固定使用 passage），需与图床入库侧核对一致 |
 | `similarity_threshold` | cosine 相似度阈值，默认 `0.80`（同图变体通常 0.85+，建议用成对图片实测校准） |
+| `duplicate_vector_threshold` | 重复图合并阈值，默认 `0.995`；候选向量 cosine 相似度达到该值时视为同一张图，只回传代表图 |
 | `top_k` | 每次取回候选数，默认 `5` |
 | `request_timeout` | 请求超时（秒），默认 `30` |
 | `vector_index_on_register` | `/登记原图` 后是否插件侧同步写向量库，默认开；`cloudflare_imgbed` 等图床自带服务器侧钩子时自动跳过，避免重复计算 |
@@ -162,7 +164,7 @@ flowchart LR
 注意：
 
 - 图床地址必须是**公网可访问的 http/https 地址**，插件会拒绝指向内网/环回地址的请求（SSRF 防护）；
-- 回传原图时若使用图床直链（`Image.fromURL`），该直链需要 QQ 服务器可访问（即公网可读）；若图床是私有读，请使用 `local` 模式；
+- 回传原图时若使用图床直链，该直链需要协议端 / QQ 服务器可访问（即公网可读）；若图床是私有读，请使用 `local` 模式；
 - 上传失败会自动回退为本地副本保存，登记流程不会中断。
 
 ## CloudFlare-ImgBed 对接（cloudflare_imgbed 模式）
@@ -246,6 +248,9 @@ v1.3.0 起，两种对象存储从图床模式中独立为单独的**储存桶�
 | `scan_dirs` | `[]` | 本地图库目录列表（绝对路径）；检索已有本地图库时必填，仅用 /登记原图 建库可留空 |
 | `vector_search.*` | - | Qdrant 地址/Key/集合、向量 AI 地址/Key/模型/输入格式、向量阈值/top_k/超时/登记同步开关（详见上方章节） |
 | `vector_search.advanced` | `false` | 面板收纳开关：开启后才显示 `embed_image_input` / `embed_input_type` / `top_k` / `request_timeout` |
+| `image_delivery.mode` | `scaled-url` | 回图模式：`scaled-url`（ImgBed 等比缩放 URL 直传，默认）/ `original-url`（原图 URL 直传）/ `local-compress`（本地压缩） |
+| `image_delivery.max_side` | `1920` | 缩放或本地压缩的最长边，范围 1~4096 |
+| `image_delivery.quality` | `85` | 本地 JPEG 压缩质量，范围 1~100 |
 | `similarity_threshold` | `0.85` | 相似度阈值（0~1，哈希引擎），相似度 = 1 - 汉明距离/总位数 |
 | `storage_bucket.mode` | `none` | 储存桶模式：`none`（不使用）/ `cloudflare_r2` / `oracle_oci`；**配置完整时优先于图床设置**；选定模式后组内展开对应字段 |
 | `storage_bucket.r2_*` | - | cloudflare_r2：账户 ID、API 令牌凭据、存储桶、endpoint、公开访问域名 |
@@ -267,11 +272,11 @@ v1.3.0 起，两种对象存储从图床模式中独立为单独的**储存桶�
 2. **取图**：优先调用 AstrBot 内置的 `Image.convert_to_file_path()` 媒体解析（自动处理 URL 下载、base64、本地文件），失败时才走自带下载兜底（含 SSRF 校验）。
 3. **特征计算**：灰度化 → EXIF 转正 → 缩放 → DCT（预计算正交矩阵）→ 低频中值二值化得到 pHash；辅以 dHash/aHash。计算在 `asyncio.to_thread` 中执行，不阻塞事件循环。
 4. **相似度检索**：图库哈希常驻内存（numpy 位矩阵，整体替换 + 快照读），XOR + 查表 popcount 批量计算汉明距离，数万张图毫秒级检索；dHash/aHash 一并入库留存，预留给后续的二级确认，当前检索仅使用 pHash。
-5. **结果回传**：优先用图床直链发图，其次本地文件；附带相似度、备注、尺寸与入库时间。
+5. **结果回传**：QQ `aiocqhttp` 优先经 OneBot 原生接口直传缩放 URL，失败后回退本地压缩；其他平台走标准消息链。向量命中先合并重复图，再回传代表图与相似度、备注、尺寸等信息。
 
 ## 项目结构与开发
 
-代码按职责拆分为 9 个模块，依赖方向单向（`main` → 各子模块；子模块 → `common` / `http_client` / `url_guard`）：
+代码按职责拆分为 10 个模块，依赖方向单向（`main` → 各子模块；子模块 → `common` / `http_client` / `url_guard`）：
 
 | 文件 | 职责 | 关键约束 |
 | --- | --- | --- |
@@ -280,6 +285,7 @@ v1.3.0 起，两种对象存储从图床模式中独立为单独的**储存桶�
 | `features.py` | pHash / dHash / aHash 感知特征计算（纯 Pillow + numpy） | pHash 十六进制长度统一由 `phash_hex_len()` 提供，任何处不得自行推导 |
 | `library.py` | SQLite 图库 + 内存哈希位矩阵检索 | 写路径持锁，缓存整体替换 + 快照读；重操作需经 `asyncio.to_thread` 调用 |
 | `image_bed.py` | 图床与储存桶各模式的上传、直链反解、远端删除 | 上传失败一律回退本地副本，登记流程不中断 |
+| `image_delivery.py` | URL 缩放、本地压缩、向量命中去重的纯函数 | 不直接访问网络或 AstrBot 事件，便于独立测试 |
 | `s3_store.py` | 纯标准库 AWS SigV4 签名 + 最小 S3 兼容客户端 | 签名与 URL/方法绑定，被重定向即报错而非复用签名 |
 | `vector_search.py` | Qdrant 检索 + OpenAI 兼容 embeddings 客户端 | embed 三值须与图床入库侧一致；错误统一归为 `VectorEngineError` |
 | `url_guard.py` | SSRF 防护：逐跳校验、IP 钉扎、响应限长 | 所有出网经共享 HTTP 客户端调用，不绕过防护 |
@@ -296,9 +302,9 @@ v1.3.0 起，两种对象存储从图床模式中独立为单独的**储存桶�
 
 /溯源：
   图片段 → _resolve_local_file
-        → 向量引擎：embed_file → Qdrant points/query（旧版回退 points/search）→ 阈值过滤（命中全回传）
+        → 向量引擎：embed_file → Qdrant points/query（旧版回退 points/search）→ 阈值过滤与同图去重
         或 哈希引擎：library.search（汉明距离）→ 阈值过滤 → 可选 AI 复核
-        → 回传原图（直链优先，其次本地文件）
+        → 统一回传入口（OneBot URL 直传优先，失败本地压缩，最后标准消息链）
 ```
 
 开发注意：
@@ -309,7 +315,7 @@ v1.3.0 起，两种对象存储从图床模式中独立为单独的**储存桶�
   `value or default`（会把合法的 0 / False 吞掉）；
 - 涉及 SQLite 或大文件复制的调用若出现在 async 上下文，应包 `asyncio.to_thread`；
 - 群聊回复文案保持脱敏：含内网地址 / Key 的错误细节只进日志，不进群聊；
-- 发布包按白名单打包 14 个文件（8 个 `.py` + README / CHANGELOG / metadata /
+- 发布包按白名单打包 16 个文件（10 个 `.py` + README / CHANGELOG / metadata /
   requirements / _conf_schema / LICENSE），不含 `.git`、`data/` 与会话状态目录。
 
 ## 常见问题

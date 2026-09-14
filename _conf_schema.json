@@ -67,6 +67,12 @@
         "obvious_hint": true,
         "hint": "Qdrant cosine 相似度达到该值判定命中（同一张图的压缩/裁剪变体通常 0.85+，不同图通常更低）。建议先用少量成对图片实测校准。"
       },
+      "duplicate_vector_threshold": {
+        "description": "【选填】重复图片向量阈值（0~1）",
+        "type": "float",
+        "default": 0.995,
+        "hint": "向量命中候选之间的 cosine 相似度达到该值时视为同一张图，只回传相似度最高的一张并显示合并数量。Qdrant 未返回向量时仅按相同 src/image_url 去重。"
+      },
       "vector_index_on_register": {
         "description": "【选填】登记原图时同步写入向量库",
         "type": "bool",
@@ -117,6 +123,33 @@
           "advanced": true
         },
         "hint": "embedding 与 Qdrant 请求的超时时间。大模型 embedding 较慢时可调大。"
+      }
+    }
+  },
+  "image_delivery": {
+    "description": "图片回传设置",
+    "type": "object",
+    "hint": "默认 scaled-url：在 QQ aiocqhttp 平台优先通过 OneBot 原生接口直传图床缩放 URL，失败后回退本地压缩；其他平台使用标准消息链。original-url 直传原图 URL；local-compress 始终下载后本地压缩。仅 CloudFlare-ImgBed 标准 /file/ 直链会附加官方 width/height/fallback 参数。",
+    "items": {
+      "mode": {
+        "description": "【选填】图片回传模式",
+        "type": "string",
+        "options": ["scaled-url", "original-url", "local-compress"],
+        "default": "scaled-url",
+        "obvious_hint": true,
+        "hint": "scaled-url=图床等比缩放 URL 直传（默认，推荐）；original-url=原图 URL 直传；local-compress=插件下载后本地压缩。"
+      },
+      "max_side": {
+        "description": "【选填】缩放/压缩最长边（像素）",
+        "type": "int",
+        "default": 1920,
+        "hint": "scaled-url 模式作为 CloudFlare-ImgBed width/height 最大边界；本地压缩时按该值等比缩放。范围 1~4096。"
+      },
+      "quality": {
+        "description": "【选填】本地 JPEG 压缩质量",
+        "type": "int",
+        "default": 85,
+        "hint": "仅本地压缩与 OneBot URL 直传失败后的压缩回退使用；范围 1~100。"
       }
     }
   },

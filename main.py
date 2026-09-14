@@ -45,7 +45,15 @@ try:
     from .features import ImageFeatures, compute_features, image_file_ok, phash_hex_len
     from .http_client import GuardedHttpClient
     from .image_bed import MODE_CFB, ImageBedClient
-    from .library import ImageLibrary, MatchResult
+    from .image_delivery import (
+        build_scaled_url,
+        deduplicate_vector_hits,
+        delivery_settings,
+        is_napcat_parseable_url,
+        prepare_image_bytes,
+        sniff_image_format,
+    )
+    from .library import ImageLibrary
     from .vector_search import VectorEngine, VectorEngineError
 except ImportError:  # 兼容插件以独立模块方式加载
     from common import (  # type: ignore[no-redef]
@@ -69,7 +77,15 @@ except ImportError:  # 兼容插件以独立模块方式加载
     )
     from http_client import GuardedHttpClient  # type: ignore[no-redef]
     from image_bed import MODE_CFB, ImageBedClient  # type: ignore[no-redef]
-    from library import ImageLibrary, MatchResult  # type: ignore[no-redef]
+    from image_delivery import (  # type: ignore[no-redef]
+        build_scaled_url,
+        deduplicate_vector_hits,
+        delivery_settings,
+        is_napcat_parseable_url,
+        prepare_image_bytes,
+        sniff_image_format,
+    )
+    from library import ImageLibrary  # type: ignore[no-redef]
     from vector_search import VectorEngine, VectorEngineError  # type: ignore[no-redef]
 
 PLUGIN_NAME = "astrbot_plugin_image_trace"
@@ -439,6 +455,172 @@ class ImageTracePlugin(Star):
         except OSError:
             pass
 
+    def _delivery_config(self) -> tuple[str, int, int]:
+        return delivery_settings(self.config.get("image_delivery"))
+
+    def _can_send_via_onebot(self, event: AstrMessageEvent) -> bool:
+        try:
+            if event.get_platform_name() != "aiocqhttp":
+                return False
+        except Exception:
+            return False
+        return getattr(event, "bot", None) is not None
+
+    @staticmethod
+    def _read_file_bytes(path: str) -> bytes:
+        with open(path, "rb") as file:
+            return file.read()
+
+    @staticmethod
+    def _onebot_text(header: str, blocks: list[dict]) -> str:
+        parts = [header]
+        for block in blocks:
+            text = str(block.get("text") or "").strip()
+            if text:
+                parts.append(text)
+        return "\n".join(parts)
+
+    async def _send_via_onebot(
+        self, event: AstrMessageEvent, header: str, blocks: list[dict], urls: list[str]
+    ) -> bool:
+        message = []
+        sender_id = event.get_sender_id()
+        if sender_id:
+            message.append({"type": "at", "data": {"qq": str(sender_id)}})
+        message.append({"type": "text", "data": {"text": self._onebot_text(header, blocks) + "\n"}})
+        message.extend({"type": "image", "data": {"file": url}} for url in urls)
+
+        params: dict = {"message": message}
+        group_id = event.get_group_id()
+        if group_id:
+            action = "send_group_msg"
+            params["group_id"] = int(group_id) if str(group_id).isdigit() else group_id
+        else:
+            action = "send_private_msg"
+            user_id = sender_id
+            params["user_id"] = int(user_id) if str(user_id).isdigit() else user_id
+        self_id = getattr(event.message_obj, "self_id", None)
+        if self_id:
+            params["self_id"] = self_id
+
+        try:
+            await event.bot.call_action(action, **params)
+        except Exception as exc:
+            logger.warning(f"OneBot URL 直传图片失败，准备回退: {exc}")
+            return False
+        logger.info(f"OneBot URL 直传图片成功: {action}")
+        return True
+
+    async def _load_delivery_bytes(self, block: dict) -> bytes | None:
+        url = str(block.get("url") or "")
+        path = str(block.get("path") or "")
+        temp_path = ""
+        try:
+            if url:
+                temp_path = await self._download(url)
+                path = temp_path
+            if not path or not await asyncio.to_thread(image_file_ok, path):
+                return None
+            return await asyncio.to_thread(self._read_file_bytes, path)
+        except Exception as exc:
+            logger.warning(f"读取回传图片失败: {exc}")
+            return None
+        finally:
+            if temp_path:
+                self._remove_quiet(temp_path)
+
+    async def _prepare_delivery_blocks(
+        self, blocks: list[dict], *, compress: bool
+    ) -> list[tuple[bytes, bool]] | None:
+        prepared = []
+        mode, max_side, quality = self._delivery_config()
+        for block in blocks:
+            if not block.get("url") and not block.get("path"):
+                continue
+            data = await self._load_delivery_bytes(block)
+            if data is None:
+                return None
+            if not compress or mode == "original-url":
+                prepared.append((data, False))
+                continue
+            result = await asyncio.to_thread(prepare_image_bytes, data, max_side, quality)
+            if result is None:
+                prepared.append((data, False))
+                logger.warning(
+                    f"图片本地压缩失败，回退原字节: 格式={sniff_image_format(data) or '未知'}, "
+                    f"大小={len(data) / 1024:.0f}KB"
+                )
+            else:
+                prepared.append(result)
+        return prepared
+
+    async def _yield_delivery(self, event: AstrMessageEvent, header: str, blocks: list[dict]):
+        """统一回传入口：URL 直传优先，本地压缩只作为失败回退。"""
+        mode, max_side, _ = self._delivery_config()
+        image_blocks = [block for block in blocks if block.get("url") or block.get("path")]
+        original_urls = [str(block["url"]) for block in image_blocks if block.get("url")]
+
+        if (
+            mode in {"scaled-url", "original-url"}
+            and self._can_send_via_onebot(event)
+            and len(original_urls) == len(image_blocks)
+        ):
+            if mode == "scaled-url" and all(
+                is_napcat_parseable_url(url) for url in original_urls
+            ):
+                scaled_urls = [build_scaled_url(url, max_side) for url in original_urls]
+                if await self._send_via_onebot(event, header, blocks, scaled_urls):
+                    event.stop_event()
+                    return
+                if scaled_urls != original_urls and await self._send_via_onebot(
+                    event, header, blocks, original_urls
+                ):
+                    event.stop_event()
+                    return
+            elif mode == "original-url":
+                if await self._send_via_onebot(event, header, blocks, original_urls):
+                    event.stop_event()
+                    return
+
+        should_compress = mode == "local-compress" or (
+            mode == "scaled-url"
+            and any(block.get("path") for block in image_blocks)
+        )
+        onebot_failed = self._can_send_via_onebot(event) and mode in {"scaled-url", "original-url"}
+        if should_compress or (onebot_failed and len(original_urls) == len(image_blocks)):
+            prepared = await self._prepare_delivery_blocks(
+                image_blocks, compress=mode != "original-url"
+            )
+            if prepared is not None:
+                fallback_header = header
+                if any(compressed for _, compressed in prepared):
+                    fallback_header += "（已压缩）"
+                chain = [Comp.At(qq=event.get_sender_id()), Comp.Plain(" " + fallback_header)]
+                image_index = 0
+                for block in blocks:
+                    if block.get("text"):
+                        chain.append(Comp.Plain("\n" + str(block["text"])))
+                    if block.get("url") or block.get("path"):
+                        data, _ = prepared[image_index]
+                        chain.append(Comp.Image.fromBytes(data))
+                        image_index += 1
+                yield event.chain_result(chain)
+                return
+            logger.warning("本地图片回退失败，改用标准消息链 URL 发送")
+
+        chain = [Comp.At(qq=event.get_sender_id()), Comp.Plain(" " + header)]
+        for block in blocks:
+            if block.get("text"):
+                chain.append(Comp.Plain("\n" + str(block["text"])))
+            url = str(block.get("url") or "")
+            path = str(block.get("path") or "")
+            if url:
+                target_url = build_scaled_url(url, max_side) if mode == "scaled-url" else url
+                chain.append(Comp.Image.fromURL(target_url))
+            elif path:
+                chain.append(Comp.Image.fromFileSystem(path))
+        yield event.chain_result(chain)
+
     # ------------------------------------------------------------------
     # 指令：溯源
     # ------------------------------------------------------------------
@@ -517,9 +699,21 @@ class ImageTracePlugin(Star):
 
             if hits:
                 best = hits[0]
-                chain = self._match_chain(event, best)
-                if any(isinstance(comp, Comp.Image) for comp in chain):
-                    yield event.chain_result(chain)
+                lines = [f"✅ 溯源命中（相似度 {best.similarity * 100:.1f}%）#{best.id}"]
+                if best.note:
+                    lines.append(f"备注：{best.note}")
+                if best.width and best.height:
+                    lines.append(f"尺寸：{best.width}x{best.height}")
+                if best.created_at:
+                    lines.append(f"入库时间：{best.created_at}")
+                block = {"text": " · ".join(lines[1:])}
+                if best.image_url:
+                    block["url"] = best.image_url
+                elif best.file_path and os.path.isfile(best.file_path):
+                    block["path"] = best.file_path
+                if "url" in block or "path" in block:
+                    async for result in self._yield_delivery(event, lines[0], [block]):
+                        yield result
                 else:
                     yield event.plain_result(
                         f"✅ 溯源命中（相似度 {best.similarity * 100:.1f}%）#{best.id}，"
@@ -565,7 +759,9 @@ class ImageTracePlugin(Star):
             if not local_path:
                 return "nofile", event.plain_result("⚠️ 未能获取图片内容，图片链接可能已过期。")
             vector = await self.vector.embed_file(local_path)
-            hits = await self.vector.search(vector, limit=self.vector.top_k)
+            hits = await self.vector.search(
+                vector, limit=self.vector.top_k, with_vector=True
+            )
             # 取回的全部达标命中（不止最高分那张），按相似度降序输出；
             # 数量上限即 top_k，需要更多就调大该配置
             good = sorted(
@@ -574,7 +770,8 @@ class ImageTracePlugin(Star):
                 reverse=True,
             )
             if good:
-                return "hit", event.chain_result(self._vector_hits_chain(event, good))
+                good = deduplicate_vector_hits(good, self.vector.duplicate_threshold)
+                return "hit", self._vector_hits_delivery(event, good)
             candidate_lines = [
                 f"· {h['payload'].get('file_name') or str(h['id']).rsplit('/', 1)[-1]}"
                 f" 相似度 {h['score'] * 100:.1f}%"
@@ -603,13 +800,20 @@ class ImageTracePlugin(Star):
         kind, item = await self._vector_search_one(event, seg)
         if kind == "error":
             yield event.plain_result(f"⚠️ 向量检索引擎错误：{item}")
+        elif kind == "hit":
+            async for result in item:
+                yield result
         else:
             yield item
 
     async def _trace_auto(self, event: AstrMessageEvent, seg) -> AsyncGenerator:
         """auto 引擎：向量优先，未命中或引擎不可用时回退哈希。"""
         kind, item = await self._vector_search_one(event, seg)
-        if kind in ("hit", "nofile"):
+        if kind == "hit":
+            async for result in item:
+                yield result
+            return
+        if kind == "nofile":
             yield item
             return
         hash_empty = self.library.count() == 0
@@ -631,25 +835,27 @@ class ImageTracePlugin(Star):
         async for it in self._trace_hash(event, seg):
             yield it
 
-    @staticmethod
-    def _vector_hits_chain(event: AstrMessageEvent, hits: list) -> list:
-        """用 Qdrant 命中点 payload 构造回传链（At + 逐张说明 + 原图 URL）。
-
-        命中多张时按传入顺序（相似度降序）逐张输出，每张图前带序号与相似度；
-        没有直链的条目只列文字，避免整条消息因缺图而失败。
-        """
-        chain = [Comp.At(qq=event.get_sender_id())]
+    def _vector_hits_delivery(self, event: AstrMessageEvent, hits: list):
+        """构造向量命中的去重回传请求，交由统一发送入口处理。"""
+        total_hits = sum(int(hit.get("duplicate_count") or 1) for hit in hits)
+        duplicate_count = total_hits - len(hits)
         multi = len(hits) > 1
-        if not multi:
-            chain.append(Comp.Plain(f" ✅ 向量检索命中（相似度 {hits[0]['score'] * 100:.1f}%）"))
+        if multi:
+            header = f"✅ 向量检索命中 {total_hits} 张（按相似度降序）"
+            if duplicate_count:
+                header += f"，已合并 {duplicate_count} 张重复，回传 {len(hits)} 张"
+            header += "："
         else:
-            chain.append(Comp.Plain(f" ✅ 向量检索命中 {len(hits)} 张（按相似度降序）："))
+            header = f"✅ 向量检索命中（相似度 {hits[0]['score'] * 100:.1f}%）"
+            if duplicate_count:
+                header += f"（已合并 {duplicate_count} 张重复）"
 
+        blocks = []
         for idx, hit in enumerate(hits, 1):
             payload = hit.get("payload") or {}
             file_name = payload.get("file_name") or str(hit.get("id")).rsplit("/", 1)[-1]
             fields = []
-            if multi:  # 单命中时相似度已在抬头里，不再重复
+            if multi:
                 fields.append(f"相似度 {hit['score'] * 100:.1f}%")
             if file_name:
                 fields.append(str(file_name))
@@ -658,39 +864,17 @@ class ImageTracePlugin(Star):
                 fields.append(f"{width}x{height}")
             if payload.get("created_at"):
                 fields.append(str(payload["created_at"]))
+            if int(hit.get("duplicate_count") or 1) > 1:
+                fields.append(f"合并重复 {int(hit['duplicate_count'])} 张")
             prefix = f"{idx}. " if multi else ""
-            chain.append(Comp.Plain("\n" + prefix + " · ".join(fields)))
-            image_url = payload.get("image_url") or ""
+            block = {"text": prefix + " · ".join(fields)}
+            image_url = str(payload.get("image_url") or "")
             if image_url:
-                chain.append(Comp.Image.fromURL(image_url))
+                block["url"] = image_url
             else:
-                chain.append(Comp.Plain("\n（该条目没有可用直链，可能已被删除）"))
-        return chain
-
-    @staticmethod
-    def _best_image_component(match: MatchResult):
-        """回图组件：直链优先，其次仍在磁盘上的本地文件；两者皆无返回 None。"""
-        if match.image_url:
-            return Comp.Image.fromURL(match.image_url)
-        if match.file_path and os.path.isfile(match.file_path):
-            return Comp.Image.fromFileSystem(match.file_path)
-        return None
-
-    @staticmethod
-    def _match_chain(event: AstrMessageEvent, match: MatchResult) -> list:
-        """哈希命中的回传消息链：At + 相似度/备注等信息 + 原图组件（若有）。"""
-        lines = [f"✅ 溯源命中（相似度 {match.similarity * 100:.1f}%）#{match.id}"]
-        if match.note:
-            lines.append(f"备注：{match.note}")
-        if match.width and match.height:
-            lines.append(f"尺寸：{match.width}x{match.height}")
-        if match.created_at:
-            lines.append(f"入库时间：{match.created_at}")
-        chain = [Comp.At(qq=event.get_sender_id()), Comp.Plain(" " + "\n".join(lines))]
-        image_comp = ImageTracePlugin._best_image_component(match)
-        if image_comp is not None:
-            chain.append(image_comp)
-        return chain
+                block["text"] += "\n（该条目没有可用直链，可能已被删除）"
+            blocks.append(block)
+        return self._yield_delivery(event, header, blocks)
 
     @staticmethod
     def _is_negative_answer(text: str) -> bool:
