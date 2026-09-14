@@ -554,17 +554,6 @@ class ImageTracePlugin(Star):
             return file.read()
 
     @staticmethod
-    def _onebot_text(header: str, blocks: list[dict]) -> str:
-        # 空 header 不占位：否则 join 出来的文本会以一个空行开头（/溯源 的
-        # 第二条消息就是 header 为空、只有逐图配文的情形）
-        parts = [header] if header else []
-        for block in blocks:
-            text = str(block.get("text") or "").strip()
-            if text:
-                parts.append(text)
-        return "\n".join(parts)
-
-    @staticmethod
     def _vector_caption(block: dict, compressed: bool) -> str:
         fields = []
         if compressed:
@@ -582,12 +571,29 @@ class ImageTracePlugin(Star):
     async def _send_via_onebot(
         self, event: AstrMessageEvent, header: str, blocks: list[dict], urls: list[str]
     ) -> bool:
+        """通过 OneBot 原生接口直发消息，消息段按「标题 →（配文 → 图片）…」交替排列。
+
+        每张图的配文紧贴在它自己那张图的上方，而不是把所有文字堆在开头、所有
+        图片堆在末尾——后者在多图命中时无法分辨哪句配文属于哪张图。该顺序与
+        标准消息链路径（_yield_delivery 末尾）保持一致，两条发送通道观感相同。
+
+        urls 与 blocks 中的有图 block 同序一一对应；调用方（_yield_delivery 的
+        URL 直传分支、_send_prompt）已保证两者数量相等，故这里按遍历到的有图
+        block 依次取用，无需再做长度校验。
+        """
         message = []
         sender_id = event.get_sender_id()
         if sender_id:
             message.append({"type": "at", "data": {"qq": str(sender_id)}})
-        message.append({"type": "text", "data": {"text": self._onebot_text(header, blocks) + "\n"}})
-        message.extend({"type": "image", "data": {"file": url}} for url in urls)
+        if header:
+            message.append({"type": "text", "data": {"text": header + "\n"}})
+        pending_urls = iter(urls)
+        for block in blocks:
+            text = str(block.get("text") or "").strip()
+            if text:
+                message.append({"type": "text", "data": {"text": text + "\n"}})
+            if block.get("url") or block.get("path"):
+                message.append({"type": "image", "data": {"file": next(pending_urls)}})
 
         params: dict = {"message": message}
         group_id = event.get_group_id()

@@ -1,6 +1,6 @@
 # astrbot_plugin_image_trace 图片溯源
 
-[![version](https://img.shields.io/badge/version-1.5.1-blue)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.5.2-blue)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](./LICENSE)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
@@ -57,7 +57,7 @@ flowchart LR
 - **发图溯源**：与图片同条消息发送 `/溯源`，或引用一张图片发送 `/溯源`，插件按当前引擎检索最相似的原图，达标即自动回传原图与相似度信息。
 - **向量引擎（可选，v1.2.0）**：配置 `vector_search` 后，用多模态向量 AI（OpenAI 兼容 `/v1/embeddings`，如 Qwen3-VL-Embedding 系）把查询图转成向量，到 Qdrant 向量库检索图床图片；图床侧每张上传由服务器钩子实时向量化入库。检索走 cosine 相似度，对压缩、缩放、裁剪、水印等改动比哈希更鲁棒，覆盖哈希难判定的构图近似变体。
 - **URL 直传与去重（v1.4.0）**：QQ `aiocqhttp` 平台优先用 OneBot 原生接口直传图床 URL；CloudFlare-ImgBed 直链默认附加官方 `width` / `height` / `fallback=original` 等比缩放参数，失败后回退本地压缩。向量命中先按 `src` / `image_url` 与候选向量相似度合并重复图，每组只回传一张代表图；去重详情只写入日志。
-- **向量命中先提示、合并回传（v1.5.1）**：先单独发送命中提示与“图片发送可能有延迟”，随后用**一条**消息回传全部相似图（此前是每张图各发一条），每张图各带一句文件名配文；缩放或压缩图在配文里标注“已压缩，可发送 `/原图` 获取原图”。
+- **向量命中先提示、合并回传（v1.5.2）**：先单独发送命中提示与“图片发送可能有延迟”，随后用**一条**消息回传全部相似图（此前是每张图各发一条）；该消息内**图文交替排列**，每张图的配文紧贴在自己那张图上方，一一对应、便于扫读。缩放或压缩图在配文里标注“已压缩，可发送 `/原图` 获取原图”。
 - **随机图与 /原图 直取（v1.5.0）**：`/随机图 [目录]`、`/随机视频 [目录]` 直接从 CloudFlare-ImgBed 随机图接口取图回传（LLM 工具 `sendRandomMedia` 亦可调用），回传方式复用「图片回传设置」，无需另配发送策略；新增 `/原图 [文件名]` 从会话级原图历史找回最近回传图片的原图，按图床读取 API 口径剥离 `width` / `height` / `fit` / `fallback` 后**原图 URL 直传、不下载不本地中转**。随机图接口出网同受 SSRF 校验，图床须公网可达。
 - **感知哈希特征**：pHash（DCT 感知哈希，默认 256bit）+ dHash + aHash，对压缩、缩放、轻微水印、EXIF 旋转均有较强鲁棒性；GIF 取首帧。纯 Pillow + numpy 实现，无需 scipy/GPU。
 - **可选 AI 复核**：开启 `ai_verify` 后，哈希命中的候选图会交给当前会话的视觉大模型二次确认"是否同一张图"，进一步降低误报；未配置视觉模型时自动跳过。
