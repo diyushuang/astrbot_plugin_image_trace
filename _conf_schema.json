@@ -451,6 +451,63 @@
       }
     }
   },
+  "random_media": {
+    "description": "随机图设置（CloudFlare-ImgBed 随机图接口）",
+    "type": "object",
+    "hint": "通过图床随机图接口（GET /random）取图；/随机图、/随机视频、/原图 与 LLM 工具 sendRandomMedia 均依赖本组配置。前置条件：须先在 ImgBed 站点后台开启「随机图」功能，否则取图会失败（插件会给出对应提示）。图床须公网可达（插件出网经 SSRF 校验，不接受内网地址）。回传方式复用上方「图片回传设置」组，本组不重复配置。",
+    "items": {
+      "base_url": {
+        "description": "【必填】图床站点地址",
+        "type": "string",
+        "default": "",
+        "obvious_hint": true,
+        "hint": "你部署的 CloudFlare-ImgBed 站点首页地址，如 https://img.example.com（不带尾斜杠，且不能含账号密码/查询参数）。必须是公网可访问的 http/https 地址。"
+      },
+      "api_endpoint": {
+        "description": "【选填】随机图接口路径",
+        "type": "string",
+        "default": "/random",
+        "hint": "随机图接口的相对路径，默认 /random。必须是相对路径（不能填完整 URL）。"
+      },
+      "api_token": {
+        "description": "【选填】随机图接口 Token",
+        "type": "string",
+        "secret": true,
+        "default": "",
+        "hint": "以 Authorization: Bearer 请求头发送；站点未开启鉴权时留空。注意：配置 Token 时图床地址必须为 https，否则插件会拒绝请求以防明文泄露。"
+      },
+      "default_dir": {
+        "description": "【选填】默认目录",
+        "type": "string",
+        "default": "",
+        "hint": "未在命令中指定目录时，从该相对目录（含子目录）取随机图，如 风景/2026。留空则从图床根目录取图。"
+      },
+      "timeout": {
+        "description": "【选填】请求超时（秒）",
+        "type": "float",
+        "default": 10,
+        "hint": "随机图接口单次请求的超时时间。"
+      },
+      "retry_count": {
+        "description": "【选填】失败重试次数",
+        "type": "int",
+        "default": 3,
+        "hint": "请求失败（网络错误或非 200 响应）时的重试次数，采用指数退避，范围 0~10。403 不重试（属配置前置条件，重试无意义）。"
+      },
+      "show_file_info": {
+        "description": "【选填】回传时附带文件名",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后随机媒体文案会带上文件名（如 “🖼️ 风景.jpg”）；关闭只显示“随机图片发送成功/随机视频发送成功”。"
+      },
+      "enable_llm": {
+        "description": "【选填】允许 LLM 工具调用",
+        "type": "bool",
+        "default": true,
+        "hint": "是否允许 LLM 通过 sendRandomMedia 工具请求随机图；关闭后仅可用 /随机图、/随机视频 命令，工具调用会提示已禁用。"
+      }
+    }
+  },
   "ai_verify": {
     "description": "【选填】AI 视觉复核",
     "type": "bool",

@@ -1,6 +1,6 @@
 # astrbot_plugin_image_trace 图片溯源
 
-[![version](https://img.shields.io/badge/version-1.4.1-blue)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.5.1-blue)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](./LICENSE)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
@@ -19,13 +19,16 @@ flowchart LR
     A["登记：原图 + /登记原图"] --> B["图床 / 对象存储 / 本地副本"]
     B --> C["向量入库（图床侧钩子或插件同步）"]
     A --> D["本地哈希库"]
+    M["/随机图 /随机视频 + LLM 工具 sendRandomMedia"] --> N["CloudFlare-ImgBed GET /random 取随机图/视频"]
     E["查询：发图 / 引用图 + /溯源"] --> F{search_engine}
     F -- "auto：向量优先" --> G["多模态 AI 向量化 → Qdrant 检索"]
     F -- "回退 / hash" --> H["pHash 汉明距离比对"]
     G --> I{"相似度 ≥ 阈值"}
     H --> I
-    I -- 命中 --> J["回传原图 + 相似度"]
+    I -- 命中 --> J["先发命中提示，再一条消息回传全部相似图（记入会话级原图历史）"]
     I -- 未命中 --> K["提示未找到（哈希引擎可展示最接近候选）"]
+    N --> J
+    J --> L["/原图 [文件名]：剥离 width/height/fit/fallback，原图 URL 直取（不下载、不本地中转）"]
 ```
 
 ## 目录
@@ -54,7 +57,8 @@ flowchart LR
 - **发图溯源**：与图片同条消息发送 `/溯源`，或引用一张图片发送 `/溯源`，插件按当前引擎检索最相似的原图，达标即自动回传原图与相似度信息。
 - **向量引擎（可选，v1.2.0）**：配置 `vector_search` 后，用多模态向量 AI（OpenAI 兼容 `/v1/embeddings`，如 Qwen3-VL-Embedding 系）把查询图转成向量，到 Qdrant 向量库检索图床图片；图床侧每张上传由服务器钩子实时向量化入库。检索走 cosine 相似度，对压缩、缩放、裁剪、水印等改动比哈希更鲁棒，覆盖哈希难判定的构图近似变体。
 - **URL 直传与去重（v1.4.0）**：QQ `aiocqhttp` 平台优先用 OneBot 原生接口直传图床 URL；CloudFlare-ImgBed 直链默认附加官方 `width` / `height` / `fallback=original` 等比缩放参数，失败后回退本地压缩。向量命中先按 `src` / `image_url` 与候选向量相似度合并重复图，每组只回传一张代表图；去重详情只写入日志。
-- **向量命中逐图回传（v1.4.1）**：先发送命中提示与“图片发送可能有延迟”，再逐条发送相似图文件名和图片；缩放或压缩图在文件名前标注“已压缩 /原图”。
+- **向量命中先提示、合并回传（v1.5.1）**：先单独发送命中提示与“图片发送可能有延迟”，随后用**一条**消息回传全部相似图（此前是每张图各发一条），每张图各带一句文件名配文；缩放或压缩图在配文里标注“已压缩，可发送 `/原图` 获取原图”。
+- **随机图与 /原图 直取（v1.5.0）**：`/随机图 [目录]`、`/随机视频 [目录]` 直接从 CloudFlare-ImgBed 随机图接口取图回传（LLM 工具 `sendRandomMedia` 亦可调用），回传方式复用「图片回传设置」，无需另配发送策略；新增 `/原图 [文件名]` 从会话级原图历史找回最近回传图片的原图，按图床读取 API 口径剥离 `width` / `height` / `fit` / `fallback` 后**原图 URL 直传、不下载不本地中转**。随机图接口出网同受 SSRF 校验，图床须公网可达。
 - **感知哈希特征**：pHash（DCT 感知哈希，默认 256bit）+ dHash + aHash，对压缩、缩放、轻微水印、EXIF 旋转均有较强鲁棒性；GIF 取首帧。纯 Pillow + numpy 实现，无需 scipy/GPU。
 - **可选 AI 复核**：开启 `ai_verify` 后，哈希命中的候选图会交给当前会话的视觉大模型二次确认"是否同一张图"，进一步降低误报；未配置视觉模型时自动跳过。
 - **泛用图床与储存桶接口**：登记原图的存储位置分两组配置，二选一即可——
@@ -73,6 +77,11 @@ flowchart LR
 | `/溯源重扫 [force]` | - | 扫描 `scan_dirs` 目录建立/更新索引；`force` 重建全部 | 管理员 |
 | `/溯源删除 <编号>` | - | 按 ID 删除图库条目（同步清理插件侧写入的向量点、远端对象与本地副本） | 管理员 |
 | `/溯源帮助` | - | 使用帮助 | 所有人 |
+| `/随机图 [目录]` | `/随机图片` | 从图床随机图接口取一张随机图片并回传；可选指定目录 | 所有人 |
+| `/随机视频 [目录]` | - | 从图床随机图接口取一段随机视频并回传；可选指定目录 | 所有人 |
+| `/原图 [文件名]` | - | 从会话级原图历史找回最近回传图片的原图（URL 直传，不本地中转） | 所有人 |
+
+> 注意：`/原图` 与 `/登记原图` 是**两个不同的命令**——`/原图` 是**找回**已回传图片的原图（本文档「随机图与 /原图 直取」特性）；`/登记原图` 是把图片**登记入库**（默认仅管理员）。二者不冲突、名字相近，注意区分。
 
 ## 安装
 
@@ -252,6 +261,14 @@ v1.3.0 起，两种对象存储从图床模式中独立为单独的**储存桶�
 | `image_delivery.mode` | `scaled-url` | 回图模式：`scaled-url`（ImgBed 等比缩放 URL 直传，默认）/ `original-url`（原图 URL 直传）/ `local-compress`（本地压缩） |
 | `image_delivery.max_side` | `1920` | 缩放或本地压缩的最长边，范围 1~4096 |
 | `image_delivery.quality` | `85` | 本地 JPEG 压缩质量，范围 1~100 |
+| `random_media.base_url` | - | 【必填】随机图图床站点地址（公网可达的 http/https）；`/随机图`、`/随机视频`、`/原图` 与 LLM 工具 `sendRandomMedia` 均依赖本组 |
+| `random_media.api_endpoint` | `/random` | 随机图接口相对路径（不能填完整 URL） |
+| `random_media.api_token` | - | 随机图接口 Token（`Authorization: Bearer`）；配置 Token 时图床地址必须为 `https`，否则插件拒绝请求 |
+| `random_media.default_dir` | - | 未在命令中指定目录时使用的默认目录（如 `风景/2026`），留空则从图床根目录取图 |
+| `random_media.timeout` | `10` | 随机图接口单次请求超时（秒） |
+| `random_media.retry_count` | `3` | 失败重试次数（指数退避，范围 0~10）；403 不重试 |
+| `random_media.show_file_info` | `true` | 回传随机媒体时是否附带文件名 |
+| `random_media.enable_llm` | `true` | 是否允许 LLM 工具 `sendRandomMedia` 调用随机图 |
 | `similarity_threshold` | `0.85` | 相似度阈值（0~1，哈希引擎），相似度 = 1 - 汉明距离/总位数 |
 | `storage_bucket.mode` | `none` | 储存桶模式：`none`（不使用）/ `cloudflare_r2` / `oracle_oci`；**配置完整时优先于图床设置**；选定模式后组内展开对应字段 |
 | `storage_bucket.r2_*` | - | cloudflare_r2：账户 ID、API 令牌凭据、存储桶、endpoint、公开访问域名 |
@@ -274,10 +291,11 @@ v1.3.0 起，两种对象存储从图床模式中独立为单独的**储存桶�
 3. **特征计算**：灰度化 → EXIF 转正 → 缩放 → DCT（预计算正交矩阵）→ 低频中值二值化得到 pHash；辅以 dHash/aHash。计算在 `asyncio.to_thread` 中执行，不阻塞事件循环。
 4. **相似度检索**：图库哈希常驻内存（numpy 位矩阵，整体替换 + 快照读），XOR + 查表 popcount 批量计算汉明距离，数万张图毫秒级检索；dHash/aHash 一并入库留存，预留给后续的二级确认，当前检索仅使用 pHash。
 5. **结果回传**：QQ `aiocqhttp` 优先经 OneBot 原生接口逐条直传缩放 URL，失败后回退本地压缩；其他平台走标准消息链。向量命中先合并重复图（详情写日志），再逐条回传代表图与相似度、尺寸等信息。
+6. **随机图与原图直取**：`/随机图`、`/随机视频` 经随机图接口（GET `/random`，出网同受 SSRF 校验）取到媒体直链后，图片复用上面的统一回传入口、视频走标准消息链；`/溯源` 与 `/随机图` 命中回传的图片都会记入会话级原图历史，`/原图` 据此把原图直链（剥离 ImgBed 缩放参数）直接下发，不下载不本地中转。
 
 ## 项目结构与开发
 
-代码按职责拆分为 10 个模块，依赖方向单向（`main` → 各子模块；子模块 → `common` / `http_client` / `url_guard`）：
+代码按职责拆分为 12 个模块，依赖方向单向（`main` → 各子模块；子模块 → `common` / `http_client` / `url_guard`）：
 
 | 文件 | 职责 | 关键约束 |
 | --- | --- | --- |
@@ -287,6 +305,8 @@ v1.3.0 起，两种对象存储从图床模式中独立为单独的**储存桶�
 | `library.py` | SQLite 图库 + 内存哈希位矩阵检索 | 写路径持锁，缓存整体替换 + 快照读；重操作需经 `asyncio.to_thread` 调用 |
 | `image_bed.py` | 图床与储存桶各模式的上传、直链反解、远端删除 | 上传失败一律回退本地副本，登记流程不中断 |
 | `image_delivery.py` | URL 缩放、本地压缩、向量命中去重的纯函数 | 不直接访问网络或 AstrBot 事件，便于独立测试 |
+| `random_media.py` | ImgBed 随机图接口客户端与响应解析纯函数 | 出网经共享 HTTP 客户端；403 特判不重试；只取直链、不落地字节 |
+| `media_history.py` | 会话级原图历史（LRU + 别名键） | 按会话/会话数封顶；主键与展示名双索引 |
 | `s3_store.py` | 纯标准库 AWS SigV4 签名 + 最小 S3 兼容客户端 | 签名与 URL/方法绑定，被重定向即报错而非复用签名 |
 | `vector_search.py` | Qdrant 检索 + OpenAI 兼容 embeddings 客户端 | embed 三值须与图床入库侧一致；错误统一归为 `VectorEngineError` |
 | `url_guard.py` | SSRF 防护：逐跳校验、IP 钉扎、响应限长 | 所有出网经共享 HTTP 客户端调用，不绕过防护 |
@@ -316,7 +336,7 @@ v1.3.0 起，两种对象存储从图床模式中独立为单独的**储存桶�
   `value or default`（会把合法的 0 / False 吞掉）；
 - 涉及 SQLite 或大文件复制的调用若出现在 async 上下文，应包 `asyncio.to_thread`；
 - 群聊回复文案保持脱敏：含内网地址 / Key 的错误细节只进日志，不进群聊；
-- 发布包按白名单打包 16 个文件（10 个 `.py` + README / CHANGELOG / metadata /
+- 发布包按白名单打包 18 个文件（12 个 `.py` + README / CHANGELOG / metadata /
   requirements / _conf_schema / LICENSE），不含 `.git`、`data/` 与会话状态目录。
 
 ## 常见问题

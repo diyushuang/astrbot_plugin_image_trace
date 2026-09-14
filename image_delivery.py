@@ -70,6 +70,26 @@ def build_scaled_url(url: str, max_side: int) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
 
 
+def build_original_url(url: str) -> str:
+    """还原 ImgBed 读取 API 意义上的“未处理原文件”直链。
+
+    与 build_scaled_url 对称：后者追加 width/height/fallback 处理参数，本函数
+    反向剥离这些参数。之所以需要它：回传用的直链在历史里可能已带缩放参数
+    （例如用户曾手动发过缩放链接、或旧版本写入过），/原图 若直接复用，拿到的
+    仍是处理后的版本，与“原图”语义不符。非 ImgBed /file/ 直链原样返回——其他
+    图床没有这套处理参数，改动其查询串反而可能破坏签名或鉴权。
+    """
+    if not is_cloudflare_imgbed_url(url):
+        return url
+    parsed = urlsplit(url)
+    query = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key.lower() not in IMGBED_MANAGED_QUERY_KEYS
+    ]
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
+
+
 def is_napcat_parseable_url(url: str) -> bool:
     """判断 URL 扩展名对应的格式能否被 QQ 协议端解析出宽高。"""
     try:
@@ -77,6 +97,28 @@ def is_napcat_parseable_url(url: str) -> bool:
     except Exception:
         return False
     return any(path.endswith(extension) for extension in NAPCAT_PARSEABLE_EXTENSIONS)
+
+
+def upgrade_to_https(url: str, base_url: str) -> str:
+    """把与 base 同域的 http 直链升级为 https，其余原样返回。
+
+    OneBot 直传前减少一次 301 跳转：部分协议端在跳转时会丢失查询参数或被
+    CDN 拒绝，直接给 https 更稳。仅当 base 本身是 https 且两者同域（主机名与
+    端口一致）时才升级，避免把第三方 http 地址误改。
+    """
+    try:
+        base = urlsplit(str(base_url or ""))
+        target = urlsplit(str(url or ""))
+    except Exception:
+        return url
+    if (
+        base.scheme == "https"
+        and target.scheme == "http"
+        and target.netloc
+        and target.netloc.lower() == base.netloc.lower()
+    ):
+        return urlunsplit(("https", target.netloc, target.path, target.query, target.fragment))
+    return url
 
 
 def sniff_image_format(data: bytes) -> str | None:

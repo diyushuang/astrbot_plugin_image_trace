@@ -46,14 +46,26 @@ try:
     from .http_client import GuardedHttpClient
     from .image_bed import MODE_CFB, ImageBedClient
     from .image_delivery import (
+        bounded_int,
+        build_original_url,
         build_scaled_url,
         deduplicate_vector_hits,
         delivery_settings,
         is_napcat_parseable_url,
         prepare_image_bytes,
         sniff_image_format,
+        upgrade_to_https,
     )
     from .library import ImageLibrary
+    from .media_history import MediaHistory
+    from .random_media import (
+        RANDOM_ENDPOINT_DEFAULT,
+        RandomMediaClient,
+        RandomMediaError,
+        extract_directory,
+        media_filename,
+        media_kind,
+    )
     from .vector_search import VectorEngine, VectorEngineError
 except ImportError:  # 兼容插件以独立模块方式加载
     from common import (  # type: ignore[no-redef]
@@ -78,14 +90,26 @@ except ImportError:  # 兼容插件以独立模块方式加载
     from http_client import GuardedHttpClient  # type: ignore[no-redef]
     from image_bed import MODE_CFB, ImageBedClient  # type: ignore[no-redef]
     from image_delivery import (  # type: ignore[no-redef]
+        bounded_int,
+        build_original_url,
         build_scaled_url,
         deduplicate_vector_hits,
         delivery_settings,
         is_napcat_parseable_url,
         prepare_image_bytes,
         sniff_image_format,
+        upgrade_to_https,
     )
     from library import ImageLibrary  # type: ignore[no-redef]
+    from media_history import MediaHistory  # type: ignore[no-redef]
+    from random_media import (  # type: ignore[no-redef]
+        RANDOM_ENDPOINT_DEFAULT,
+        RandomMediaClient,
+        RandomMediaError,
+        extract_directory,
+        media_filename,
+        media_kind,
+    )
     from vector_search import VectorEngine, VectorEngineError  # type: ignore[no-redef]
 
 PLUGIN_NAME = "astrbot_plugin_image_trace"
@@ -164,6 +188,9 @@ class ImageTracePlugin(Star):
         self._http: GuardedHttpClient | None = None
         self.bed = ImageBedClient(self.data_dir, self._bed_cfg, self._get_http)
         self.vector = VectorEngine(config, self._get_http)
+        # 回传过的原图直链的历史（供 /原图 找回）；随机图客户端惰性构造
+        self.history = MediaHistory()
+        self._random_media_client: RandomMediaClient | None = None
         self._cleanup_tmp()
         engine = self._engine_choice()
         vector_note = "（向量引擎已启用）" if self.vector.enabled and engine != "hash" else ""
@@ -458,6 +485,61 @@ class ImageTracePlugin(Star):
     def _delivery_config(self) -> tuple[str, int, int]:
         return delivery_settings(self.config.get("image_delivery"))
 
+    def _random_settings(self) -> dict:
+        """归一化随机图配置组（random_media）。
+
+        与其它配置组同源：数值用 common 的容错解析、布尔用真值表、空串按未
+        配置处理。缺 base_url 时不在这里拦截，交由 RandomMediaClient 抛
+        RandomMediaError，使“未配置”提示集中在一处。
+        """
+        raw = self._dict_cfg("random_media")
+        timeout = as_float(raw.get("timeout"), 10.0)
+        if timeout <= 0:
+            # 0/负数会让请求立即超时，回退默认值
+            timeout = 10.0
+        return {
+            "base_url": str(raw.get("base_url") or "").strip(),
+            "api_endpoint": str(raw.get("api_endpoint") or RANDOM_ENDPOINT_DEFAULT).strip()
+            or RANDOM_ENDPOINT_DEFAULT,
+            "api_token": str(raw.get("api_token") or "").strip(),
+            "default_dir": str(raw.get("default_dir") or "").strip(),
+            "timeout": timeout,
+            "retry_count": bounded_int(raw.get("retry_count"), 3, 0, 10),
+            "show_file_info": self._random_bool(raw.get("show_file_info"), True),
+            "enable_llm": self._random_bool(raw.get("enable_llm"), True),
+        }
+
+    @staticmethod
+    def _random_bool(value, default: bool) -> bool:
+        """random_media 组的布尔取值：未配置取默认，其余按真值表解释。"""
+        if is_blank(value):
+            return default
+        return truthy(value)
+
+    def _random_client(self) -> RandomMediaClient:
+        """惰性构造随机图客户端；配置在插件加载时读入，改动后重载生效。"""
+        if self._random_media_client is None:
+            self._random_media_client = RandomMediaClient(self._random_settings(), self._get_http)
+        return self._random_media_client
+
+    @staticmethod
+    def _session_key(event: AstrMessageEvent) -> str:
+        """会话唯一标识，用于隔离 /原图 的图片历史。"""
+        return str(getattr(event, "unified_msg_origin", None) or "default")
+
+    def _remember_blocks(self, event: AstrMessageEvent, blocks: list[dict]) -> None:
+        """把本次回传的原图直链记入会话历史，供 /原图 找回。
+
+        /溯源 的哈希与向量两条路径、以及 /随机图 现在都经 _yield_delivery
+        回传（向量命中额外带 mark_compressed=True 生成逐图配文），因此只需在
+        这一个入口收口，避免在各命令里分别维护历史而漏记。
+        """
+        session = self._session_key(event)
+        for block in blocks:
+            url = str(block.get("url") or "").strip()
+            if url:
+                self.history.remember(session, url, display_name=block.get("file_name"))
+
     def _can_send_via_onebot(self, event: AstrMessageEvent) -> bool:
         try:
             if event.get_platform_name() != "aiocqhttp":
@@ -473,7 +555,9 @@ class ImageTracePlugin(Star):
 
     @staticmethod
     def _onebot_text(header: str, blocks: list[dict]) -> str:
-        parts = [header]
+        # 空 header 不占位：否则 join 出来的文本会以一个空行开头（/溯源 的
+        # 第二条消息就是 header 为空、只有逐图配文的情形）
+        parts = [header] if header else []
         for block in blocks:
             text = str(block.get("text") or "").strip()
             if text:
@@ -484,7 +568,9 @@ class ImageTracePlugin(Star):
     def _vector_caption(block: dict, compressed: bool) -> str:
         fields = []
         if compressed:
-            fields.append("已压缩 /原图")
+            # 只给一句用法说明，不再抄文件名：/原图 不带参数即取最近一张，
+            # 文案里重复文件名属于冗余（见需求 3）
+            fields.append("已压缩，可发送 /原图 获取原图")
         file_name = str(block.get("file_name") or "").strip()
         if file_name:
             fields.append(file_name)
@@ -523,6 +609,36 @@ class ImageTracePlugin(Star):
             return False
         logger.info(f"OneBot URL 直传图片成功: {action}")
         return True
+
+    async def _send_prompt(self, event: AstrMessageEvent, text: str) -> bool:
+        """发送一条纯文本提示，返回是否已由 OneBot 原生发出。
+
+        OneBot（aiocqhttp）下走原生 call_action 单发文本，命中提示就不会跟
+        图片挤在同一条消息里；其余平台或发送失败时返回 False，由调用方
+        yield plain_result 兜底，保证提示不丢。
+        """
+        if self._can_send_via_onebot(event):
+            return await self._send_via_onebot(event, text, [], [])
+        return False
+
+    def _mark_compressed_captions(
+        self, blocks: list[dict], image_flags: list[bool]
+    ) -> None:
+        """为 mark_compressed 路径写入逐图配文。
+
+        image_flags 与 blocks 中的有图 block 一一对应（同序于 scaled/original
+        URL 列表或 _prepare_delivery_blocks 的输出）；无图 block（例如没有可用
+        直链的条目）按未压缩处理，但它也要拿到配文，才不会在合并消息里消失。
+        仅在 mark_compressed 为真时调用，默认路径不触碰 block["text"]。
+        """
+        index = 0
+        for block in blocks:
+            if block.get("url") or block.get("path"):
+                compressed = image_flags[index]
+                index += 1
+            else:
+                compressed = False
+            block["text"] = self._vector_caption(block, compressed)
 
     async def _load_delivery_bytes(self, block: dict) -> bytes | None:
         url = str(block.get("url") or "")
@@ -567,9 +683,31 @@ class ImageTracePlugin(Star):
                 prepared.append(result)
         return prepared
 
-    async def _yield_delivery(self, event: AstrMessageEvent, header: str, blocks: list[dict]):
-        """统一回传入口：URL 直传优先，本地压缩只作为失败回退。"""
+    async def _yield_delivery(
+        self,
+        event: AstrMessageEvent,
+        header: str,
+        blocks: list[dict],
+        *,
+        mode_override: str | None = None,
+        allow_local_fallback: bool = True,
+        mark_compressed: bool = False,
+    ):
+        """统一回传入口：URL 直传优先，本地压缩只作为失败回退。
+
+        mode_override 供 /原图 强制走 original-url、无视全局回传模式；
+        allow_local_fallback=False 时彻底不进入下载字节/本地压缩分支，保证
+        /原图 只发 URL、不落地字节。两参数均有默认值。
+
+        mark_compressed 供 /溯源 向量命中启用：为真时按各回传路径实际的压缩
+        情形写入 block["text"]（含文件名与「已压缩」用法说明），使合并消息里
+        每张图各带一句配文。为假时一个字节都不碰 block——哈希 /随机图 /原图
+        三处既有调用点行为与改造前一致。
+        """
+        self._remember_blocks(event, blocks)
         mode, max_side, _ = self._delivery_config()
+        if mode_override is not None:
+            mode = mode_override
         image_blocks = [block for block in blocks if block.get("url") or block.get("path")]
         original_urls = [str(block["url"]) for block in image_blocks if block.get("url")]
 
@@ -582,46 +720,84 @@ class ImageTracePlugin(Star):
                 is_napcat_parseable_url(url) for url in original_urls
             ):
                 scaled_urls = [build_scaled_url(url, max_side) for url in original_urls]
+                if mark_compressed:
+                    self._mark_compressed_captions(
+                        blocks,
+                        [
+                            sent != url
+                            for sent, url in zip(
+                                scaled_urls, original_urls, strict=True
+                            )
+                        ],
+                    )
                 if await self._send_via_onebot(event, header, blocks, scaled_urls):
                     event.stop_event()
                     return
-                if scaled_urls != original_urls and await self._send_via_onebot(
-                    event, header, blocks, original_urls
-                ):
-                    event.stop_event()
-                    return
+                if scaled_urls != original_urls:
+                    if mark_compressed:
+                        self._mark_compressed_captions(blocks, [False] * len(image_blocks))
+                    if await self._send_via_onebot(
+                        event, header, blocks, original_urls
+                    ):
+                        event.stop_event()
+                        return
             elif mode == "original-url":
+                if mark_compressed:
+                    self._mark_compressed_captions(blocks, [False] * len(image_blocks))
                 if await self._send_via_onebot(event, header, blocks, original_urls):
                     event.stop_event()
                     return
 
-        should_compress = mode == "local-compress" or (
-            mode == "scaled-url"
-            and any(block.get("path") for block in image_blocks)
-        )
-        onebot_failed = self._can_send_via_onebot(event) and mode in {"scaled-url", "original-url"}
-        if should_compress or (onebot_failed and len(original_urls) == len(image_blocks)):
-            prepared = await self._prepare_delivery_blocks(
-                image_blocks, compress=mode != "original-url"
+        if allow_local_fallback:
+            should_compress = mode == "local-compress" or (
+                mode == "scaled-url"
+                and any(block.get("path") for block in image_blocks)
             )
-            if prepared is not None:
-                fallback_header = header
-                if any(compressed for _, compressed in prepared):
-                    fallback_header += "（已压缩）"
-                chain = [Comp.At(qq=event.get_sender_id()), Comp.Plain(" " + fallback_header)]
-                image_index = 0
-                for block in blocks:
-                    if block.get("text"):
-                        chain.append(Comp.Plain("\n" + str(block["text"])))
-                    if block.get("url") or block.get("path"):
-                        data, _ = prepared[image_index]
-                        chain.append(Comp.Image.fromBytes(data))
-                        image_index += 1
-                yield event.chain_result(chain)
-                return
-            logger.warning("本地图片回退失败，改用标准消息链 URL 发送")
+            onebot_failed = self._can_send_via_onebot(event) and mode in {
+                "scaled-url",
+                "original-url",
+            }
+            if should_compress or (onebot_failed and len(original_urls) == len(image_blocks)):
+                prepared = await self._prepare_delivery_blocks(
+                    image_blocks, compress=mode != "original-url"
+                )
+                if prepared is not None:
+                    if mark_compressed:
+                        self._mark_compressed_captions(
+                            blocks, [compressed for _, compressed in prepared]
+                        )
+                    fallback_header = header
+                    if any(compressed for _, compressed in prepared):
+                        fallback_header += "（已压缩）"
+                    chain = [Comp.At(qq=event.get_sender_id())]
+                    if fallback_header:
+                        chain.append(Comp.Plain(" " + fallback_header))
+                    image_index = 0
+                    for block in blocks:
+                        if block.get("text"):
+                            chain.append(Comp.Plain("\n" + str(block["text"])))
+                        if block.get("url") or block.get("path"):
+                            data, _ = prepared[image_index]
+                            chain.append(Comp.Image.fromBytes(data))
+                            image_index += 1
+                    yield event.chain_result(chain)
+                    return
+                logger.warning("本地图片回退失败，改用标准消息链 URL 发送")
 
-        chain = [Comp.At(qq=event.get_sender_id()), Comp.Plain(" " + header)]
+        if mark_compressed:
+            flags = []
+            for block in image_blocks:
+                url = str(block.get("url") or "")
+                target_url = (
+                    build_scaled_url(url, max_side)
+                    if url and mode == "scaled-url"
+                    else url
+                )
+                flags.append(target_url != url)
+            self._mark_compressed_captions(blocks, flags)
+        chain = [Comp.At(qq=event.get_sender_id())]
+        if header:
+            chain.append(Comp.Plain(" " + header))
         for block in blocks:
             if block.get("text"):
                 chain.append(Comp.Plain("\n" + str(block["text"])))
@@ -633,73 +809,6 @@ class ImageTracePlugin(Star):
             elif path:
                 chain.append(Comp.Image.fromFileSystem(path))
         yield event.chain_result(chain)
-
-    async def _yield_separated_delivery(
-        self, event: AstrMessageEvent, header: str, blocks: list[dict]
-    ):
-        mode, max_side, _ = self._delivery_config()
-        onebot = self._can_send_via_onebot(event)
-        prompt_sent = False
-        used_onebot = False
-        if onebot and await self._send_via_onebot(event, header, [], []):
-            prompt_sent = True
-            used_onebot = True
-        if not prompt_sent:
-            yield event.plain_result(header)
-
-        for block in blocks:
-            url = str(block.get("url") or "")
-            path = str(block.get("path") or "")
-            direct_url = ""
-            if onebot and url and mode in {"scaled-url", "original-url"}:
-                if mode == "scaled-url" and is_napcat_parseable_url(url):
-                    direct_url = build_scaled_url(url, max_side)
-                elif mode == "original-url":
-                    direct_url = url
-
-            if direct_url:
-                block["text"] = self._vector_caption(block, direct_url != url)
-                if await self._send_via_onebot(event, block["text"], [block], [direct_url]):
-                    used_onebot = True
-                    continue
-                if direct_url != url:
-                    block["text"] = self._vector_caption(block, False)
-                    if await self._send_via_onebot(event, block["text"], [block], [url]):
-                        used_onebot = True
-                        continue
-
-            if not url and not path:
-                caption = self._vector_caption(block, False)
-                yield event.plain_result(caption)
-                continue
-
-            needs_local_bytes = mode == "local-compress" or (
-                mode == "scaled-url" and path
-            ) or (onebot and url and mode in {"scaled-url", "original-url"})
-            if needs_local_bytes:
-                prepared = await self._prepare_delivery_blocks([block], compress=True)
-                if prepared is not None:
-                    data, compressed = prepared[0]
-                    caption = self._vector_caption(block, compressed)
-                    chain = [
-                        Comp.At(qq=event.get_sender_id()),
-                        Comp.Plain(" " + caption),
-                        Comp.Image.fromBytes(data),
-                    ]
-                    yield event.chain_result(chain)
-                    continue
-                logger.warning("本地图片回退失败，改用标准消息链 URL 发送")
-
-            target_url = build_scaled_url(url, max_side) if url and mode == "scaled-url" else url
-            caption = self._vector_caption(block, bool(url and target_url != url))
-            chain = [Comp.At(qq=event.get_sender_id()), Comp.Plain(" " + caption)]
-            if url:
-                chain.append(Comp.Image.fromURL(target_url))
-            else:
-                chain.append(Comp.Image.fromFileSystem(path))
-            yield event.chain_result(chain)
-        if used_onebot:
-            event.stop_event()
 
     # ------------------------------------------------------------------
     # 指令：溯源
@@ -918,7 +1027,12 @@ class ImageTracePlugin(Star):
     async def _vector_hits_delivery(
         self, event: AstrMessageEvent, hits: list
     ) -> AsyncGenerator:
-        """构造向量命中的去重回传请求，逐图独立发送。"""
+        """构造向量命中的去重回传请求。
+
+        先发一条纯文本命中提示，再把全部相似图合并进单独一条消息：第二条走
+        _yield_delivery 的统一入口（一条消息含多图），逐图配文由 mark_compressed
+        按各回传路径的实际压缩情形写入，因此不再重复命中提示标题。
+        """
         total_hits = sum(int(hit.get("duplicate_count") or 1) for hit in hits)
         duplicate_count = total_hits - len(hits)
         multi = len(hits) > 1
@@ -976,8 +1090,16 @@ class ImageTracePlugin(Star):
             else:
                 block["fields"].append("该条目没有可用直链，可能已被删除")
             blocks.append(block)
-        async for result in self._yield_separated_delivery(event, header, blocks):
+        prompt_via_onebot = await self._send_prompt(event, header)
+        if not prompt_via_onebot:
+            yield event.plain_result(header)
+        async for result in self._yield_delivery(event, "", blocks, mark_compressed=True):
             yield result
+        # 提示用 OneBot 原生发出（图片那条未必）时，仍按旧语义停事件；若图片
+        # 那条也走了 OneBot，_yield_delivery 已停过，这里重复调用无副作用。
+        # 放在 yield 之后：第二条消息已经交付，停事件不会把它吞掉。
+        if prompt_via_onebot:
+            event.stop_event()
 
     @staticmethod
     def _is_negative_answer(text: str) -> bool:
@@ -1400,10 +1522,136 @@ class ImageTracePlugin(Star):
             "· /溯源状态 —— 查看图库统计\n"
             "· /溯源重扫 [force] —— 扫描本地图库目录建立索引（管理员）\n"
             "· /溯源删除 <编号> —— 删除图库条目（管理员）\n"
+            "· /随机图 [目录] —— 从图床随机取一张图片并回传\n"
+            "· /随机视频 [目录] —— 从图床随机取一个视频并回传\n"
+            "· /原图 [文件名] —— 重发本会话最近回传图片的原图（不带参数取最近一张）\n"
             "· /溯源帮助 —— 显示本说明\n"
             "检索引擎：auto=向量优先（未命中/不可用自动回退哈希）；hash/vector 可在插件配置 search_engine 切换。\n"
-            "提示：哈希阈值、向量阈值与模型、图床接口等均可在 WebUI 插件配置中调整。"
+            "提示：哈希阈值、向量阈值与模型、图床接口、随机图接口等均可在 WebUI 插件配置中调整。"
         )
+
+    # ------------------------------------------------------------------
+    # 指令：随机图 / 随机视频 / 原图（CloudFlare-ImgBed 随机图接口）
+    # ------------------------------------------------------------------
+
+    @filter.command("随机图", alias={"随机图片"})
+    async def random_image(self, event: AstrMessageEvent):
+        """从图床随机取一张图片并回传（可带目录，如 /随机图 风景）"""
+        settings = self._random_settings()
+        directory, parsed_type = extract_directory(event.message_str or "")
+        async for result in self._random_media_delivery(
+            event, directory, parsed_type or "image", settings
+        ):
+            yield result
+
+    @filter.command("随机视频")
+    async def random_video(self, event: AstrMessageEvent):
+        """从图床随机取一个视频并回传（可带目录，如 /随机视频 风景）"""
+        settings = self._random_settings()
+        directory, parsed_type = extract_directory(event.message_str or "")
+        async for result in self._random_media_delivery(
+            event, directory, parsed_type or "video", settings
+        ):
+            yield result
+
+    @filter.command("原图")
+    async def original_image(self, event: AstrMessageEvent):
+        """重发本会话最近回传图片的原图；可带文件名指定某一张（/原图 风景.jpg）"""
+        session = self._session_key(event)
+        if not self.history.count(session):
+            yield event.plain_result("本会话还没有回传过图片，请先使用 /溯源 或 /随机图")
+            return
+        query = self._strip_command(event.message_str or "", ("原图",)).strip(" \t:：,，")
+        if query:
+            status, payload = self.history.find(session, query)
+            if status == "missing":
+                yield event.plain_result(f"没有找到「{query}」，只能找回本会话最近回传过的图片")
+                return
+            if status == "ambiguous":
+                candidates = "、".join(payload[:5])
+                yield event.plain_result(f"匹配到多张图片，请写出更完整的文件名：{candidates}")
+                return
+            name, url = payload
+        else:
+            name, url = self.history.latest(session)
+        # R6：/原图 只发 URL、不落地字节——剥离 ImgBed 处理参数还原未处理原文件，
+        # 并强制 original-url + 禁用本地回退
+        block = {"url": build_original_url(url), "file_name": name}
+        async for result in self._yield_delivery(
+            event,
+            f"🖼️ {name}（原图）",
+            [block],
+            mode_override="original-url",
+            allow_local_fallback=False,
+        ):
+            yield result
+
+    async def _random_media_delivery(
+        self, event: AstrMessageEvent, directory, content_type: str, settings: dict
+    ):
+        """取一条随机媒体并回传。
+
+        图片走 _yield_delivery（复用全局回传策略：scaled-url / original-url /
+        local-compress），视频走标准消息链 Video.fromURL；无法识别类型时回退
+        纯文本直链。同域 http 直链先升级为 https，减少协议端一次跳转。
+        """
+        try:
+            media_url = await self._random_client().fetch(directory, content_type)
+        except RandomMediaError as exc:
+            logger.warning(f"获取随机媒体失败: {exc}")
+            yield event.plain_result(f"⚠️ 获取随机媒体失败：{exc}")
+            return
+        media_url = upgrade_to_https(media_url, settings["base_url"])
+        kind = media_kind(media_url, content_type)
+        if kind == "video":
+            caption = self._random_caption(media_url, "video", settings)
+            yield event.chain_result([Comp.Plain(caption), Comp.Video.fromURL(media_url)])
+            return
+        if kind == "image":
+            caption = self._random_caption(media_url, "image", settings)
+            async for result in self._yield_delivery(event, caption, [{"url": media_url}]):
+                yield result
+            return
+        yield event.plain_result(f"随机媒体获取成功：{media_url}")
+
+    @staticmethod
+    def _random_caption(media_url: str, kind: str, settings: dict) -> str:
+        """随机媒体回传文案；show_file_info 关闭或取不到文件名时用固定文案。"""
+        label = "图片" if kind == "image" else "视频"
+        fallback = f"随机{label}发送成功"
+        if not settings.get("show_file_info", True):
+            return fallback
+        filename = media_filename(media_url)
+        if not filename:
+            return fallback
+        icon = "🖼️" if kind == "image" else "🎬"
+        return f"{icon} {filename}"
+
+    @filter.llm_tool(name="sendRandomMedia")
+    async def send_random_media(
+        self,
+        event: AstrMessageEvent,
+        directory: str | None = None,
+        content_type: str | None = None,
+    ):
+        """发送随机图片或视频。
+
+        当用户请求随机图片或视频时使用此工具。
+
+        Args:
+            directory(string): 目录路径，指定从哪个目录获取随机媒体，可选。
+            content_type(string): 内容类型，可选值为 image 或 video，可选。
+        """
+        settings = self._random_settings()
+        if not settings["enable_llm"]:
+            yield event.plain_result("LLM 调用随机媒体已被禁用，请使用 /随机图 或 /随机视频 命令")
+            return
+        parsed_directory, parsed_type = extract_directory(event.message_str or "")
+        if directory is None and parsed_directory:
+            directory = parsed_directory
+        content_type = (parsed_type or content_type or "image").strip().lower()
+        async for result in self._random_media_delivery(event, directory, content_type, settings):
+            yield result
 
     # ------------------------------------------------------------------
     # 生命周期
