@@ -480,6 +480,19 @@ class ImageTracePlugin(Star):
                 parts.append(text)
         return "\n".join(parts)
 
+    @staticmethod
+    def _vector_caption(block: dict, compressed: bool) -> str:
+        fields = []
+        if compressed:
+            fields.append("已压缩 /原图")
+        file_name = str(block.get("file_name") or "").strip()
+        if file_name:
+            fields.append(file_name)
+        fields.extend(str(field) for field in block.get("fields", []) if field)
+        prefix = str(block.get("prefix") or "").strip()
+        caption = " · ".join(fields)
+        return f"{prefix} {caption}".strip() if prefix else caption
+
     async def _send_via_onebot(
         self, event: AstrMessageEvent, header: str, blocks: list[dict], urls: list[str]
     ) -> bool:
@@ -620,6 +633,73 @@ class ImageTracePlugin(Star):
             elif path:
                 chain.append(Comp.Image.fromFileSystem(path))
         yield event.chain_result(chain)
+
+    async def _yield_separated_delivery(
+        self, event: AstrMessageEvent, header: str, blocks: list[dict]
+    ):
+        mode, max_side, _ = self._delivery_config()
+        onebot = self._can_send_via_onebot(event)
+        prompt_sent = False
+        used_onebot = False
+        if onebot and await self._send_via_onebot(event, header, [], []):
+            prompt_sent = True
+            used_onebot = True
+        if not prompt_sent:
+            yield event.plain_result(header)
+
+        for block in blocks:
+            url = str(block.get("url") or "")
+            path = str(block.get("path") or "")
+            direct_url = ""
+            if onebot and url and mode in {"scaled-url", "original-url"}:
+                if mode == "scaled-url" and is_napcat_parseable_url(url):
+                    direct_url = build_scaled_url(url, max_side)
+                elif mode == "original-url":
+                    direct_url = url
+
+            if direct_url:
+                block["text"] = self._vector_caption(block, direct_url != url)
+                if await self._send_via_onebot(event, block["text"], [block], [direct_url]):
+                    used_onebot = True
+                    continue
+                if direct_url != url:
+                    block["text"] = self._vector_caption(block, False)
+                    if await self._send_via_onebot(event, block["text"], [block], [url]):
+                        used_onebot = True
+                        continue
+
+            if not url and not path:
+                caption = self._vector_caption(block, False)
+                yield event.plain_result(caption)
+                continue
+
+            needs_local_bytes = mode == "local-compress" or (
+                mode == "scaled-url" and path
+            ) or (onebot and url and mode in {"scaled-url", "original-url"})
+            if needs_local_bytes:
+                prepared = await self._prepare_delivery_blocks([block], compress=True)
+                if prepared is not None:
+                    data, compressed = prepared[0]
+                    caption = self._vector_caption(block, compressed)
+                    chain = [
+                        Comp.At(qq=event.get_sender_id()),
+                        Comp.Plain(" " + caption),
+                        Comp.Image.fromBytes(data),
+                    ]
+                    yield event.chain_result(chain)
+                    continue
+                logger.warning("本地图片回退失败，改用标准消息链 URL 发送")
+
+            target_url = build_scaled_url(url, max_side) if url and mode == "scaled-url" else url
+            caption = self._vector_caption(block, bool(url and target_url != url))
+            chain = [Comp.At(qq=event.get_sender_id()), Comp.Plain(" " + caption)]
+            if url:
+                chain.append(Comp.Image.fromURL(target_url))
+            else:
+                chain.append(Comp.Image.fromFileSystem(path))
+            yield event.chain_result(chain)
+        if used_onebot:
+            event.stop_event()
 
     # ------------------------------------------------------------------
     # 指令：溯源
@@ -835,20 +915,42 @@ class ImageTracePlugin(Star):
         async for it in self._trace_hash(event, seg):
             yield it
 
-    def _vector_hits_delivery(self, event: AstrMessageEvent, hits: list):
-        """构造向量命中的去重回传请求，交由统一发送入口处理。"""
+    async def _vector_hits_delivery(
+        self, event: AstrMessageEvent, hits: list
+    ) -> AsyncGenerator:
+        """构造向量命中的去重回传请求，逐图独立发送。"""
         total_hits = sum(int(hit.get("duplicate_count") or 1) for hit in hits)
         duplicate_count = total_hits - len(hits)
         multi = len(hits) > 1
+        if duplicate_count:
+            logger.info(
+                "向量命中去重：原始 %d 张，合并重复 %d 张，回传 %d 张",
+                total_hits,
+                duplicate_count,
+                len(hits),
+            )
+        for hit in hits:
+            duplicates = hit.get("duplicates") or []
+            if not duplicates:
+                continue
+            payload = hit.get("payload") or {}
+            display_name = payload.get("file_name") or str(hit.get("id"))
+            duplicate_ids = "、".join(str(item.get("id")) for item in duplicates)
+            logger.info(
+                "向量命中去重：保留 %s（%s），合并重复 %d 张（%s）",
+                display_name,
+                hit.get("id"),
+                len(duplicates),
+                duplicate_ids,
+            )
+
         if multi:
-            header = f"✅ 向量检索命中 {total_hits} 张（按相似度降序）"
-            if duplicate_count:
-                header += f"，已合并 {duplicate_count} 张重复，回传 {len(hits)} 张"
-            header += "："
+            header = f"✅ 向量检索命中 {len(hits)} 张（按相似度降序），图片发送可能有延迟"
         else:
-            header = f"✅ 向量检索命中（相似度 {hits[0]['score'] * 100:.1f}%）"
-            if duplicate_count:
-                header += f"（已合并 {duplicate_count} 张重复）"
+            header = (
+                f"✅ 向量检索命中（相似度 {hits[0]['score'] * 100:.1f}%），"
+                "图片发送可能有延迟"
+            )
 
         blocks = []
         for idx, hit in enumerate(hits, 1):
@@ -857,24 +959,25 @@ class ImageTracePlugin(Star):
             fields = []
             if multi:
                 fields.append(f"相似度 {hit['score'] * 100:.1f}%")
-            if file_name:
-                fields.append(str(file_name))
             width, height = payload.get("width"), payload.get("height")
             if width and height:
                 fields.append(f"{width}x{height}")
             if payload.get("created_at"):
                 fields.append(str(payload["created_at"]))
-            if int(hit.get("duplicate_count") or 1) > 1:
-                fields.append(f"合并重复 {int(hit['duplicate_count'])} 张")
-            prefix = f"{idx}. " if multi else ""
-            block = {"text": prefix + " · ".join(fields)}
+            prefix = f"{idx}." if multi else ""
+            block = {
+                "prefix": prefix,
+                "file_name": str(file_name or ""),
+                "fields": fields,
+            }
             image_url = str(payload.get("image_url") or "")
             if image_url:
                 block["url"] = image_url
             else:
-                block["text"] += "\n（该条目没有可用直链，可能已被删除）"
+                block["fields"].append("该条目没有可用直链，可能已被删除")
             blocks.append(block)
-        return self._yield_delivery(event, header, blocks)
+        async for result in self._yield_separated_delivery(event, header, blocks):
+            yield result
 
     @staticmethod
     def _is_negative_answer(text: str) -> bool:

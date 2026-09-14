@@ -192,6 +192,7 @@ def deduplicate_vector_hits(hits: list[dict], threshold: float = 0.995) -> list[
         if exact_key is not None and exact_key in exact_index:
             representative = result[exact_index[exact_key]]
             representative["duplicate_count"] = int(representative.get("duplicate_count") or 1) + 1
+            representative.setdefault("duplicates", []).append(hit)
             continue
 
         merged = False
@@ -205,6 +206,7 @@ def deduplicate_vector_hits(hits: list[dict], threshold: float = 0.995) -> list[
                     representative["duplicate_count"] = (
                         int(representative.get("duplicate_count") or 1) + 1
                     )
+                    representative.setdefault("duplicates", []).append(hit)
                     merged = True
                     break
         if merged:
@@ -212,6 +214,7 @@ def deduplicate_vector_hits(hits: list[dict], threshold: float = 0.995) -> list[
 
         item = dict(hit)
         item["duplicate_count"] = 1
+        item["duplicates"] = []
         if exact_key is not None:
             exact_index[exact_key] = len(result)
         result.append(item)

@@ -1,6 +1,6 @@
 # astrbot_plugin_image_trace 图片溯源
 
-[![version](https://img.shields.io/badge/version-1.4.0-blue)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.4.1-blue)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](./LICENSE)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
@@ -53,7 +53,8 @@ flowchart LR
 
 - **发图溯源**：与图片同条消息发送 `/溯源`，或引用一张图片发送 `/溯源`，插件按当前引擎检索最相似的原图，达标即自动回传原图与相似度信息。
 - **向量引擎（可选，v1.2.0）**：配置 `vector_search` 后，用多模态向量 AI（OpenAI 兼容 `/v1/embeddings`，如 Qwen3-VL-Embedding 系）把查询图转成向量，到 Qdrant 向量库检索图床图片；图床侧每张上传由服务器钩子实时向量化入库。检索走 cosine 相似度，对压缩、缩放、裁剪、水印等改动比哈希更鲁棒，覆盖哈希难判定的构图近似变体。
-- **URL 直传与去重（v1.4.0）**：QQ `aiocqhttp` 平台优先用 OneBot 原生接口直传图床 URL；CloudFlare-ImgBed 直链默认附加官方 `width` / `height` / `fallback=original` 等比缩放参数，失败后回退本地压缩。向量命中先按 `src` / `image_url` 与候选向量相似度合并重复图，每组只回传一张代表图。
+- **URL 直传与去重（v1.4.0）**：QQ `aiocqhttp` 平台优先用 OneBot 原生接口直传图床 URL；CloudFlare-ImgBed 直链默认附加官方 `width` / `height` / `fallback=original` 等比缩放参数，失败后回退本地压缩。向量命中先按 `src` / `image_url` 与候选向量相似度合并重复图，每组只回传一张代表图；去重详情只写入日志。
+- **向量命中逐图回传（v1.4.1）**：先发送命中提示与“图片发送可能有延迟”，再逐条发送相似图文件名和图片；缩放或压缩图在文件名前标注“已压缩 /原图”。
 - **感知哈希特征**：pHash（DCT 感知哈希，默认 256bit）+ dHash + aHash，对压缩、缩放、轻微水印、EXIF 旋转均有较强鲁棒性；GIF 取首帧。纯 Pillow + numpy 实现，无需 scipy/GPU。
 - **可选 AI 复核**：开启 `ai_verify` 后，哈希命中的候选图会交给当前会话的视觉大模型二次确认"是否同一张图"，进一步降低误报；未配置视觉模型时自动跳过。
 - **泛用图床与储存桶接口**：登记原图的存储位置分两组配置，二选一即可——
@@ -272,7 +273,7 @@ v1.3.0 起，两种对象存储从图床模式中独立为单独的**储存桶�
 2. **取图**：优先调用 AstrBot 内置的 `Image.convert_to_file_path()` 媒体解析（自动处理 URL 下载、base64、本地文件），失败时才走自带下载兜底（含 SSRF 校验）。
 3. **特征计算**：灰度化 → EXIF 转正 → 缩放 → DCT（预计算正交矩阵）→ 低频中值二值化得到 pHash；辅以 dHash/aHash。计算在 `asyncio.to_thread` 中执行，不阻塞事件循环。
 4. **相似度检索**：图库哈希常驻内存（numpy 位矩阵，整体替换 + 快照读），XOR + 查表 popcount 批量计算汉明距离，数万张图毫秒级检索；dHash/aHash 一并入库留存，预留给后续的二级确认，当前检索仅使用 pHash。
-5. **结果回传**：QQ `aiocqhttp` 优先经 OneBot 原生接口直传缩放 URL，失败后回退本地压缩；其他平台走标准消息链。向量命中先合并重复图，再回传代表图与相似度、备注、尺寸等信息。
+5. **结果回传**：QQ `aiocqhttp` 优先经 OneBot 原生接口逐条直传缩放 URL，失败后回退本地压缩；其他平台走标准消息链。向量命中先合并重复图（详情写日志），再逐条回传代表图与相似度、尺寸等信息。
 
 ## 项目结构与开发
 
