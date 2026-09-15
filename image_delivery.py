@@ -54,7 +54,12 @@ class SendOutcome(str, Enum):
 
 _TIMEOUT_ERRORS = (TimeoutError, asyncio.TimeoutError)
 
-# 协议端明确回报「这条消息没发出去」的异常类名（aiocqhttp 的 ActionFailed 等）
+# 协议端明确回报「这条消息没发出去」的异常类名（aiocqhttp 的 ActionFailed 等）。
+# 注意这只是「类名像明确失败」，不等于「语义是明确失败」——超时也常被包进
+# ActionFailed，故超时线索必须排在本判断之前（见 classify_send_error）。
+# NapCat 的 retcode=1200 目前正是靠 message 里的 `Timeout:` 线索判成 UNKNOWN 的；
+# 若将来出现「空 message + retcode=1200」这种没有任何超时线索的形态，会落到这里
+# 按类名判 FAILED（偏保守、允许一次重发），届时再评估是否为 1200 单独特判。
 _DEFINITE_FAILURE_NAMES = frozenset({"ActionFailed", "ApiNotAvailable"})
 
 # 「连接根本没建起来」类错误：请求没到协议端，重发安全
@@ -66,6 +71,12 @@ _UNCONNECTED_HINTS = (
     "cannot connect",
     "no connection",
 )
+
+# 「语义是超时」的文案线索：协议端常把超时包在 ActionFailed 里——NapCat 实测
+# 就是 retcode=1200、“Timeout: NTEvent ... sendMsg”。类名看着像明确失败，
+# 语义其实是结果未知，所以超时线索必须优先于类名/retcode 判断，否则会误触发
+# 回退、把同一张图发两遍。timedout 覆盖无空格的写法（Node 网络栈的 ETIMEDOUT）。
+_TIMEOUT_HINTS = ("timeout", "timed out", "timedout", "time out", "超时")
 
 
 def bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
@@ -88,20 +99,57 @@ def delivery_settings(config: Any) -> tuple[str, int, int]:
     return mode, max_side, quality
 
 
+def _error_text(exc: BaseException) -> str:
+    """把异常可见文案拼成小写文本，供超时/未连接线索匹配。
+
+    str(exc) 对 aiocqhttp 的 ActionFailed 通常已含完整消息体；再补上它的
+    message 属性，避免个别版本 __str__ 只给简短摘要时漏掉真正的失败原因。
+
+    本函数在 except 块里被调用，是「异常处理的异常处理」，因此对畸形异常必须
+    绝对健壮：str(exc)、getattr(exc, "message") 与 str(message) 任一处抛异常
+    （自定义 __str__、取值即抛的 property 等）都就地跳过该部分、退化为空串，
+    绝不让异常向上传播、掩盖真实错误。两者都取不到时返回空串，不影响后续兜底。
+    """
+    parts: list[str] = []
+    try:
+        parts.append(str(exc))
+    except Exception:
+        pass
+    try:
+        # getattr 也放进 try：message 可能是取值即抛的 property，默认值兜不住。
+        message = getattr(exc, "message", None)
+        if message is not None:
+            parts.append(str(message))
+    except Exception:
+        pass
+    return " ".join(part for part in parts if part).strip().lower()
+
+
 def classify_send_error(exc: BaseException) -> SendOutcome:
     """把 OneBot 直发异常归为「明确失败」或「结果未知」。
 
     只有明确失败才允许换通道重发：超时是最典型的结果未知——请求已经发到协议
     端，只是响应在回程丢了；若当成失败再发一次，用户就会收到两张一模一样的图
     （原图体积大、协议端还要自己下载图床 URL，最容易踩这条）。
+
+    注意协议端常把超时包装成 ActionFailed（NapCat 实测：retcode=1200，消息体里
+    写着 `Timeout: NTEvent ... sendMsg`）。这种异常若先按类名或 retcode 判，会
+    得出「已明确失败」的相反结论，进而触发回退把同一张图发两遍。因此这里的顺序
+    是「异常类型 → 消息内容里的超时线索 → 类名 → retcode → 未连接线索」：让语义
+    压过类型名。retcode 只在非 0 时才当作失败——OneBot 里 0 表示成功，异常却带着
+    成功码时说明状态不明，宁可判 UNKNOWN 也不再重发；比较前按字符串归一化，
+    让 0 与 "0" 一视同仁，避免字符串码被误当成失败而触发重发。
     """
     if isinstance(exc, _TIMEOUT_ERRORS):
         return SendOutcome.UNKNOWN
+    message = _error_text(exc)
+    if any(hint in message for hint in _TIMEOUT_HINTS):
+        return SendOutcome.UNKNOWN
     if type(exc).__name__ in _DEFINITE_FAILURE_NAMES:
         return SendOutcome.FAILED
-    if getattr(exc, "retcode", None) is not None:
+    retcode = getattr(exc, "retcode", None)
+    if retcode is not None and str(retcode).strip() != "0":
         return SendOutcome.FAILED
-    message = str(exc).strip().lower()
     if any(hint in message for hint in _UNCONNECTED_HINTS):
         return SendOutcome.FAILED
     return SendOutcome.UNKNOWN
