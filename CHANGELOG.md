@@ -1,5 +1,30 @@
 # 更新日志
 
+## 1.5.4（2026-09-15，修复 NapCat 超时被误判为发送失败导致同图重发）
+
+- **修掉「一张图还是会发两遍」的漏网情形**：上一版把 `ActionFailed` 归入「协议端
+  明确回报失败」，但 NapCat 会把**超时**也包装成 `ActionFailed`——实测形态是
+  `retcode=1200`、消息体里写着 `Timeout: NTEvent ... sendMsg`。原判断顺序是
+  「异常类型 → 类名 → retcode → 文案」，类名检查排在任何文案检查之前，于是这种
+  语义上的「结果未知」被先一步判成「明确失败」，照样触发本地压缩回退，用户依旧
+  收到两张相同的图。现改为「异常类型 → 消息内容里的超时线索 → 类名 → retcode →
+  未连接线索」，**让语义压过类型名**：`ActionFailed` 里只要出现 `timeout` /
+  `timed out` / `timedout` / `time out` / `超时` 任一线索，一律判 `UNKNOWN` 就此打住。
+  - 新增 `_TIMEOUT_HINTS` 与 `_error_text()`：后者从 `str(exc)` 与 `exc.message`
+    两处拼出小写文案供线索匹配（个别版本 `__str__` 只给简短摘要，会漏掉真正的失败
+    原因）。`_error_text()` 对畸形异常完全健壮——它是在 `except` 块里被调用的
+    「异常处理的异常处理」，`str(exc)` / `getattr` / `str(message)` 任一处抛异常
+    （自定义 `__str__`、取值即抛的 property）都就地跳过、退化为空串，绝不让自身
+    异常向上传播、掩盖真实错误。
+  - `retcode` 比较按字符串归一化（`str(retcode).strip() != "0"`），让 `0` 与 `"0"`
+    一视同仁。OneBot 里 `retcode=0` 表示成功，异常却带着成功码说明状态不明，
+    宁可判 `UNKNOWN` 也不再重发。
+  - 代码注释写明：`retcode=1200` 当前的判定**依赖**消息体里的 `Timeout` 线索；
+    若将来出现「空 message + `retcode=1200`」这种没有任何超时线索的形态，会退回按
+    类名判 `FAILED`（偏保守、允许一次重发），届时再评估是否给 1200 单独特判。
+  - 未连接类错误（`not connected` / `connection closed` 等）仍判 `FAILED`，
+    保留安全重发能力——请求根本没到协议端，重发不会产生重复。
+
 ## 1.5.3（2026-09-15，HEIC 支持、压缩标识按证据判定、图片不再重复发送、/原图 直查图床）
 
 - **HEIC/HEIF 支持**：`requirements.txt` 新增 `pillow-heif`，`features.py` 顶部防御式
