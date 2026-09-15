@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import math
+from collections.abc import Mapping
+from enum import Enum
 from typing import Any
-from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
 
 try:
     from PIL import Image as PILImage
@@ -22,6 +25,47 @@ NAPCAT_PARSEABLE_EXTENSIONS = frozenset(
 )
 NAPCAT_PARSEABLE_FORMATS = frozenset({"JPEG", "PNG", "GIF", "WEBP", "BMP", "TIFF"})
 COMPRESS_MIN_BYTES = 200 * 1024
+
+
+class CompressionEvidence(str, Enum):
+    """图片回传时的压缩证据。
+
+    COMPRESSED / ORIGINAL 都有依据（实测字节更小，或已知尺寸不会被图床缩放）；
+    UNKNOWN 表示「无法证明压缩过」——此时配文一律不写「已压缩」，宁可少说，
+    也不能出现「文字说已压缩、用户收到的却是原图」。
+    """
+
+    COMPRESSED = "compressed"
+    ORIGINAL = "original"
+    UNKNOWN = "unknown"
+
+
+class SendOutcome(str, Enum):
+    """OneBot 直发结果。只有 FAILED 允许换通道重发。
+
+    UNKNOWN 是最需要小心的一档：请求可能已经送达（超时等），此时任何「重发」
+    都会让用户收到两张一模一样的图。
+    """
+
+    SENT = "sent"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
+_TIMEOUT_ERRORS = (TimeoutError, asyncio.TimeoutError)
+
+# 协议端明确回报「这条消息没发出去」的异常类名（aiocqhttp 的 ActionFailed 等）
+_DEFINITE_FAILURE_NAMES = frozenset({"ActionFailed", "ApiNotAvailable"})
+
+# 「连接根本没建起来」类错误：请求没到协议端，重发安全
+_UNCONNECTED_HINTS = (
+    "not connected",
+    "connection closed",
+    "connection is closed",
+    "connect call failed",
+    "cannot connect",
+    "no connection",
+)
 
 
 def bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
@@ -42,6 +86,25 @@ def delivery_settings(config: Any) -> tuple[str, int, int]:
     max_side = bounded_int(raw.get("max_side"), 1920, 1, 4096)
     quality = bounded_int(raw.get("quality"), 85, 1, 100)
     return mode, max_side, quality
+
+
+def classify_send_error(exc: BaseException) -> SendOutcome:
+    """把 OneBot 直发异常归为「明确失败」或「结果未知」。
+
+    只有明确失败才允许换通道重发：超时是最典型的结果未知——请求已经发到协议
+    端，只是响应在回程丢了；若当成失败再发一次，用户就会收到两张一模一样的图
+    （原图体积大、协议端还要自己下载图床 URL，最容易踩这条）。
+    """
+    if isinstance(exc, _TIMEOUT_ERRORS):
+        return SendOutcome.UNKNOWN
+    if type(exc).__name__ in _DEFINITE_FAILURE_NAMES:
+        return SendOutcome.FAILED
+    if getattr(exc, "retcode", None) is not None:
+        return SendOutcome.FAILED
+    message = str(exc).strip().lower()
+    if any(hint in message for hint in _UNCONNECTED_HINTS):
+        return SendOutcome.FAILED
+    return SendOutcome.UNKNOWN
 
 
 def is_cloudflare_imgbed_url(url: str) -> bool:
@@ -90,6 +153,58 @@ def build_original_url(url: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
 
 
+def is_scaling_needed(image_size, max_side) -> bool | None:
+    """该图是否需要图床缩放：True 需要、False 不需要、None 尺寸未知。
+
+    尺寸未知时返回 None 而不是 False：调用方必须能区分「确定不用缩放」与
+    「不知道」——前者可以省掉缩放参数（图床不会放大，追加参数只是白白触发
+    一次处理），后者只能照旧追加参数且不宣称压缩。
+    """
+    try:
+        width, height = int(image_size[0]), int(image_size[1])
+    except (TypeError, ValueError, IndexError, KeyError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return max(width, height) > bounded_int(max_side, 1920, 1, 4096)
+
+
+def compression_evidence(
+    image_size, max_side, *, verified_smaller: bool | None = None
+) -> CompressionEvidence:
+    """判定回传这张图「已压缩 / 就是原图 / 说不准」。
+
+    verified_smaller 是唯一的一手证据（实测缩放版字节数确实更小）。没有它时
+    只能按尺寸推断：不超过 max_side 的图不会被图床放大，ImgBed 按
+    fallback=original 原样返回，可以确定是原图；超过 max_side 或尺寸未知则
+    无从判断，返回 UNKNOWN，配文据此不再写「已压缩」。
+    """
+    if verified_smaller is not None:
+        return CompressionEvidence.COMPRESSED if verified_smaller else CompressionEvidence.ORIGINAL
+    if is_scaling_needed(image_size, max_side) is False:
+        return CompressionEvidence.ORIGINAL
+    return CompressionEvidence.UNKNOWN
+
+
+def build_imgbed_file_url(base_url: str, file_name: str) -> str | None:
+    """按 CloudFlare-ImgBed 公开直链口径拼出 `{base}/file/{文件名}`。
+
+    供 /原图 在会话历史未命中时直接按文件名到图床取原图。文件名允许带目录
+    （如 `2026/09/abc.jpg`），但拒绝一切可能拼出跨站或路径穿越的输入：绝对
+    URL、`..`、`//`、空名一律返回 None。拼出的结果还必须落回 ImgBed 的
+    /file/ 口径，避免 base 配错时发出一条语法合法却指向别处的链接。
+    """
+    base = str(base_url or "").strip().rstrip("/")
+    name = str(file_name or "").strip().strip("/")
+    if not base or not name or ".." in name or "//" in name:
+        return None
+    parsed = urlsplit(name)
+    if parsed.scheme or parsed.netloc:
+        return None
+    candidate = f"{base}/file/{quote(unquote(name), safe='/')}"
+    return candidate if is_cloudflare_imgbed_url(candidate) else None
+
+
 def is_napcat_parseable_url(url: str) -> bool:
     """判断 URL 扩展名对应的格式能否被 QQ 协议端解析出宽高。"""
     try:
@@ -119,6 +234,50 @@ def upgrade_to_https(url: str, base_url: str) -> str:
     ):
         return urlunsplit(("https", target.netloc, target.path, target.query, target.fragment))
     return url
+
+
+def classify_probe_status(status: int | None) -> bool | None:
+    """HTTP 状态码 → 资源是否存在：2xx/206 存在、4xx 不存在、其余（未知）None。"""
+    if status is None:
+        return None
+    if 200 <= status < 300:
+        return True
+    if 400 <= status < 500:
+        return False
+    return None
+
+
+def _header_value(headers: Mapping[str, str], name: str) -> str | None:
+    """大小写不敏感地取响应头字段（aiohttp 的 CIMultiDict 与测试用普通 dict 都认）。"""
+    for key in (name, name.lower(), name.upper()):
+        try:
+            value = headers.get(key)
+        except Exception:
+            return None
+        if value is not None:
+            return str(value).strip()
+    return None
+
+
+def content_length_from_headers(headers: Mapping[str, str] | None) -> int | None:
+    """从响应头取响应体总长度：Content-Length 优先，206 退化解析 Content-Range。
+
+    探测走 HEAD（无响应体）或 `Range: bytes=0-0` 的单字节 GET，前者靠
+    Content-Length，后者靠 Content-Range 的 `bytes 0-0/总长`。拿不到长度时
+    返回 None 表示「无法判定」——绝不能把 0 当成长度，否则会把「探测不出」
+    误判成「缩放版更小」。
+    """
+    if headers is None:
+        return None
+    declared = _header_value(headers, "Content-Length")
+    if declared is not None and declared.isdigit():
+        return int(declared)
+    content_range = _header_value(headers, "Content-Range")
+    if content_range and "/" in content_range:
+        size = content_range.rsplit("/", 1)[1].strip()
+        if size.isdigit():
+            return int(size)
+    return None
 
 
 def sniff_image_format(data: bytes) -> str | None:

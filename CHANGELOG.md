@@ -1,5 +1,48 @@
 # 更新日志
 
+## 1.5.3（2026-09-15，HEIC 支持、压缩标识按证据判定、图片不再重复发送、/原图 直查图床）
+
+- **HEIC/HEIF 支持**：`requirements.txt` 新增 `pillow-heif`，`features.py` 顶部防御式
+  `register_heif_opener()`，`image_mime` 白名单补 `HEIF → image/heic`，`IMAGE_EXTS`
+  补 `.heic` / `.heif`（`/溯源重扫` 得以收录 HEIC 原图）。此前 iPhone 图片会走进
+  「内置解析产物不是有效图片（…ftypheic/mif1）→ 改走兜底下载 → 兜底下载内容不是
+  有效图片」这条必然失败的链路：产物其实是合法 HEIC，只是白名单里没有它、解码器
+  也没装。
+  - **坏下载与缺解码器分流**：`_resolve_local_file` 现在区分两种情况——认不出任何
+    图片容器（图床错误体 / rkey 过期 / 防盗链）才走自带下载兜底；已经认得出容器却
+    解不开（缺解码器、文件截断）说明链接指向同一份内容，直接带具体原因返回并提示
+    「未安装 pillow-heif」，省掉一次注定失败的请求与一对误导性日志。
+  - **QQ 图床 Referer 分域**：`multimedia.nt.qq.com.cn` 改用自身根域 Referer，
+    `*.qpic.cn` 继续用 `gchat.qpic.cn`——跨族套用 Referer 本身就会被判成跨站盗用。
+- **压缩标识改为按证据判定**：新增 `CompressionEvidence`（已压缩 / 原图 / 说不准）
+  与 `image_delivery.verify_scaled` 开关（默认开启）。修复「文字显示已压缩、实际
+  收到的是原图」：此前压缩标识由「URL 是否被改写」推导，而图床在图片不超过
+  `max_side`、格式不可处理或图像处理不可用时会按 `fallback=original` 原样返回。
+  现在只有实测（HEAD，退化 `Range: bytes=0-0` 比对 Content-Length）缩放版确实更小、
+  或本地压缩确实缩了字节，配文才写「已压缩」；不超过 `max_side` 的图直接发原图 URL、
+  不再追加缩放参数，顺带省掉一次无意义的图床处理。
+- **一张图只会发一次**：`_send_via_onebot` 返回三态 `SendOutcome`
+  （`SENT` / `FAILED` / `UNKNOWN`），只有协议端**明确回报失败**（`ActionFailed` 等）
+  才允许换通道回退；超时属于「结果未知」——消息很可能已经送达，一律就此打住，并给
+  事件打上「已投递」标记，后续任何回退路径都不得再发。同时删除「缩放 URL 直发失败
+  → 改发原图 URL」的第二次直发。修复「原图被重复发送两遍」：原图体积大、协议端要
+  自行下载图床 URL，直发最容易超时，此前超时被当成失败，于是同一张图被发两次。
+- **修掉同一张图被溯源两次**：`_extract_images` 的去重键从 `url or file` 改为
+  收集 `url` / `file` / `path` 三个标识求交——同一张图在消息链里只有 `url`、在被
+  引用消息里只有 `file` 时，此前会被判成两张，`/溯源` 于是对同一张图跑两遍、回传两遍。
+- **`/原图` 可直接按文件名到图床取原图**：会话历史未命中时，按
+  `{图床地址}/file/{文件名}` 拼直链（复用 ImgBed 公开直链口径）、探测存在后直传
+  原图，不再要求「本会话先回传过」。图床地址取 `image_bed.cfi_base_url`
+  （`cloudflare_imgbed`）或 `random_media.base_url`；无参 `/原图` 在历史为空时退化为
+  「按消息/引用图的文件名直查」。新增纯函数 `build_imgbed_file_url`：拒绝 `..`、
+  `//`、绝对 URL 与空名，中文/空格按 URL 规则转义，允许带上传目录。找不到时提示会
+  附上尝试过的完整直链。**仍未接入**的查找来源：Qdrant 向量库按 `file_name` 过滤、
+  本地 SQLite 图库按文件名匹配、会话历史落盘。
+- **非本插件问题的日志指引**：README 常见问题新增 `pillowmd ... OSError: cannot open
+  resource` 的定位与修复（堆栈里的 `astrbot_plugin_outputpro` 是另一个插件，转图时
+  打不开配置里的字体文件），附三条修复路径。
+- 版本号 1.5.2 → 1.5.3（`metadata.yaml`、README 徽章）；测试 116 → 137 条，ruff 全绿。
+
 ## 1.5.2（2026-09-14，相似图消息改为图文交替）
 
 - **相似图消息改为图文交替排列**：合并回传那条消息现在按「配文 → 图片 → 配文 →

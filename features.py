@@ -20,6 +20,14 @@ from functools import cache
 import numpy as np
 from PIL import Image, ImageOps
 
+try:  # iPhone 默认相册格式 HEIC/HEIF 的解码支持；可选依赖，缺失时按不支持处理
+    import pillow_heif
+
+    pillow_heif.register_heif_opener()
+    _HEIF_AVAILABLE = True
+except Exception:  # ImportError 及其它注册失败一律降级
+    _HEIF_AVAILABLE = False
+
 # 防解压炸弹：打开后、解码前先按尺寸拒绝；不修改 Pillow 的进程级全局配置。
 _MAX_LOAD_PIXELS = 50_000_000
 
@@ -110,6 +118,7 @@ def image_mime(path: str) -> str | None:
                 "AVIF": "image/avif",
                 "BMP": "image/bmp",
                 "GIF": "image/gif",
+                "HEIF": "image/heic",
                 "JPEG": "image/jpeg",
                 "MPO": "image/jpeg",
                 "PNG": "image/png",
@@ -122,6 +131,11 @@ def image_mime(path: str) -> str | None:
             return mime
     except Exception:
         return None
+
+
+def heif_available() -> bool:
+    """服务端是否具备 HEIC/HEIF 解码能力（未装 pillow-heif 时为 False）。"""
+    return _HEIF_AVAILABLE
 
 
 def image_file_ok(path: str) -> bool:

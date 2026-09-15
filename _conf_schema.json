@@ -150,6 +150,12 @@
         "type": "int",
         "default": 85,
         "hint": "仅本地压缩与 OneBot URL 直传失败后的压缩回退使用；范围 1~100。"
+      },
+      "verify_scaled": {
+        "description": "【选填】实测校验图床缩放是否真的生效",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，缩放 URL 直传前先用 HEAD（退化 Range 探测）比对缩放版与原图的响应体长度，只有确实更小才在配文里标注「已压缩」；图片不超过 max_side 时也会跳过缩放参数，避免触发一次无意义的图床处理。关闭后不再宣称压缩。"
       }
     }
   },

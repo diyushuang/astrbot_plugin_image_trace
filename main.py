@@ -42,16 +42,30 @@ try:
         is_qq_image_bed_host,
         truthy,
     )
-    from .features import ImageFeatures, compute_features, image_file_ok, phash_hex_len
+    from .features import (
+        ImageFeatures,
+        compute_features,
+        heif_available,
+        image_file_ok,
+        phash_hex_len,
+    )
     from .http_client import GuardedHttpClient
     from .image_bed import MODE_CFB, ImageBedClient
     from .image_delivery import (
+        CompressionEvidence,
+        SendOutcome,
         bounded_int,
+        build_imgbed_file_url,
         build_original_url,
         build_scaled_url,
+        classify_probe_status,
+        classify_send_error,
+        compression_evidence,
+        content_length_from_headers,
         deduplicate_vector_hits,
         delivery_settings,
         is_napcat_parseable_url,
+        is_scaling_needed,
         prepare_image_bytes,
         sniff_image_format,
         upgrade_to_https,
@@ -84,18 +98,27 @@ except ImportError:  # 兼容插件以独立模块方式加载
     from features import (  # type: ignore[no-redef]
         ImageFeatures,
         compute_features,
+        heif_available,
         image_file_ok,
         phash_hex_len,
     )
     from http_client import GuardedHttpClient  # type: ignore[no-redef]
     from image_bed import MODE_CFB, ImageBedClient  # type: ignore[no-redef]
     from image_delivery import (  # type: ignore[no-redef]
+        CompressionEvidence,
+        SendOutcome,
         bounded_int,
+        build_imgbed_file_url,
         build_original_url,
         build_scaled_url,
+        classify_probe_status,
+        classify_send_error,
+        compression_evidence,
+        content_length_from_headers,
         deduplicate_vector_hits,
         delivery_settings,
         is_napcat_parseable_url,
+        is_scaling_needed,
         prepare_image_bytes,
         sniff_image_format,
         upgrade_to_https,
@@ -113,7 +136,26 @@ except ImportError:  # 兼容插件以独立模块方式加载
     from vector_search import VectorEngine, VectorEngineError  # type: ignore[no-redef]
 
 PLUGIN_NAME = "astrbot_plugin_image_trace"
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".jfif"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".jfif", ".heic", ".heif"}
+
+
+def _describe_bad_image(path: str) -> tuple[str, str | None]:
+    """坏产物摘要 + 按文件头识别的容器格式，供日志与失败分诊使用。
+
+    第二项为 None 表示「连图片容器都认不出」（错误体、HTML、空文件），非
+    None 表示「容器认得出但解不开」（缺解码器、截断）——两者的处置完全不同：
+    前者才值得重下，后者重下也是同一份内容。函数为同步 IO，调用方应走
+    asyncio.to_thread。
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(64)
+        size = os.path.getsize(path)
+    except OSError:
+        return "无法读取", None
+    text = "".join(chr(b) if 32 <= b < 127 else "." for b in head)
+    return f"{size} 字节, 头部 {text!r}", sniff_image_format(head)
+
 
 # 储存桶（对象存储）独立配置组；v1.2.x 曾作为 image_bed 的模式，迁移见
 # _migrate_bucket_config。完整判定与 image_bed.py 的 _require / 公开直链
@@ -347,16 +389,31 @@ class ImageTracePlugin(Star):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _extract_images(event: AstrMessageEvent) -> list:
+    def _image_identity(seg) -> set:
+        """图片段可用于去重的标识集合（url / file / path 全部收集）。
+
+        同一张图在消息链与被引用消息里往往只带其中一部分字段（链里是 url、
+        Reply.chain 里只有 file），只取其一就会把同一张图判成两张：/溯源 于是
+        对同一张图跑两遍、回传两遍，表现为「图片被重复发送」。
+        """
+        keys = set()
+        for name in ("url", "file", "path"):
+            value = getattr(seg, name, None)
+            if value:
+                keys.add(str(value))
+        return keys
+
+    @classmethod
+    def _extract_images(cls, event: AstrMessageEvent) -> list:
         """提取消息链与被引用消息中的图片段（按链接/文件名去重）。"""
         found: list = []
         seen: set = set()
 
         def push(seg) -> None:
-            key = getattr(seg, "url", None) or getattr(seg, "file", None) or id(seg)
-            if key in seen:
+            keys = cls._image_identity(seg) or {f"id:{id(seg)}"}
+            if keys & seen:
                 return
-            seen.add(key)
+            seen.update(keys)
             found.append(seg)
 
         for seg in event.message_obj.message or []:
@@ -368,21 +425,33 @@ class ImageTracePlugin(Star):
                         push(sub)
         return found
 
-    async def _resolve_local_file(self, seg) -> tuple[str, bool]:
-        """把图片段解析为本地文件。返回 (路径, 是否为需要清理的临时文件)。
+    async def _resolve_local_file(self, seg) -> tuple[str, bool, str]:
+        """把图片段解析为本地文件。返回 (路径, 是否临时文件, 失败提示)。
 
-        优先走 AstrBot 内置媒体解析 convert_to_file_path()；其产物或兜底
-        下载的内容都会先经 image_file_ok 校验——QQ 图床 URL 带 rkey 签名
-        会过期、NTQQ/gchat 图床有防盗链，失败时常返回几十~几百字节的错误
-        体而非图片，必须拦在引擎之前。两条路都无效时返回空路径，由调用方
-        给出统一的「未能获取图片内容」提示。
+        优先走 AstrBot 内置媒体解析 convert_to_file_path()，产物先经
+        image_file_ok 校验。校验失败时分两种情况：
+
+        - 认不出任何图片容器（多半是图床返回的几十~几百字节错误体、或
+          rkey 过期/防盗链拦下的响应）→ 才值得走自带下载兜底；
+        - 已经认得出容器却解不开（典型是缺解码器的 HEIC、被截断的文件）
+          → 内容本身有问题，链接指向同一张图，重下不会有不同结果，直接带
+          具体原因返回，省掉一次注定失败的请求与一对误导性日志。
+
+        失败提示为空串表示解析成功。
         """
         try:
             path = await seg.convert_to_file_path()
             if path and os.path.isfile(path):
                 if await asyncio.to_thread(image_file_ok, path):
-                    return path, False
-                logger.warning(f"内置解析产物不是有效图片（{self._peek_sniff(path)}），改走兜底下载")
+                    return path, False, ""
+                summary, sniffed = await asyncio.to_thread(_describe_bad_image, path)
+                if sniffed is not None:
+                    logger.warning(
+                        f"内置解析产物无法解码（{summary}，容器格式 {sniffed}），"
+                        "链接指向同一内容，跳过兜底下载"
+                    )
+                    return "", False, self._decode_fail_message(sniffed)
+                logger.warning(f"内置解析产物不是有效图片（{summary}），改走兜底下载")
         except Exception as e:
             logger.debug(f"convert_to_file_path 失败，尝试兜底下载: {e}")
 
@@ -392,25 +461,35 @@ class ImageTracePlugin(Star):
                 path = await self._download(str(url))
             except Exception as e:
                 logger.warning(f"图片兜底下载失败: {e}")
-                return "", False
+                return "", False, self._download_fail_message()
             if await asyncio.to_thread(image_file_ok, path):
-                return path, True
+                return path, True, ""
+            summary, _ = await asyncio.to_thread(_describe_bad_image, path)
             logger.warning(
-                f"兜底下载内容不是有效图片（{self._peek_sniff(path)}），链接可能已过期或被防盗链拦截"
+                f"兜底下载内容不是有效图片（{summary}），链接可能已过期或被防盗链拦截"
             )
             self._remove_quiet(path)
-        return "", False
+        return "", False, self._download_fail_message()
 
     @staticmethod
-    def _peek_sniff(path: str) -> str:
-        """日志用的坏文件摘要：字节数 + 头部可打印片段，便于定位是谁返回的。"""
-        try:
-            with open(path, "rb") as f:
-                head = f.read(48)
-            text = "".join(chr(b) if 32 <= b < 127 else "." for b in head)
-            return f"{os.path.getsize(path)} 字节, 头部 {text!r}"
-        except OSError:
-            return "无法读取"
+    def _download_fail_message() -> str:
+        return (
+            "⚠️ 未能获取图片内容：图片链接可能已过期（QQ 图床签名失效）或被防盗链拦截，"
+            "请重新发送、或引用该图片后再试。"
+        )
+
+    @staticmethod
+    def _decode_fail_message(sniffed: str) -> str:
+        """认得出容器却解不开时的提示；HEIC 缺解码器是最常见的一种。"""
+        if sniffed == "HEIF" and not heif_available():
+            return (
+                "⚠️ 检测到 HEIC/HEIF 图片（iPhone 默认格式），但服务端未安装 pillow-heif "
+                "解码支持，无法溯源。安装该依赖后重启机器人即可。"
+            )
+        return (
+            f"⚠️ 未能解析图片内容：识别为 {sniffed} 但解码失败，"
+            "文件可能已损坏或格式不受当前服务端支持，详情见机器人日志。"
+        )
 
     async def _download(self, url: str) -> str:
         client = await self._get_http()
@@ -449,13 +528,80 @@ class ImageTracePlugin(Star):
         """图片兜底下载的请求头。
 
         NTQQ（multimedia.nt.qq.com.cn）与旧版 gchat.qpic.cn 图床均启用了
-        防盗链：缺 Referer 时会返回 403 或只有几十~几百字节的错误体。
-        Referer 不是凭据，跨域重定向是否剥离交给 url_guard；重定向离开
-        QQ 图床域名后因 host 不匹配自然不再携带。
+        防盗链：缺 Referer 时会返回 403 或只有几十~几百字节的错误体。两者的
+        防盗链规则按各自站点校验，因此 Referer 必须与图片同族——拿旧图床的
+        Referer 去请求 NTQQ，反而会被判成跨站盗用。Referer 不是凭据，跨域
+        重定向是否剥离交给 url_guard；重定向离开该域名后因 host 不匹配自然
+        不再携带。
         """
-        if is_qq_image_bed_host(urlparse(u).hostname or ""):
-            return {"headers": {"Referer": "https://gchat.qpic.cn/"}}
-        return {}
+        host = (urlparse(u).hostname or "").lower()
+        if not is_qq_image_bed_host(host):
+            return {}
+        if host == "multimedia.nt.qq.com.cn" or host.endswith(".nt.qq.com.cn"):
+            return {"headers": {"Referer": "https://multimedia.nt.qq.com.cn/"}}
+        return {"headers": {"Referer": "https://gchat.qpic.cn/"}}
+
+    @classmethod
+    def _range_probe_headers(cls, u: str, m: str, c: bool) -> dict:
+        """在下载请求头基础上加 Range: bytes=0-0，用于退化探测响应体长度。"""
+        base = dict(cls._image_download_headers(u, m, c))
+        headers = dict(base.get("headers") or {})
+        headers["Range"] = "bytes=0-0"
+        base["headers"] = headers
+        return base
+
+    async def _probe_url(
+        self, url: str, cache: dict | None = None
+    ) -> tuple[bool | None, int | None]:
+        """轻量探测 URL 是否存在及其响应体长度，返回 (是否存在, 字节数)。
+
+        两个用途：判定图床缩放 URL 是否真的比原图小（压缩标识的唯一一手
+        证据），以及 /原图 按文件名拼出的直链是否真的存在于图床。HEAD 优先，
+        不支持时退化为只取 0-0 一个字节的 Range GET。任何网络异常都返回
+        (None, None)——调用方必须把「探测不出来」与「确定不存在」分开处理，
+        网络抖动不该被当成「图床没有这张图」。
+        """
+        if cache is not None and url in cache:
+            return cache[url]
+        result = await self._probe_url_uncached(url)
+        if cache is not None:
+            cache[url] = result
+        return result
+
+    async def _probe_url_uncached(self, url: str) -> tuple[bool | None, int | None]:
+        client = await self._get_http()
+        timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)
+        try:
+            async with await client.request(
+                "HEAD", url, prepare=self._image_download_headers, timeout=timeout
+            ) as resp:
+                exists = classify_probe_status(resp.status)
+                if exists is False:
+                    return False, None
+                length = content_length_from_headers(resp.headers)
+                if exists is True and length is not None:
+                    return True, length
+                if exists is None:
+                    return None, None
+        except Exception as exc:
+            logger.debug(f"HEAD 探测失败，改用 Range 探测 {url}: {exc}")
+        try:
+            async with await client.request(
+                "GET", url, prepare=self._range_probe_headers, timeout=timeout
+            ) as resp:
+                # 只读响应头，绝不读响应体：Range 被忽略而返回 200 时，
+                # 完整读下来就等于把整张图下载了一遍，探测也就失去了意义
+                return classify_probe_status(resp.status), content_length_from_headers(
+                    resp.headers
+                )
+        except Exception as exc:
+            logger.debug(f"URL 探测失败（无法判定存在性）{url}: {exc}")
+        return None, None
+
+    def _verify_scaled(self) -> bool:
+        """image_delivery.verify_scaled：图床缩放是否实测校验，未配置时默认开启。"""
+        raw = self._dict_cfg("image_delivery").get("verify_scaled")
+        return True if is_blank(raw) else truthy(raw)
 
     async def _get_http(self) -> GuardedHttpClient:
         if self._http is None:
@@ -554,12 +700,32 @@ class ImageTracePlugin(Star):
             return file.read()
 
     @staticmethod
-    def _vector_caption(block: dict, compressed: bool) -> str:
+    def _event_already_sent(event: AstrMessageEvent) -> bool:
+        """本次事件是否已经投递过图片（事件级去重盾）。"""
+        return bool(getattr(event, "_image_trace_sent", False))
+
+    @staticmethod
+    def _mark_event_sent(event: AstrMessageEvent) -> None:
+        """标记本次事件已投递图片，禁止后续任何回退路径再发一次。"""
+        try:
+            event._image_trace_sent = True
+        except AttributeError:  # 少数事件实现带 __slots__，标记失败不影响发送
+            logger.debug("事件对象不支持动态属性，跳过已发送标记")
+
+    @staticmethod
+    def _vector_caption(block: dict, evidence: CompressionEvidence) -> str:
+        """按压缩证据拼配文。
+
+        只有拿到证据才写「已压缩」：此前按「URL 被改写」推断压缩，而图床在
+        图片不超 max_side、格式不可处理或图像处理不可用时会按 fallback=original
+        原样返回，于是出现「文字说已压缩、用户收到的却是原图」。UNKNOWN 只给
+        一句 /原图 用法提示，ORIGINAL 连提示都不给——发的本来就是原图。
+        """
         fields = []
-        if compressed:
-            # 只给一句用法说明，不再抄文件名：/原图 不带参数即取最近一张，
-            # 文案里重复文件名属于冗余（见需求 3）
+        if evidence is CompressionEvidence.COMPRESSED:
             fields.append("已压缩，可发送 /原图 获取原图")
+        elif evidence is CompressionEvidence.UNKNOWN:
+            fields.append("可发送 /原图 获取原图")
         file_name = str(block.get("file_name") or "").strip()
         if file_name:
             fields.append(file_name)
@@ -570,16 +736,19 @@ class ImageTracePlugin(Star):
 
     async def _send_via_onebot(
         self, event: AstrMessageEvent, header: str, blocks: list[dict], urls: list[str]
-    ) -> bool:
+    ) -> SendOutcome:
         """通过 OneBot 原生接口直发消息，消息段按「标题 →（配文 → 图片）…」交替排列。
 
-        每张图的配文紧贴在它自己那张图的上方，而不是把所有文字堆在开头、所有
-        图片堆在末尾——后者在多图命中时无法分辨哪句配文属于哪张图。该顺序与
-        标准消息链路径（_yield_delivery 末尾）保持一致，两条发送通道观感相同。
+        每张图的配文紧贴在自己那张图的上方，与标准消息链路径（_yield_delivery
+        末尾）顺序一致，两条发送通道观感相同。
 
         urls 与 blocks 中的有图 block 同序一一对应；调用方（_yield_delivery 的
         URL 直传分支、_send_prompt）已保证两者数量相等，故这里按遍历到的有图
         block 依次取用，无需再做长度校验。
+
+        返回三态而非布尔：只有协议端明确回报失败（FAILED）才允许换通道重发。
+        超时等 UNKNOWN 情形请求可能已经送达，调用方必须先看返回值再决定是否
+        回退，否则同一张图会被发两遍。
         """
         message = []
         sender_id = event.get_sender_id()
@@ -611,40 +780,49 @@ class ImageTracePlugin(Star):
         try:
             await event.bot.call_action(action, **params)
         except Exception as exc:
-            logger.warning(f"OneBot URL 直传图片失败，准备回退: {exc}")
-            return False
+            outcome = classify_send_error(exc)
+            logger.debug(f"OneBot 直发异常分类: {type(exc).__name__} -> {outcome.value}")
+            if outcome is SendOutcome.UNKNOWN:
+                logger.warning(
+                    f"OneBot 直发结果未知（{type(exc).__name__}: {exc}）：消息可能已送达，"
+                    "为避免同一张图重复发送，本次不再走任何回退"
+                )
+            else:
+                logger.warning(f"OneBot URL 直传图片失败，准备回退: {exc}")
+            return outcome
         logger.info(f"OneBot URL 直传图片成功: {action}")
-        return True
+        return SendOutcome.SENT
 
     async def _send_prompt(self, event: AstrMessageEvent, text: str) -> bool:
-        """发送一条纯文本提示，返回是否已由 OneBot 原生发出。
+        """发送一条纯文本提示，返回是否已由 OneBot 原生处理。
 
         OneBot（aiocqhttp）下走原生 call_action 单发文本，命中提示就不会跟
-        图片挤在同一条消息里；其余平台或发送失败时返回 False，由调用方
-        yield plain_result 兜底，保证提示不丢。
+        图片挤在同一条消息里；其余平台返回 False，由调用方 yield plain_result
+        兜底。结果未知（超时）也按「已处理」返回：提示重复一遍无伤大雅，但
+        让它再走一次消息链毫无意义。
         """
         if self._can_send_via_onebot(event):
-            return await self._send_via_onebot(event, text, [], [])
+            return await self._send_via_onebot(event, text, [], []) is not SendOutcome.FAILED
         return False
 
     def _mark_compressed_captions(
-        self, blocks: list[dict], image_flags: list[bool]
+        self, blocks: list[dict], evidences: list[CompressionEvidence]
     ) -> None:
         """为 mark_compressed 路径写入逐图配文。
 
-        image_flags 与 blocks 中的有图 block 一一对应（同序于 scaled/original
-        URL 列表或 _prepare_delivery_blocks 的输出）；无图 block（例如没有可用
-        直链的条目）按未压缩处理，但它也要拿到配文，才不会在合并消息里消失。
-        仅在 mark_compressed 为真时调用，默认路径不触碰 block["text"]。
+        evidences 与 blocks 中的有图 block 一一对应（同序于 URL 直传计划或
+        _prepare_delivery_blocks 的输出）；无图 block（例如没有可用直链的条目）
+        按 UNKNOWN 处理，但它也要拿到配文，才不会在合并消息里消失。仅在
+        mark_compressed 为真时调用，默认路径不触碰 block["text"]。
         """
         index = 0
         for block in blocks:
             if block.get("url") or block.get("path"):
-                compressed = image_flags[index]
+                evidence = evidences[index]
                 index += 1
             else:
-                compressed = False
-            block["text"] = self._vector_caption(block, compressed)
+                evidence = CompressionEvidence.UNKNOWN
+            block["text"] = self._vector_caption(block, evidence)
 
     async def _load_delivery_bytes(self, block: dict) -> bytes | None:
         url = str(block.get("url") or "")
@@ -689,6 +867,57 @@ class ImageTracePlugin(Star):
                 prepared.append(result)
         return prepared
 
+    async def _url_delivery_plan(
+        self, image_blocks: list[dict], max_side: int, mode: str
+    ) -> tuple[list[str], list[CompressionEvidence]]:
+        """决定每张图 URL 直传实际发哪个 URL，并给出压缩证据，两者同序对应。
+
+        不再无条件改写 URL：只有最长边确实超过 max_side（或尺寸未知）时才追加
+        图床缩放参数——不超过 max_side 的图，图床按 fallback=original 原样返回，
+        追加参数只是白白触发一次处理。开启 verify_scaled 时进一步用响应体长度
+        实测缩放版是否真的更小，这也是「已压缩」文案唯一的一手依据；实测不出来
+        就按 UNKNOWN 处理，配文宁可不写，也不能出现「文字说压缩、收到的是原图」。
+        """
+        urls: list[str] = []
+        evidences: list[CompressionEvidence] = []
+        probe_cache: dict = {}
+        verify = mode == "scaled-url" and self._verify_scaled()
+        for block in image_blocks:
+            original = build_original_url(str(block.get("url") or ""))
+            size = (block.get("width"), block.get("height"))
+            if mode != "scaled-url" or not original:
+                urls.append(original or str(block.get("url") or ""))
+                evidences.append(compression_evidence(size, max_side))
+                continue
+            scaled = build_scaled_url(original, max_side)
+            if is_scaling_needed(size, max_side) is False or scaled == original:
+                # 尺寸证明不会被缩放，或这条直链本来就带不了缩放参数
+                urls.append(original)
+                evidences.append(compression_evidence(size, max_side))
+                continue
+            verified = (
+                await self._scaled_is_smaller(original, scaled, probe_cache)
+                if verify
+                else None
+            )
+            urls.append(scaled)
+            evidences.append(compression_evidence(size, max_side, verified_smaller=verified))
+        return urls, evidences
+
+    async def _scaled_is_smaller(
+        self, original: str, scaled: str, cache: dict
+    ) -> bool | None:
+        """实测缩放 URL 的响应体是否真的比原图小。
+
+        两次探测都拿到长度才能比较；任一侧拿不到（服务器不返回长度、请求失败）
+        返回 None，调用方据此按「无法判定」处理。
+        """
+        _, original_size = await self._probe_url(original, cache)
+        _, scaled_size = await self._probe_url(scaled, cache)
+        if original_size is None or scaled_size is None:
+            return None
+        return scaled_size < original_size
+
     async def _yield_delivery(
         self,
         event: AstrMessageEvent,
@@ -706,74 +935,67 @@ class ImageTracePlugin(Star):
         /原图 只发 URL、不落地字节。两参数均有默认值。
 
         mark_compressed 供 /溯源 向量命中启用：为真时按各回传路径实际的压缩
-        情形写入 block["text"]（含文件名与「已压缩」用法说明），使合并消息里
+        证据写入 block["text"]（含文件名与「已压缩」用法说明），使合并消息里
         每张图各带一句配文。为假时一个字节都不碰 block——哈希 /随机图 /原图
         三处既有调用点行为与改造前一致。
+
+        单次发送保证：同一批图片在一次调用里只发起一次发送。只有 OneBot 直发
+        明确失败（FAILED）才允许走字节回退；结果未知（超时）一律就此打住——
+        请求可能已经送达，再发一次用户就会收到两张一模一样的图。
         """
+        if self._event_already_sent(event):
+            logger.warning("本次事件已投递过图片，跳过重复投递")
+            return
         self._remember_blocks(event, blocks)
         mode, max_side, _ = self._delivery_config()
         if mode_override is not None:
             mode = mode_override
         image_blocks = [block for block in blocks if block.get("url") or block.get("path")]
-        original_urls = [str(block["url"]) for block in image_blocks if block.get("url")]
-
-        if (
-            mode in {"scaled-url", "original-url"}
+        raw_urls = [str(block["url"]) for block in image_blocks if block.get("url")]
+        all_urls = bool(image_blocks) and len(raw_urls) == len(image_blocks)
+        direct_mode = mode in {"scaled-url", "original-url"}
+        # 非 NapCat 可解析的扩展名（avif 等）协议端拿不到宽高，这种情况在
+        # scaled-url 模式下改走本地压缩，把图片转成 JPEG 再发
+        direct_ok = (
+            direct_mode
+            and all_urls
             and self._can_send_via_onebot(event)
-            and len(original_urls) == len(image_blocks)
-        ):
-            if mode == "scaled-url" and all(
-                is_napcat_parseable_url(url) for url in original_urls
-            ):
-                scaled_urls = [build_scaled_url(url, max_side) for url in original_urls]
-                if mark_compressed:
-                    self._mark_compressed_captions(
-                        blocks,
-                        [
-                            sent != url
-                            for sent, url in zip(
-                                scaled_urls, original_urls, strict=True
-                            )
-                        ],
-                    )
-                if await self._send_via_onebot(event, header, blocks, scaled_urls):
-                    event.stop_event()
-                    return
-                if scaled_urls != original_urls:
-                    if mark_compressed:
-                        self._mark_compressed_captions(blocks, [False] * len(image_blocks))
-                    if await self._send_via_onebot(
-                        event, header, blocks, original_urls
-                    ):
-                        event.stop_event()
-                        return
-            elif mode == "original-url":
-                if mark_compressed:
-                    self._mark_compressed_captions(blocks, [False] * len(image_blocks))
-                if await self._send_via_onebot(event, header, blocks, original_urls):
-                    event.stop_event()
-                    return
+            and (mode == "original-url" or all(is_napcat_parseable_url(u) for u in raw_urls))
+        )
 
-        if allow_local_fallback:
+        if direct_ok:
+            urls, evidences = await self._url_delivery_plan(image_blocks, max_side, mode)
+            if mark_compressed:
+                self._mark_compressed_captions(blocks, evidences)
+            outcome = await self._send_via_onebot(event, header, blocks, urls)
+            if outcome is not SendOutcome.FAILED:
+                # SENT 已送达；UNKNOWN 可能已送达——两者都不能再发第二次
+                self._mark_event_sent(event)
+                event.stop_event()
+                return
+
+        if allow_local_fallback and not self._event_already_sent(event):
             should_compress = mode == "local-compress" or (
-                mode == "scaled-url"
-                and any(block.get("path") for block in image_blocks)
+                mode == "scaled-url" and any(block.get("path") for block in image_blocks)
             )
-            onebot_failed = self._can_send_via_onebot(event) and mode in {
-                "scaled-url",
-                "original-url",
-            }
-            if should_compress or (onebot_failed and len(original_urls) == len(image_blocks)):
+            # 走 URL 直传但没能直发成功：既包括 FAILED 后的回退，也包括扩展名
+            # 让协议端解析不了宽高、压根没尝试直发的情形（改本地压缩成 JPEG 再发）
+            onebot_failed = self._can_send_via_onebot(event) and direct_mode and all_urls
+            if should_compress or onebot_failed:
                 prepared = await self._prepare_delivery_blocks(
                     image_blocks, compress=mode != "original-url"
                 )
                 if prepared is not None:
+                    evidences = [
+                        CompressionEvidence.COMPRESSED if compressed else CompressionEvidence.ORIGINAL
+                        for _, compressed in prepared
+                    ]
                     if mark_compressed:
-                        self._mark_compressed_captions(
-                            blocks, [compressed for _, compressed in prepared]
-                        )
+                        self._mark_compressed_captions(blocks, evidences)
                     fallback_header = header
-                    if any(compressed for _, compressed in prepared):
+                    if any(
+                        item is CompressionEvidence.COMPRESSED for item in evidences
+                    ):
                         fallback_header += "（已压缩）"
                     chain = [Comp.At(qq=event.get_sender_id())]
                     if fallback_header:
@@ -786,34 +1008,30 @@ class ImageTracePlugin(Star):
                             data, _ = prepared[image_index]
                             chain.append(Comp.Image.fromBytes(data))
                             image_index += 1
+                    self._mark_event_sent(event)
                     yield event.chain_result(chain)
                     return
                 logger.warning("本地图片回退失败，改用标准消息链 URL 发送")
 
+        if self._event_already_sent(event):
+            return
+        urls, evidences = await self._url_delivery_plan(image_blocks, max_side, mode)
         if mark_compressed:
-            flags = []
-            for block in image_blocks:
-                url = str(block.get("url") or "")
-                target_url = (
-                    build_scaled_url(url, max_side)
-                    if url and mode == "scaled-url"
-                    else url
-                )
-                flags.append(target_url != url)
-            self._mark_compressed_captions(blocks, flags)
+            self._mark_compressed_captions(blocks, evidences)
         chain = [Comp.At(qq=event.get_sender_id())]
         if header:
             chain.append(Comp.Plain(" " + header))
+        image_index = 0
         for block in blocks:
             if block.get("text"):
                 chain.append(Comp.Plain("\n" + str(block["text"])))
-            url = str(block.get("url") or "")
             path = str(block.get("path") or "")
-            if url:
-                target_url = build_scaled_url(url, max_side) if mode == "scaled-url" else url
-                chain.append(Comp.Image.fromURL(target_url))
+            if block.get("url"):
+                chain.append(Comp.Image.fromURL(urls[image_index]))
+                image_index += 1
             elif path:
                 chain.append(Comp.Image.fromFileSystem(path))
+        self._mark_event_sent(event)
         yield event.chain_result(chain)
 
     # ------------------------------------------------------------------
@@ -877,9 +1095,9 @@ class ImageTracePlugin(Star):
         local_path = ""
         is_tmp = False
         try:
-            local_path, is_tmp = await self._resolve_local_file(seg)
+            local_path, is_tmp, fail_message = await self._resolve_local_file(seg)
             if not local_path:
-                yield event.plain_result("⚠️ 未能获取图片内容，图片链接可能已过期。")
+                yield event.plain_result(fail_message)
                 return
 
             feats: ImageFeatures = await asyncio.to_thread(
@@ -902,6 +1120,10 @@ class ImageTracePlugin(Star):
                 if best.created_at:
                     lines.append(f"入库时间：{best.created_at}")
                 block = {"text": " · ".join(lines[1:])}
+                if best.width and best.height:
+                    # 供回传计划判断是否需要图床缩放，以及压缩标识是否成立
+                    block["width"] = best.width
+                    block["height"] = best.height
                 if best.image_url:
                     block["url"] = best.image_url
                 elif best.file_path and os.path.isfile(best.file_path):
@@ -950,9 +1172,9 @@ class ImageTracePlugin(Star):
         local_path = ""
         is_tmp = False
         try:
-            local_path, is_tmp = await self._resolve_local_file(seg)
+            local_path, is_tmp, fail_message = await self._resolve_local_file(seg)
             if not local_path:
-                return "nofile", event.plain_result("⚠️ 未能获取图片内容，图片链接可能已过期。")
+                return "nofile", event.plain_result(fail_message)
             vector = await self.vector.embed_file(local_path)
             hits = await self.vector.search(
                 vector, limit=self.vector.top_k, with_vector=True
@@ -1090,6 +1312,10 @@ class ImageTracePlugin(Star):
                 "file_name": str(file_name or ""),
                 "fields": fields,
             }
+            if width and height:
+                # 供回传计划判断是否需要图床缩放，以及压缩标识是否成立
+                block["width"] = width
+                block["height"] = height
             image_url = str(payload.get("image_url") or "")
             if image_url:
                 block["url"] = image_url
@@ -1184,9 +1410,9 @@ class ImageTracePlugin(Star):
         stored = None
         db_saved = False
         try:
-            local_path, is_tmp = await self._resolve_local_file(seg)
+            local_path, is_tmp, fail_message = await self._resolve_local_file(seg)
             if not local_path:
-                yield event.plain_result("⚠️ 未能获取图片内容，图片链接可能已过期。")
+                yield event.plain_result(fail_message)
                 return
             size_limit = max(1, self._int_cfg("max_download_mb", 20)) * 1024 * 1024
             if os.path.getsize(local_path) > size_limit:
@@ -1530,7 +1756,8 @@ class ImageTracePlugin(Star):
             "· /溯源删除 <编号> —— 删除图库条目（管理员）\n"
             "· /随机图 [目录] —— 从图床随机取一张图片并回传\n"
             "· /随机视频 [目录] —— 从图床随机取一个视频并回传\n"
-            "· /原图 [文件名] —— 重发本会话最近回传图片的原图（不带参数取最近一张）\n"
+            "· /原图 [文件名] —— 取原图：带文件名时直接到图床按名取（无需先回传），"
+            "不带文件名取本会话最近回传的原图\n"
             "· /溯源帮助 —— 显示本说明\n"
             "检索引擎：auto=向量优先（未命中/不可用自动回退哈希）；hash/vector 可在插件配置 search_engine 切换。\n"
             "提示：哈希阈值、向量阈值与模型、图床接口、随机图接口等均可在 WebUI 插件配置中调整。"
@@ -1560,26 +1787,103 @@ class ImageTracePlugin(Star):
         ):
             yield result
 
+    def _imgbed_base(self) -> str:
+        """/原图 直查用的图床站点地址（取第一个配置完整的）。
+
+        CloudFlare-ImgBed 图床配置与本插件登记原图同站点，最权威；其次是
+        随机图接口用的站点地址（同一台图床的另一处配置）。都没有时返回空串，
+        由调用方给出「未配置图床站点」的提示，而不是拼一条必然 404 的链接。
+        """
+        bed = self._dict_cfg("image_bed")
+        if str(bed.get("mode") or "").strip() == MODE_CFB:
+            base = str(bed.get("cfi_base_url") or "").strip().rstrip("/")
+            if base.lower().startswith(("http://", "https://")):
+                return base
+        base = str(self._dict_cfg("random_media").get("base_url") or "").strip().rstrip("/")
+        return base if base.lower().startswith(("http://", "https://")) else ""
+
+    @classmethod
+    def _first_image_name(cls, event: AstrMessageEvent) -> str:
+        """从本条消息/被引用消息的图片段里取一个文件名。
+
+        供无参 /原图 在会话历史为空时退化为直查：引用一张图发 /原图，即按
+        该图文件名去图床找原图。
+        """
+        for seg in cls._extract_images(event):
+            for candidate in (getattr(seg, "url", None), getattr(seg, "file", None)):
+                name = media_filename(candidate)
+                if name:
+                    return name
+        return ""
+
+    @staticmethod
+    def _original_usage() -> str:
+        return (
+            "本会话还没有回传过图片。/原图 也可直接按文件名到图床取原图：\n"
+            "· /原图 文件名 —— 直接把图床里的原图取回来（无需先回传）\n"
+            "· /原图 —— 取本会话最近回传过的图片的原图\n"
+            "· 引用一张图发送 /原图 —— 按该图文件名到图床取原图"
+        )
+
+    async def _lookup_imgbed_file(self, name: str) -> tuple[str, str, str]:
+        """按文件名到图床直查原图，返回 (名称, 直链, 失败提示)。
+
+        探测为「确定不存在」（4xx）时返回空直链并给出提示，同时附上尝试过的
+        完整直链，便于用户核对图床里的目录层级；探测结果未知（网络异常）不拦，
+        仍把直链交给回传——网络抖动不该被当成「图床没有这张图」。
+        """
+        base = self._imgbed_base()
+        if not base:
+            return (
+                "",
+                "",
+                "未配置图床站点地址：请在「图床设置」（cloudflare_imgbed）或「随机图」里"
+                "填写站点地址后重试，或先 /溯源 命中再发 /原图。",
+            )
+        candidate = build_imgbed_file_url(base, name)
+        if not candidate:
+            return (
+                "",
+                "",
+                f"「{name}」不像图床里的文件名，无法直接取原图；"
+                "可先用 /溯源 命中该图后再发 /原图。",
+            )
+        exists, _length = await self._probe_url(candidate)
+        if exists is False:
+            return "", "", f"图床里没有找到「{name}」，已尝试：{candidate}"
+        return name, candidate, ""
+
     @filter.command("原图")
     async def original_image(self, event: AstrMessageEvent):
-        """重发本会话最近回传图片的原图；可带文件名指定某一张（/原图 风景.jpg）"""
+        """重发最近回传过的图片的原图；也可直接按文件名到图床取（/原图 风景.jpg）"""
         session = self._session_key(event)
-        if not self.history.count(session):
-            yield event.plain_result("本会话还没有回传过图片，请先使用 /溯源 或 /随机图")
-            return
         query = self._strip_command(event.message_str or "", ("原图",)).strip(" \t:：,，")
+        name = ""
+        url = ""
         if query:
             status, payload = self.history.find(session, query)
-            if status == "missing":
-                yield event.plain_result(f"没有找到「{query}」，只能找回本会话最近回传过的图片")
-                return
             if status == "ambiguous":
                 candidates = "、".join(payload[:5])
                 yield event.plain_result(f"匹配到多张图片，请写出更完整的文件名：{candidates}")
                 return
-            name, url = payload
+            if status == "found":
+                name, url = payload
         else:
-            name, url = self.history.latest(session)
+            latest = self.history.latest(session)
+            if latest is not None:
+                name, url = latest
+            else:
+                # 会话里没有回传记录：退化为「按消息/引用图里的文件名直查图床」
+                query = self._first_image_name(event)
+
+        if not url:
+            if not query:
+                yield event.plain_result(self._original_usage())
+                return
+            name, url, message = await self._lookup_imgbed_file(query)
+            if not url:
+                yield event.plain_result(message)
+                return
         # R6：/原图 只发 URL、不落地字节——剥离 ImgBed 处理参数还原未处理原文件，
         # 并强制 original-url + 禁用本地回退
         block = {"url": build_original_url(url), "file_name": name}
