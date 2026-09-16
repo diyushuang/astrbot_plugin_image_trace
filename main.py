@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import os
 import secrets
 import time
@@ -26,15 +27,26 @@ import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
+
+# 说明：获取 AstrBot data 目录目前官方仅有 astrbot.core.utils.astrbot_path 这一条途径
+# （astrbot.api / Context 均未暴露等价 API）。StarTools.get_data_dir() 路径等价
+# （data/plugin_data/<name>），但要求较新的 AstrBot 版本，与 metadata.yaml 声明的
+# astrbot_version ">=4.0.0" 兼容范围冲突，故保留此导入（AstrBot 官方插件生态通用做法）。
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 try:
     from .common import (
         AI_VERIFY_MAX_CANDIDATES,
+        COMPRESS_CONCURRENCY,
         DOWNLOAD_CHUNK_SIZE,
         DOWNLOAD_TIMEOUT,
+        MEMORY_DOWNLOAD_MAX_BYTES,
+        PLAN_TOTAL_TIMEOUT,
+        PROBE_CONCURRENCY,
+        PROBE_TIMEOUT,
         RESCAN_BATCH_SIZE,
         RESCAN_PROGRESS_EVERY,
+        SCALED_VERIFY_COOLDOWN_SECONDS,
         TMP_MAX_AGE_SECONDS,
         as_float,
         as_int,
@@ -46,6 +58,7 @@ try:
         ImageFeatures,
         compute_features,
         heif_available,
+        image_bytes_ok,
         image_file_ok,
         phash_hex_len,
     )
@@ -65,6 +78,7 @@ try:
         deduplicate_vector_hits,
         delivery_settings,
         is_napcat_parseable_url,
+        is_scaling_capability_rejection,
         is_scaling_needed,
         prepare_image_bytes,
         sniff_image_format,
@@ -84,10 +98,16 @@ try:
 except ImportError:  # 兼容插件以独立模块方式加载
     from common import (  # type: ignore[no-redef]
         AI_VERIFY_MAX_CANDIDATES,
+        COMPRESS_CONCURRENCY,
         DOWNLOAD_CHUNK_SIZE,
         DOWNLOAD_TIMEOUT,
+        MEMORY_DOWNLOAD_MAX_BYTES,
+        PLAN_TOTAL_TIMEOUT,
+        PROBE_CONCURRENCY,
+        PROBE_TIMEOUT,
         RESCAN_BATCH_SIZE,
         RESCAN_PROGRESS_EVERY,
+        SCALED_VERIFY_COOLDOWN_SECONDS,
         TMP_MAX_AGE_SECONDS,
         as_float,
         as_int,
@@ -99,6 +119,7 @@ except ImportError:  # 兼容插件以独立模块方式加载
         ImageFeatures,
         compute_features,
         heif_available,
+        image_bytes_ok,
         image_file_ok,
         phash_hex_len,
     )
@@ -118,6 +139,7 @@ except ImportError:  # 兼容插件以独立模块方式加载
         deduplicate_vector_hits,
         delivery_settings,
         is_napcat_parseable_url,
+        is_scaling_capability_rejection,
         is_scaling_needed,
         prepare_image_bytes,
         sniff_image_format,
@@ -233,6 +255,9 @@ class ImageTracePlugin(Star):
         # 回传过的原图直链的历史（供 /原图 找回）；随机图客户端惰性构造
         self.history = MediaHistory()
         self._random_media_client: RandomMediaClient | None = None
+        # 图床缩放能力冷却截止时刻（time.monotonic 口径，0 表示未观测到拒绝）。
+        # 探测到 API 级拒绝（405/501 等）后的一段时间内不再探测缩放版。
+        self._scaled_verify_unsupported_until = 0.0
         self._cleanup_tmp()
         engine = self._engine_choice()
         vector_note = "（向量引擎已启用）" if self.vector.enabled and engine != "hash" else ""
@@ -523,6 +548,42 @@ class ImageTracePlugin(Star):
             raise
         return path
 
+    async def _download_bytes(self, url: str) -> bytes:
+        """下载到内存；声明体积超过内存阈值时退回落盘实现再读回。
+
+        回退交付只需要字节（压缩、发送都在内存里完成），落盘再读回纯属多余
+        的两次文件操作。内存占用由两道闸门控制：声明长度超过
+        MEMORY_DOWNLOAD_MAX_BYTES 时直接改走落盘；声明长度未知（分块传输）时
+        仍读内存，但受 max_download_mb 上限约束——阈值取 8MB 而非上限值，正是
+        为了让「未知长度」这种情况也留在可控范围内（并发上限 3，最坏约 24MB）。
+        """
+        client = await self._get_http()
+        size_limit = max(1, self._int_cfg("max_download_mb", 20)) * 1024 * 1024
+        timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)
+        async with await client.request(
+            "GET", url, prepare=self._image_download_headers, timeout=timeout
+        ) as resp:
+            resp.raise_for_status()
+            declared = resp.headers.get("Content-Length", "")
+            if declared.isdigit() and int(declared) > size_limit:
+                raise ValueError("图片超过大小上限")
+            if declared.isdigit() and int(declared) > MEMORY_DOWNLOAD_MAX_BYTES:
+                # 大图不冒险占内存：交回落盘实现
+                await resp.release()
+                path = await self._download(url)
+                try:
+                    return await asyncio.to_thread(self._read_file_bytes, path)
+                finally:
+                    self._remove_quiet(path)
+            buffer = io.BytesIO()
+            received = 0
+            async for chunk in resp.content.iter_chunked(DOWNLOAD_CHUNK_SIZE):
+                received += len(chunk)
+                if received > size_limit:
+                    raise ValueError("图片超过大小上限")
+                buffer.write(chunk)
+            return buffer.getvalue()
+
     @staticmethod
     def _image_download_headers(u: str, _m: str, _c: bool) -> dict:
         """图片兜底下载的请求头。
@@ -551,40 +612,52 @@ class ImageTracePlugin(Star):
         return base
 
     async def _probe_url(
-        self, url: str, cache: dict | None = None
+        self, url: str, cache: dict | None = None, *, allow_range: bool = True
     ) -> tuple[bool | None, int | None]:
         """轻量探测 URL 是否存在及其响应体长度，返回 (是否存在, 字节数)。
 
         两个用途：判定图床缩放 URL 是否真的比原图小（压缩标识的唯一一手
         证据），以及 /原图 按文件名拼出的直链是否真的存在于图床。HEAD 优先，
-        不支持时退化为只取 0-0 一个字节的 Range GET。任何网络异常都返回
-        (None, None)——调用方必须把「探测不出来」与「确定不存在」分开处理，
-        网络抖动不该被当成「图床没有这张图」。
+        不支持时退化为只取 0-0 一个字节的 Range GET（仅限不带缩放参数的 URL：
+        ImgBed 明确拒绝「Range + 缩放」的组合，退化为 Range 只会白花一次请求）。
+        任何网络异常都返回 (None, None)——调用方必须把「探测不出来」与「确定
+        不存在」分开处理，网络抖动不该被当成「图床没有这张图」。
         """
         if cache is not None and url in cache:
             return cache[url]
-        result = await self._probe_url_uncached(url)
+        result = await self._probe_url_uncached(url, allow_range=allow_range)
         if cache is not None:
             cache[url] = result
         return result
 
-    async def _probe_url_uncached(self, url: str) -> tuple[bool | None, int | None]:
+    async def _probe_url_uncached(
+        self, url: str, *, allow_range: bool = True
+    ) -> tuple[bool | None, int | None]:
+        """探测实现。探测用 PROBE_TIMEOUT 而非下载超时：探测只读响应头，
+        此前共用 30s 会让一次卡住的探测把交付拖到分钟级。
+        """
         client = await self._get_http()
-        timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)
+        timeout = aiohttp.ClientTimeout(total=PROBE_TIMEOUT)
         try:
             async with await client.request(
                 "HEAD", url, prepare=self._image_download_headers, timeout=timeout
             ) as resp:
+                if not allow_range and is_scaling_capability_rejection(resp.status):
+                    # 图床对缩放请求的 API 级拒绝：这是部署能力问题，不是这张图
+                    # 的问题。记一次冷却，冷却期内不再为「已压缩」证据探测。
+                    self._note_scaled_unsupported(resp.status)
                 exists = classify_probe_status(resp.status)
                 if exists is False:
                     return False, None
                 length = content_length_from_headers(resp.headers)
                 if exists is True and length is not None:
                     return True, length
-                if exists is None:
+                if not allow_range:
                     return None, None
         except Exception as exc:
             logger.debug(f"HEAD 探测失败，改用 Range 探测 {url}: {exc}")
+            if not allow_range:
+                return None, None
         try:
             async with await client.request(
                 "GET", url, prepare=self._range_probe_headers, timeout=timeout
@@ -597,6 +670,20 @@ class ImageTracePlugin(Star):
         except Exception as exc:
             logger.debug(f"URL 探测失败（无法判定存在性）{url}: {exc}")
         return None, None
+
+    def _note_scaled_unsupported(self, status: int) -> None:
+        """记录「图床处理不了缩放请求」，随后一段时间跳过缩放探测。"""
+        self._scaled_verify_unsupported_until = (
+            time.monotonic() + SCALED_VERIFY_COOLDOWN_SECONDS
+        )
+        logger.info(
+            f"图床拒绝了缩放请求（HTTP {status}）：{SCALED_VERIFY_COOLDOWN_SECONDS} 秒内"
+            "不再探测缩放版（配文相应不再标注「已压缩」）"
+        )
+
+    def _scaled_verify_cooling(self) -> bool:
+        """是否处在「图床不支持缩放」的冷却期内。"""
+        return time.monotonic() < self._scaled_verify_unsupported_until
 
     def _verify_scaled(self) -> bool:
         """image_delivery.verify_scaled：图床缩放是否实测校验，未配置时默认开启。"""
@@ -824,48 +911,95 @@ class ImageTracePlugin(Star):
                 evidence = CompressionEvidence.UNKNOWN
             block["text"] = self._vector_caption(block, evidence)
 
-    async def _load_delivery_bytes(self, block: dict) -> bytes | None:
+    async def _load_delivery_bytes(self, block: dict, *, validate: bool = True) -> bytes | None:
+        """取回传要用的图片字节。
+
+        validate=False 供本地压缩路径使用：压缩本身就要完整解码一次，再提前
+        校验等于同一次解码做两遍（实测 4000x3000 JPEG 白花 78ms、外加一次
+        全尺寸位图内存）。压缩失败时调用方再用 image_bytes_ok 判定「图本身
+        坏」还是「这个格式不适合重编码」，坏图仍会被拦下。
+        """
         url = str(block.get("url") or "")
         path = str(block.get("path") or "")
-        temp_path = ""
         try:
             if url:
-                temp_path = await self._download(url)
-                path = temp_path
-            if not path or not await asyncio.to_thread(image_file_ok, path):
+                data = await self._download_bytes(url)
+                if validate and not await asyncio.to_thread(image_bytes_ok, data):
+                    return None
+                return data
+            if not path:
+                return None
+            if validate and not await asyncio.to_thread(image_file_ok, path):
                 return None
             return await asyncio.to_thread(self._read_file_bytes, path)
         except Exception as exc:
             logger.warning(f"读取回传图片失败: {exc}")
             return None
-        finally:
-            if temp_path:
-                self._remove_quiet(temp_path)
 
     async def _prepare_delivery_blocks(
         self, blocks: list[dict], *, compress: bool
     ) -> list[tuple[bytes, bool]] | None:
-        prepared = []
+        """准备要直发的字节，逐图压缩在并发上限内并行执行。
+
+        顺序必须与传入的 image_blocks 一致（调用方按下标取用），因此用
+        gather 收集结果而不是 as_completed。任一张失败即整体返回 None，
+        调用方据此改走 URL 链——与逐张串行时的语义一致。
+        """
         mode, max_side, quality = self._delivery_config()
-        for block in blocks:
-            if not block.get("url") and not block.get("path"):
-                continue
-            data = await self._load_delivery_bytes(block)
-            if data is None:
-                return None
-            if not compress or mode == "original-url":
-                prepared.append((data, False))
-                continue
-            result = await asyncio.to_thread(prepare_image_bytes, data, max_side, quality)
-            if result is None:
-                prepared.append((data, False))
+        target_bytes, use_webp = self._encode_options()
+        semaphore = asyncio.Semaphore(COMPRESS_CONCURRENCY)
+
+        async def prepare_one(block: dict) -> tuple[bytes, bool] | None:
+            async with semaphore:
+                data = await self._load_delivery_bytes(block, validate=not compress)
+                if data is None:
+                    return None
+                if not compress or mode == "original-url":
+                    return data, False
+                result = await asyncio.to_thread(
+                    prepare_image_bytes,
+                    data,
+                    max_side,
+                    quality,
+                    target_bytes=target_bytes,
+                    use_webp=use_webp,
+                )
+                if result is not None:
+                    return result
+                if await asyncio.to_thread(image_bytes_ok, data):
+                    # 压缩失败但图片本身可用（格式不支持重编码等）：回退原字节
+                    logger.warning(
+                        f"图片本地压缩失败，回退原字节: 格式={sniff_image_format(data) or '未知'}, "
+                        f"大小={len(data) / 1024:.0f}KB"
+                    )
+                    return data, False
                 logger.warning(
-                    f"图片本地压缩失败，回退原字节: 格式={sniff_image_format(data) or '未知'}, "
+                    f"回退图片无法解码，改用 URL 发送: 格式={sniff_image_format(data) or '未知'}, "
                     f"大小={len(data) / 1024:.0f}KB"
                 )
-            else:
-                prepared.append(result)
-        return prepared
+                return None
+
+        prepared = await asyncio.gather(
+            *(prepare_one(block) for block in blocks if block.get("url") or block.get("path"))
+        )
+        if any(item is None for item in prepared):
+            return None
+        return list(prepared)
+
+    def _encode_options(self) -> tuple[int, bool]:
+        """本地压缩进阶选项：目标体积上限（字节，0 表示不限制）与 WebP 输出。"""
+        raw = self._dict_cfg("image_delivery")
+        target_kb = bounded_int(raw.get("target_kb"), 0, 0, 10240)
+        return target_kb * 1024, truthy(raw.get("webp"))
+
+    @staticmethod
+    def _known_bytes(block: dict) -> int:
+        """命中条目里记录的原图体积（字节）；未知或非法一律返回 0。"""
+        try:
+            value = int(block.get("size_bytes") or 0)
+        except (TypeError, ValueError):
+            return 0
+        return value if value > 0 else 0
 
     async def _url_delivery_plan(
         self, image_blocks: list[dict], max_side: int, mode: str
@@ -874,49 +1008,99 @@ class ImageTracePlugin(Star):
 
         不再无条件改写 URL：只有最长边确实超过 max_side（或尺寸未知）时才追加
         图床缩放参数——不超过 max_side 的图，图床按 fallback=original 原样返回，
-        追加参数只是白白触发一次处理。开启 verify_scaled 时进一步用响应体长度
-        实测缩放版是否真的更小，这也是「已压缩」文案唯一的一手依据；实测不出来
-        就按 UNKNOWN 处理，配文宁可不写，也不能出现「文字说压缩、收到的是原图」。
+        追加参数只是白白触发一次处理。开启 verify_scaled 时进一步实测缩放版是否
+        真的更小，这也是「已压缩」文案唯一的一手依据；实测不出来就按 UNKNOWN
+        处理，配文宁可不写，也不能出现「文字说压缩、收到的是原图」。
+
+        探测成本被压到最低：所有探测并发执行且有总预算，命中条目自带原图体积
+        （size_bytes / file_size）时不必再探原图；图床明确拒绝缩放请求后进入
+        冷却期，冷却期内直接跳过探测。
         """
         urls: list[str] = []
-        evidences: list[CompressionEvidence] = []
-        probe_cache: dict = {}
-        verify = mode == "scaled-url" and self._verify_scaled()
+        sizes: list[tuple] = []
+        jobs: list[tuple[str, str, int] | None] = []
+        verify = (
+            mode == "scaled-url" and self._verify_scaled() and not self._scaled_verify_cooling()
+        )
         for block in image_blocks:
             original = build_original_url(str(block.get("url") or ""))
             size = (block.get("width"), block.get("height"))
+            sizes.append(size)
             if mode != "scaled-url" or not original:
                 urls.append(original or str(block.get("url") or ""))
-                evidences.append(compression_evidence(size, max_side))
+                jobs.append(None)
                 continue
             scaled = build_scaled_url(original, max_side)
             if is_scaling_needed(size, max_side) is False or scaled == original:
                 # 尺寸证明不会被缩放，或这条直链本来就带不了缩放参数
                 urls.append(original)
-                evidences.append(compression_evidence(size, max_side))
+                jobs.append(None)
                 continue
-            verified = (
-                await self._scaled_is_smaller(original, scaled, probe_cache)
-                if verify
-                else None
-            )
             urls.append(scaled)
-            evidences.append(compression_evidence(size, max_side, verified_smaller=verified))
+            jobs.append((original, scaled, self._known_bytes(block)) if verify else None)
+
+        verified = await self._verify_scaled_batch(jobs) if any(jobs) else {}
+        evidences = [
+            compression_evidence(sizes[index], max_side, verified_smaller=verified.get(index))
+            for index in range(len(image_blocks))
+        ]
         return urls, evidences
 
-    async def _scaled_is_smaller(
-        self, original: str, scaled: str, cache: dict
-    ) -> bool | None:
-        """实测缩放 URL 的响应体是否真的比原图小。
+    async def _verify_scaled_batch(
+        self, jobs: list[tuple[str, str, int] | None]
+    ) -> dict[int, bool | None]:
+        """并行实测「缩放版是否真的更小」，返回 {下标: 是否更小或 None}。
 
-        两次探测都拿到长度才能比较；任一侧拿不到（服务器不返回长度、请求失败）
-        返回 None，调用方据此按「无法判定」处理。
+        已知原图体积（命中条目里的 size_bytes / file_size）时只探缩放版——
+        少一次请求也少一次图床处理；未知时才把原图与缩放版一起并发探。
+        超出总预算仍未返回的探测一律不判定（配文按「说不准」处理），
+        绝不让探测无限期拖住发送。
         """
-        _, original_size = await self._probe_url(original, cache)
-        _, scaled_size = await self._probe_url(scaled, cache)
-        if original_size is None or scaled_size is None:
-            return None
-        return scaled_size < original_size
+        semaphore = asyncio.Semaphore(PROBE_CONCURRENCY)
+        cache: dict = {}
+
+        async def run(index: int, job: tuple[str, str, int]) -> tuple[int, bool | None]:
+            original, scaled, known = job
+            async with semaphore:
+                if known:
+                    _, scaled_size = await self._probe_url(scaled, cache, allow_range=False)
+                    return index, (
+                        None if scaled_size is None else scaled_size < known
+                    )
+                (_, original_size), (_, scaled_size) = await asyncio.gather(
+                    self._probe_url(original, cache),
+                    self._probe_url(scaled, cache, allow_range=False),
+                )
+                if original_size is None or scaled_size is None:
+                    return index, None
+                return index, scaled_size < original_size
+
+        tasks = [
+            asyncio.create_task(run(index, job))
+            for index, job in enumerate(jobs)
+            if job is not None
+        ]
+        if not tasks:
+            return {}
+        done, pending = await asyncio.wait(tasks, timeout=PLAN_TOTAL_TIMEOUT)
+        for task in pending:
+            task.cancel()
+        if pending:
+            # 取消后回收，避免留下「已取消但仍挂着」的任务对象
+            await asyncio.gather(*pending, return_exceptions=True)
+            logger.warning(
+                f"探测超出 {PLAN_TOTAL_TIMEOUT}s 预算，{len(pending)} 张图的压缩标识按"
+                "「无法判定」处理（不阻塞图片发送）"
+            )
+        result: dict[int, bool | None] = {}
+        for task in done:
+            try:
+                index, value = task.result()
+            except Exception as exc:  # 单张探测失败不影响其余判定
+                logger.debug(f"缩放实测失败: {exc}")
+                continue
+            result[index] = value
+        return result
 
     async def _yield_delivery(
         self,
@@ -963,8 +1147,12 @@ class ImageTracePlugin(Star):
             and (mode == "original-url" or all(is_napcat_parseable_url(u) for u in raw_urls))
         )
 
+        # 回传计划最多只算一次：回退路径此前会重跑一遍规划，把同样的探测白做
+        # 第二次（图床还会因此多做一次缩放处理）。
+        plan: tuple[list[str], list[CompressionEvidence]] | None = None
         if direct_ok:
-            urls, evidences = await self._url_delivery_plan(image_blocks, max_side, mode)
+            plan = await self._url_delivery_plan(image_blocks, max_side, mode)
+            urls, evidences = plan
             if mark_compressed:
                 self._mark_compressed_captions(blocks, evidences)
             outcome = await self._send_via_onebot(event, header, blocks, urls)
@@ -1015,7 +1203,9 @@ class ImageTracePlugin(Star):
 
         if self._event_already_sent(event):
             return
-        urls, evidences = await self._url_delivery_plan(image_blocks, max_side, mode)
+        if plan is None:
+            plan = await self._url_delivery_plan(image_blocks, max_side, mode)
+        urls, evidences = plan
         if mark_compressed:
             self._mark_compressed_captions(blocks, evidences)
         chain = [Comp.At(qq=event.get_sender_id())]
@@ -1124,6 +1314,9 @@ class ImageTracePlugin(Star):
                     # 供回传计划判断是否需要图床缩放，以及压缩标识是否成立
                     block["width"] = best.width
                     block["height"] = best.height
+                if best.file_size and best.file_size > 0:
+                    # 入库时记录的原图体积：回传计划据此免探测原图体积
+                    block["size_bytes"] = int(best.file_size)
                 if best.image_url:
                     block["url"] = best.image_url
                 elif best.file_path and os.path.isfile(best.file_path):
@@ -1316,17 +1509,31 @@ class ImageTracePlugin(Star):
                 # 供回传计划判断是否需要图床缩放，以及压缩标识是否成立
                 block["width"] = width
                 block["height"] = height
+            size_bytes = self._known_bytes(payload)
+            if size_bytes:
+                # 图床侧钩子（img-indexer）入库时已记录原图体积，直接用：
+                # 回传计划因此不必再探测原图尺寸，省一次往返与一次图床处理
+                block["size_bytes"] = size_bytes
             image_url = str(payload.get("image_url") or "")
             if image_url:
                 block["url"] = image_url
             else:
                 block["fields"].append("该条目没有可用直链，可能已被删除")
             blocks.append(block)
-        prompt_via_onebot = await self._send_prompt(event, header)
-        if not prompt_via_onebot:
+        prompt_via_onebot = False
+        prompt_task = None
+        if self._can_send_via_onebot(event):
+            # 提示与图片并行发出：提示只走一次 call_action，串行 await 会让图片
+            # 晚一个完整往返才起步。两条消息都在同一条 OneBot 连接上按顺序下发，
+            # 提示先入队，正常情况下仍先到达。
+            prompt_task = asyncio.create_task(self._send_prompt(event, header))
+        else:
             yield event.plain_result(header)
         async for result in self._yield_delivery(event, "", blocks, mark_compressed=True):
             yield result
+        if prompt_task is not None:
+            # 只为 stop_event 决策等待提示结果；图片可能已经交付，不再回滚。
+            prompt_via_onebot = await prompt_task
         # 提示用 OneBot 原生发出（图片那条未必）时，仍按旧语义停事件；若图片
         # 那条也走了 OneBot，_yield_delivery 已停过，这里重复调用无副作用。
         # 放在 yield 之后：第二条消息已经交付，停事件不会把它吞掉。
@@ -1347,25 +1554,30 @@ class ImageTracePlugin(Star):
     async def _ai_verify(self, query_path: str, hits: list) -> list:
         """用当前会话的视觉大模型复核候选图是否为同一张图。
 
-        任一环节失败都静默降级为纯哈希结果，不影响正常使用。
+        任一环节失败都静默降级为纯哈希结果，不影响正常使用。候选之间彼此独立，
+        因此并发送审——此前串行等待，多候选时复核耗时是单次推理的 N 倍。
         """
         provider = None
         try:
-            provider = self.context.get_using_provider()
+            # get_using_provider 已被官方弃用，优先使用异步版；旧版本回退同步 API。
+            get_provider = getattr(self.context, "get_using_provider_async", None)
+            if get_provider is not None:
+                provider = await get_provider()
+            else:
+                provider = self.context.get_using_provider()
         except Exception:
             provider = None
         if provider is None or not hasattr(provider, "text_chat"):
             logger.info("未找到可用的 LLM 提供商，跳过 AI 复核。")
             return hits
 
-        verified: list = []
-        for cand in hits[:AI_VERIFY_MAX_CANDIDATES]:
+        async def verify(cand):
+            """返回保留的候选；被否决时返回 None。"""
             cand_path = ""
             if cand.file_path and os.path.isfile(cand.file_path):
                 cand_path = cand.file_path
             if not cand_path:
-                verified.append(cand)  # 候选无本地文件，无法复核，保留哈希结论
-                continue
+                return cand  # 候选无本地文件，无法复核，保留哈希结论
             try:
                 resp = await provider.text_chat(
                     prompt=(
@@ -1376,14 +1588,16 @@ class ImageTracePlugin(Star):
                 )
                 answer = (getattr(resp, "completion_text", "") or "").strip()
                 logger.debug(f"AI 复核 #{cand.id} -> {answer}")
-                if self._is_negative_answer(answer):
-                    continue
-                verified.append(cand)
+                return None if self._is_negative_answer(answer) else cand
             except Exception as e:
                 logger.warning(f"AI 复核失败，保留候选 #{cand.id}: {e}")
-                verified.append(cand)
+                return cand
+
+        results = await asyncio.gather(
+            *(verify(cand) for cand in hits[:AI_VERIFY_MAX_CANDIDATES])
+        )
         # 不能回退为未复核的 hits：候选被全部否决时应当报告未命中
-        return verified
+        return [cand for cand in results if cand is not None]
 
     # ------------------------------------------------------------------
     # 指令：登记原图

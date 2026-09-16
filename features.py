@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import contextlib
+import io
 from dataclasses import dataclass
 from functools import cache
 
@@ -35,6 +36,21 @@ try:  # Pillow >= 9.1
     _RESAMPLE = Image.Resampling.LANCZOS
 except AttributeError:  # 旧版本兜底
     _RESAMPLE = Image.LANCZOS
+
+# 受支持的图片格式 → MIME。image_mime(path) 与 image_bytes_ok(data) 共用同一份
+# 真值表：两条校验路径判据必须一致，否则「落盘校验通过、内存校验不通过」这类
+# 差异会让回退逻辑在不同入口表现不一。
+_MIME_BY_FORMAT = {
+    "AVIF": "image/avif",
+    "BMP": "image/bmp",
+    "GIF": "image/gif",
+    "HEIF": "image/heic",
+    "JPEG": "image/jpeg",
+    "MPO": "image/jpeg",
+    "PNG": "image/png",
+    "TIFF": "image/tiff",
+    "WEBP": "image/webp",
+}
 
 
 def phash_hex_len(hash_size: int) -> int:
@@ -107,6 +123,11 @@ def _ahash(gray: Image.Image) -> str:
     return _bits_to_hex((pixels > pixels.mean()).flatten())
 
 
+def _supported_mime(image) -> str | None:
+    """按 Pillow 识别出的格式映射 MIME；不受支持/识别不出返回 None。"""
+    return _MIME_BY_FORMAT.get(image.format or "")
+
+
 def image_mime(path: str) -> str | None:
     """按真实内容识别受支持的图片格式，并完整解码以拒绝截断文件。"""
     try:
@@ -114,23 +135,34 @@ def image_mime(path: str) -> str | None:
             # 与 _load_rgb 同一防解压炸弹闸门：load() 前按头部尺寸拒绝
             if image.width * image.height > _MAX_LOAD_PIXELS:
                 return None
-            mime = {
-                "AVIF": "image/avif",
-                "BMP": "image/bmp",
-                "GIF": "image/gif",
-                "HEIF": "image/heic",
-                "JPEG": "image/jpeg",
-                "MPO": "image/jpeg",
-                "PNG": "image/png",
-                "TIFF": "image/tiff",
-                "WEBP": "image/webp",
-            }.get(image.format or "")
+            mime = _supported_mime(image)
             if mime is None:
                 return None
             image.load()
             return mime
     except Exception:
         return None
+
+
+def image_bytes_ok(data: bytes) -> bool:
+    """按字节校验：可完整解码且格式受支持（与 image_file_ok 同一判据）。
+
+    回退路径的图片本就在内存里，无需先落盘再 `image_file_ok`——落盘只为校验
+    等于白白多一次磁盘往返。判据与 image_file_ok 完全一致（同一张格式表、
+    同一个解压炸弹闸门、同样要求完整解码），因此两者可互换。
+    """
+    if not data:
+        return False
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            if image.width * image.height > _MAX_LOAD_PIXELS:
+                return False
+            if _supported_mime(image) is None:
+                return False
+            image.load()
+            return True
+    except Exception:
+        return False
 
 
 def heif_available() -> bool:

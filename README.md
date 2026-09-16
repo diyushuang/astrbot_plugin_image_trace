@@ -1,6 +1,6 @@
 # astrbot_plugin_image_trace 图片溯源
 
-[![version](https://img.shields.io/badge/version-1.5.4-blue)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.5.5-blue)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](./LICENSE)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
@@ -267,7 +267,9 @@ v1.3.0 起，两种对象存储从图床模式中独立为单独的**储存桶�
 | `image_delivery.mode` | `scaled-url` | 回图模式：`scaled-url`（ImgBed 等比缩放 URL 直传，默认）/ `original-url`（原图 URL 直传）/ `local-compress`（本地压缩） |
 | `image_delivery.max_side` | `1920` | 缩放或本地压缩的最长边，范围 1~4096 |
 | `image_delivery.quality` | `85` | 本地 JPEG 压缩质量，范围 1~100 |
-| `image_delivery.verify_scaled` | `true` | 是否实测校验图床缩放是否真的生效：开启时缩放 URL 直传前用 HEAD（退化 Range 探测）比对缩放版与原图的响应体长度，只有确实更小才在配文标注「已压缩」；图片不超过 `max_side` 时跳过缩放参数。关闭后不再宣称压缩 |
+| `image_delivery.verify_scaled` | `true` | 是否实测校验图床缩放是否真的生效：开启时缩放 URL 直传前用 HEAD 比对缩放版与原图的响应体长度，只有确实更小才在配文标注「已压缩」；命中条目已记录原图体积（向量 `payload.size_bytes` / 图库 `file_size`）时只探测缩放版一次；所有探测并发执行且受 8 秒总预算约束，图床明确拒绝缩放请求（405/501/400）后 600 秒内不再探测；图片不超过 `max_side` 时跳过缩放参数。关闭后不再宣称压缩 |
+| `image_delivery.target_kb` | `0` | 本地压缩的目标体积上限（KB，0=不限制，进阶项）。非 0 时启用质量阶梯：先按 `quality` 编码，仍超上限就逐档降 10 质量（最低 45）重编，最多 3 次 |
+| `image_delivery.webp` | `false` | 本地压缩是否改用 WebP 输出（进阶项）。平滑内容通常比同质量 JPEG 小 25%~60%，但编码耗时高一个量级（实测 1920 长边约 0.2~0.5 秒/张），噪声极多的图反而可能更大（此时自动回退原字节）；动图仍原样发送 |
 | `random_media.base_url` | - | 【必填】随机图图床站点地址（公网可达的 http/https）；`/随机图`、`/随机视频`、`/原图` 与 LLM 工具 `sendRandomMedia` 均依赖本组 |
 | `random_media.api_endpoint` | `/random` | 随机图接口相对路径（不能填完整 URL） |
 | `random_media.api_token` | - | 随机图接口 Token（`Authorization: Bearer`）；配置 Token 时图床地址必须为 `https`，否则插件拒绝请求 |
@@ -297,7 +299,11 @@ v1.3.0 起，两种对象存储从图床模式中独立为单独的**储存桶�
 2. **取图**：优先调用 AstrBot 内置的 `Image.convert_to_file_path()` 媒体解析（自动处理 URL 下载、base64、本地文件），产物先经完整解码校验。校验失败时分两种：认不出任何图片容器（图床错误体、rkey 过期、防盗链）才走自带下载兜底（含 SSRF 校验）；已经认得出容器却解不开（缺解码器的 HEIC / 截断文件）说明内容本身有问题，直接带具体原因返回、不再重下。
 3. **特征计算**：灰度化 → EXIF 转正 → 缩放 → DCT（预计算正交矩阵）→ 低频中值二值化得到 pHash；辅以 dHash/aHash。计算在 `asyncio.to_thread` 中执行，不阻塞事件循环。
 4. **相似度检索**：图库哈希常驻内存（numpy 位矩阵，整体替换 + 快照读），XOR + 查表 popcount 批量计算汉明距离，数万张图毫秒级检索；dHash/aHash 一并入库留存，预留给后续的二级确认，当前检索仅使用 pHash。
-5. **结果回传**：QQ `aiocqhttp` 优先经 OneBot 原生接口逐条直传 URL（`scaled-url` 模式下图片超过 `max_side` 才追加图床缩放参数），失败后回退本地压缩；其他平台走标准消息链。**单次发送保证**：直发结果分已送达 / 明确失败 / 结果未知，只有明确失败才允许回退，超时等「结果未知」一律不再重发。配文里的「已压缩」只在实测（缩放版字节更小）或本地压缩确实缩了字节时才出现。
+5. **结果回传**：QQ `aiocqhttp` 优先经 OneBot 原生接口直传 URL（`scaled-url` 模式下图片超过 `max_side` 才追加图床缩放参数），失败后回退本地压缩；其他平台走标准消息链。**单次发送保证**：直发结果分已送达 / 明确失败 / 结果未知，只有明确失败才允许回退，超时等「结果未知」一律不再重发。配文里的「已压缩」只在实测（缩放版字节更小）或本地压缩确实缩了字节时才出现。
+   - **回传计划只算一次**：URL 计划（含探测）在直发前算好后，失败回退路径直接复用，不会重跑一遍探测。
+   - **探测开销被压到最低**：全部探测并发执行（上限 4 并发）且有 8 秒总预算，超预算的按「说不准」处理、绝不等它；探测用独立的 5 秒超时（不再借用 30 秒的下载超时）；命中条目自带原图体积时只探缩放版一次；图床明确拒绝缩放请求后 600 秒内不再探测。
+   - **本地压缩**：单次解码（不再先做一次完整校验解码）、多图并发压缩（上限 3）、回退下载优先走内存（超过 8MB 才落盘）。
+   - **提示与图片并行**：OneBot 场景下命中提示与图片消息同时下发，首图不再等提示的整轮往返。
 6. **随机图与原图直取**：`/随机图`、`/随机视频` 经随机图接口（GET `/random`，出网同受 SSRF 校验）取到媒体直链后，图片复用上面的统一回传入口、视频走标准消息链；`/溯源` 与 `/随机图` 命中回传的图片都会记入会话级原图历史，`/原图` 据此把原图直链（剥离 ImgBed 缩放参数）直接下发，不下载不本地中转；历史未命中时 `/原图 文件名` 按文件名拼图床直链、探测存在后直传。
 
 ## 项目结构与开发
@@ -308,7 +314,7 @@ v1.3.0 起，两种对象存储从图床模式中独立为单独的**储存桶�
 | --- | --- | --- |
 | `main.py` | 插件入口：指令、图片提取、引擎调度、AI 复核、生命周期 | auto 引擎的"向量优先、失败回退哈希"由本层编排 |
 | `http_client.py` | 共享受管 HTTP 客户端 | 统一持有启用 IP pinning 的 `aiohttp` 会话 |
-| `features.py` | pHash / dHash / aHash 感知特征计算（Pillow + numpy + pillow-heif） | pHash 十六进制长度统一由 `phash_hex_len()` 提供，任何处不得自行推导；HEIF/HEIC 解码器在此防御式注册，缺失时降级为明确提示 |
+| `features.py` | pHash / dHash / aHash 感知特征计算（Pillow + numpy + pillow-heif） | pHash 十六进制长度统一由 `phash_hex_len()` 提供，任何处不得自行推导；HEIF/HEIC 解码器在此防御式注册，缺失时降级为明确提示；支持格式表只维护一份，`image_file_ok(path)` 与 `image_bytes_ok(data)` 判据必须一致 |
 | `library.py` | SQLite 图库 + 内存哈希位矩阵检索 | 写路径持锁，缓存整体替换 + 快照读；重操作需经 `asyncio.to_thread` 调用 |
 | `image_bed.py` | 图床与储存桶各模式的上传、直链反解、远端删除 | 上传失败一律回退本地副本，登记流程不中断 |
 | `image_delivery.py` | URL 缩放/原图还原、本地压缩、压缩证据三态、直发结果分类、图床直链拼装、向量命中去重的纯函数 | 不直接访问网络或 AstrBot 事件，便于独立测试 |
@@ -363,7 +369,7 @@ v1.3.0 起，两种对象存储从图床模式中独立为单独的**储存桶�
   1. 在该插件的 t2i/字体配置里指向容器内**真实存在**的字体文件（先 `docker exec -it <容器> ls <配置里的路径>` 确认）；
   2. 安装一套中文字体后重载插件，例如 `apt-get update && apt-get install -y fonts-noto-cjk`，或把思源黑体挂载进容器再填其路径；
   3. 临时关闭那个插件的文字转图开关（或把本插件的长回复改用 `/溯源帮助` 按需触发）。
-- **`/原图 文件名` 说「图床里没有找到」？** 它会按 `{图床地址}/file/{文件名}` 直接探测：先确认名字与图床里的实际文件名一致（含上传目录时写成 `/原图 2026/09/abc.jpg`）；若图床不是 CloudFlare-ImgBed，或文件放在自定义目录，请改用 `/溯源` 命中后再发 `/原图`。当前 `/原图` 只接「会话回传历史」与「图床直链」两条来源，不查 Qdrant 向量库与本地图库。
+- **`/原图 文件名` 说「图床里没有找到」？** 它会按 `{图床地址}/file/{文件名}` 直接探测：先确认名字与图床里的实际文件名一致（含上传目录时写成 `/原图 2026/09/abc.jpg`）；若图床不是 CloudFlare-ImgBed，或文件放在自定义目录，请改用 `/溯源` 命中后再发 `/原图`。当前 `/原图` 只接「会话回传历史」与「图床直链」两条来源，不查 Qdrant 向量库与本地图库。只有 HTTP 404/410 才判「确定不存在」；403（防盗链/访问规则）、429（限流）等只说明这次没读到，此时插件照常把直链发出去（不再误报找不到）。
 
 ## 数据存储
 

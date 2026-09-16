@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import math
 from collections.abc import Mapping
@@ -25,6 +26,17 @@ NAPCAT_PARSEABLE_EXTENSIONS = frozenset(
 )
 NAPCAT_PARSEABLE_FORMATS = frozenset({"JPEG", "PNG", "GIF", "WEBP", "BMP", "TIFF"})
 COMPRESS_MIN_BYTES = 200 * 1024
+
+# 探测结果里「确定不存在」的状态码：只有这两个语义明确。
+_NOT_FOUND_STATUSES = frozenset({404, 410})
+# 表示「该部署处理不了缩放请求」的 API 级拒绝（见 is_scaling_capability_rejection）。
+_CAPABILITY_REJECT_STATUSES = frozenset({400, 405, 501})
+
+# 本地压缩的质量阶梯：目标是「不超过指定体积」时的最低质量与最大尝试次数。
+# 每次尝试都是一次完整编码，故上限 3 次（首次 + 两次降档）。
+COMPRESS_MIN_QUALITY = 45
+COMPRESS_QUALITY_STEP = 10
+COMPRESS_MAX_ATTEMPTS = 3
 
 
 class CompressionEvidence(str, Enum):
@@ -111,10 +123,9 @@ def _error_text(exc: BaseException) -> str:
     绝不让异常向上传播、掩盖真实错误。两者都取不到时返回空串，不影响后续兜底。
     """
     parts: list[str] = []
-    try:
+    # str(exc) 若抛异常（自定义 __str__ 等）则跳过该部分，静默退化为无此段。
+    with contextlib.suppress(Exception):
         parts.append(str(exc))
-    except Exception:
-        pass
     try:
         # getattr 也放进 try：message 可能是取值即抛的 property，默认值兜不住。
         message = getattr(exc, "message", None)
@@ -285,14 +296,32 @@ def upgrade_to_https(url: str, base_url: str) -> str:
 
 
 def classify_probe_status(status: int | None) -> bool | None:
-    """HTTP 状态码 → 资源是否存在：2xx/206 存在、4xx 不存在、其余（未知）None。"""
+    """HTTP 状态码 → 资源是否存在：2xx/206 存在、404/410 不存在、其余 None。
+
+    只有「确定不存在」才返回 False，且仅限 404/410 这两个语义明确的码。此前把
+    所有 4xx 都判成「不存在」，于是 403（防盗链/访问规则拒绝）、429（限流）、
+    405（方法不允许）都被当成「图床里没有这张图」——`/原图` 于文件明明存在时
+    误报未找到，缩放探测也会误判成资源缺失。这些状态只能说明「这次没读到」，
+    代表不了资源的存在性，一律归入 None（说不准）。
+    """
     if status is None:
         return None
     if 200 <= status < 300:
         return True
-    if 400 <= status < 500:
+    if status in _NOT_FOUND_STATUSES:
         return False
     return None
+
+
+def is_scaling_capability_rejection(status: int | None) -> bool:
+    """该状态码是否表示「当前部署处理不了缩放请求」。
+
+    对应 CloudFlare-ImgBed Read API 的 API 级拒绝：405（带缩放参数的请求只接受
+    GET）、501（未配置图片处理器）、400（缩放参数与 Range 同时使用等参数组合
+    非法）。这类拒绝是**部署能力**问题，不是单张图的问题，因此调用方可以据此
+    在一段时间内不再探测缩放版。
+    """
+    return status is not None and int(status) in _CAPABILITY_REJECT_STATUSES
 
 
 def _header_value(headers: Mapping[str, str], name: str) -> str | None:
@@ -356,8 +385,24 @@ def sniff_image_format(data: bytes) -> str | None:
     return None
 
 
-def prepare_image_bytes(data: bytes, max_side: int, quality: int) -> tuple[bytes, bool] | None:
-    """压缩静态图；返回 (字节, 是否压缩)，失败返回 None。"""
+def prepare_image_bytes(
+    data: bytes,
+    max_side: int,
+    quality: int,
+    *,
+    target_bytes: int = 0,
+    use_webp: bool = False,
+) -> tuple[bytes, bool] | None:
+    """压缩静态图；返回 (字节, 是否压缩)，失败返回 None。
+
+    target_bytes > 0 时启用质量阶梯：首次按 quality 编码，仍超目标体积就按
+    COMPRESS_QUALITY_STEP 逐档降质量重编，最多 COMPRESS_MAX_ATTEMPTS 次，下限
+    COMPRESS_MIN_QUALITY。每档都是一次完整编码，故次数有上限——用 CPU 换体积，
+    只在明确设了目标体积时才启用。
+
+    use_webp 切换输出格式为 WebP（体积通常比同质量 JPEG 小 25%~60%，编码耗时
+    则高一个量级），仅对本地压缩路径生效；动图仍原样返回，不重编码。
+    """
     if PILImage is None:
         return None
     try:
@@ -380,14 +425,33 @@ def prepare_image_bytes(data: bytes, max_side: int, quality: int) -> tuple[bytes
                 image = background
             elif image.mode != "RGB":
                 image = image.convert("RGB")
-            output = io.BytesIO()
-            image.save(output, format="JPEG", quality=bounded_int(quality, 85, 1, 100), optimize=True)
-            compressed = output.getvalue()
+            compressed = _encode_image(image, quality, target_bytes=target_bytes, use_webp=use_webp)
     except Exception:
         return None
     if len(compressed) >= len(data) and original_format in NAPCAT_PARSEABLE_FORMATS:
         return data, False
     return compressed, True
+
+
+def _encode_image(image, quality: int, *, target_bytes: int, use_webp: bool) -> bytes:
+    """按质量阶梯编码；返回最后一次编码结果（体积最小的一档未必是最后一次）。"""
+    current = bounded_int(quality, 85, 1, 100)
+    target = max(0, int(target_bytes or 0))
+    best: bytes | None = None
+    for _attempt in range(COMPRESS_MAX_ATTEMPTS):
+        output = io.BytesIO()
+        if use_webp:
+            # method=4 在编码耗时与压缩率之间取平衡；method 越高越慢
+            image.save(output, format="WEBP", quality=current, method=4)
+        else:
+            image.save(output, format="JPEG", quality=current, optimize=True)
+        candidate = output.getvalue()
+        if best is None or len(candidate) < len(best):
+            best = candidate
+        if not target or len(candidate) <= target or current <= COMPRESS_MIN_QUALITY:
+            break
+        current = max(COMPRESS_MIN_QUALITY, current - COMPRESS_QUALITY_STEP)
+    return best if best is not None else b""
 
 
 def cosine_similarity(left: list[float], right: list[float]) -> float:

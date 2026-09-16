@@ -68,6 +68,9 @@ class MatchResult:
     width: int | None
     height: int | None
     created_at: str | None
+    # 入库时记录的原图字节数。回传计划用它来判断「图床缩放后是否真的更小」，
+    # 有了它就不必再探测原图体积——少一次往返、少一次图床处理。
+    file_size: int | None = None
 
 
 def _under_any(path: str, dirs: set) -> bool:
@@ -387,6 +390,7 @@ class ImageLibrary:
                     width=row["width"],
                     height=row["height"],
                     created_at=row["created_at"],
+                    file_size=row["file_size"],
                 )
             )
         return results
