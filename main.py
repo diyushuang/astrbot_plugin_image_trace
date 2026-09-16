@@ -635,29 +635,62 @@ class ImageTracePlugin(Star):
     ) -> tuple[bool | None, int | None]:
         """探测实现。探测用 PROBE_TIMEOUT 而非下载超时：探测只读响应头，
         此前共用 30s 会让一次卡住的探测把交付拖到分钟级。
+
+        缩放 URL（allow_range=False）的 HEAD 405 特殊处理：CloudFlare-ImgBed
+        的缩放 API 只接受 GET 不接受 HEAD，405 不等于「缩放不支持」。
+        遇到 405 时回退到 GET（不带 Range）再探一次，确认缩放功能是否真的不可用。
         """
         client = await self._get_http()
         timeout = aiohttp.ClientTimeout(total=PROBE_TIMEOUT)
+
+        # ---------- 第一步：HEAD 探测 ----------
+        head_status: int | None = None
         try:
             async with await client.request(
                 "HEAD", url, prepare=self._image_download_headers, timeout=timeout
             ) as resp:
+                head_status = resp.status
                 if not allow_range and is_scaling_capability_rejection(resp.status):
-                    # 图床对缩放请求的 API 级拒绝：这是部署能力问题，不是这张图
-                    # 的问题。记一次冷却，冷却期内不再为「已压缩」证据探测。
-                    self._note_scaled_unsupported(resp.status)
+                    # 405 先不记冷却：它可能只是 HEAD 方法不被允许，而不是
+                    # 缩放功能本身不可用。下面回退 GET 再确认。
+                    if resp.status != 405:
+                        self._note_scaled_unsupported(resp.status)
                 exists = classify_probe_status(resp.status)
                 if exists is False:
                     return False, None
                 length = content_length_from_headers(resp.headers)
                 if exists is True and length is not None:
                     return True, length
-                if not allow_range:
+                if not allow_range and resp.status != 405:
+                    # 非 405 的缩放探测失败（400/501/网络问题等）：不回退，
+                    # 400/501 已在上文记冷却，其余按「无法判定」处理。
                     return None, None
         except Exception as exc:
-            logger.debug(f"HEAD 探测失败，改用 Range 探测 {url}: {exc}")
+            logger.debug(f"HEAD 探测失败 {url}: {exc}")
             if not allow_range:
                 return None, None
+
+        # ---------- 缩放 URL 的 405 回退：GET（不带 Range） ----------
+        if not allow_range and head_status == 405:
+            try:
+                async with await client.request(
+                    "GET", url, prepare=self._image_download_headers, timeout=timeout
+                ) as resp:
+                    # 只读响应头，不读响应体
+                    if is_scaling_capability_rejection(resp.status):
+                        # GET 也被拒绝：这才是真的缩放能力缺失
+                        self._note_scaled_unsupported(resp.status)
+                        return None, None
+                    exists = classify_probe_status(resp.status)
+                    length = content_length_from_headers(resp.headers)
+                    if exists is True and length is not None:
+                        return True, length
+                    return None, None
+            except Exception as exc:
+                logger.debug(f"缩放 URL GET 回退探测失败 {url}: {exc}")
+                return None, None
+
+        # ---------- 普通 URL 的 Range GET 回退 ----------
         try:
             async with await client.request(
                 "GET", url, prepare=self._range_probe_headers, timeout=timeout

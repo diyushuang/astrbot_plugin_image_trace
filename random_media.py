@@ -147,25 +147,61 @@ def resolve_media_url(value, response_url) -> str | None:
 def parse_random_response(text, response_url, content_type_header) -> str | None:
     """把 /random 的响应解析为绝对媒体 URL，无法识别时返回 None。
 
-    兼容三种返回形态：直接返回媒体（Content-Type 为 image/* 或 video/*，此时
-    响应地址本身即媒体直链，可能经重定向）、JSON（顶层 url 或 data.url）、以及
-    纯文本 URL。三形态并存是图床不同配置/版本的产物，收在一处兼容最省事。
+    兼容多种返回形态：
+    - 直接返回媒体（Content-Type 为 image/* 或 video/*，此时响应地址本身即
+      媒体直链，可能经重定向）
+    - JSON 对象：顶层 url / src / publicUrl，或 data.url / data.src
+    - JSON 数组：取首个元素的 url / src / publicUrl（兼容部分版本的返回格式）
+    - 纯文本 URL
+
+    多形态并存是图床不同配置/版本的产物，收在一处兼容最省事。
     """
     if _is_media_content_type(content_type_header):
         return resolve_media_url(response_url, response_url)
     body = str(text or "").strip()
     if not body:
         return None
-    value: object = body
+
+    # 先尝试 JSON
     try:
         payload = json.loads(body)
     except json.JSONDecodeError:
-        payload = None
-    if isinstance(payload, dict):
-        value = payload.get("url")
-        if not value and isinstance(payload.get("data"), dict):
-            value = payload["data"].get("url")
-    return resolve_media_url(value, response_url)
+        # 不是 JSON：当纯文本 URL 处理
+        return resolve_media_url(body, response_url)
+
+    # 候选字段：按优先级尝试
+    candidate_fields = ("url", "src", "publicUrl")
+
+    def _extract(obj) -> str | None:
+        """从 dict 中按优先级提取媒体地址字段。"""
+        if not isinstance(obj, dict):
+            return None
+        for field in candidate_fields:
+            val = obj.get(field)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        return None
+
+    # 顶层对象
+    value = _extract(payload)
+    if value:
+        return resolve_media_url(value, response_url)
+
+    # data.url / data.src 等嵌套结构
+    data_val = payload.get("data")
+    if isinstance(data_val, dict):
+        value = _extract(data_val)
+        if value:
+            return resolve_media_url(value, response_url)
+
+    # 数组形式：取第一个元素
+    if isinstance(payload, list) and payload:
+        value = _extract(payload[0])
+        if value:
+            return resolve_media_url(value, response_url)
+
+    # 都没找到
+    return None
 
 
 def media_filename(url) -> str | None:
@@ -275,8 +311,9 @@ class RandomMediaClient:
                         last_error = f"图床返回 HTTP {resp.status}"
                         logger.warning(f"随机图请求失败: {last_error}")
                     else:
+                        body_text = await self._read_body(resp)
                         media_url = parse_random_response(
-                            await self._read_body(resp),
+                            body_text,
                             str(resp.url),
                             resp.headers.get("Content-Type", ""),
                         )
@@ -284,6 +321,9 @@ class RandomMediaClient:
                             return media_url
                         last_error = "图床未返回有效的媒体地址"
                         logger.warning(f"随机图请求失败: {last_error}")
+                        logger.debug(
+                            f"随机图响应解析失败，响应体（前300字）: {body_text[:300]!r}"
+                        )
             except RandomMediaError:
                 raise
             except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
