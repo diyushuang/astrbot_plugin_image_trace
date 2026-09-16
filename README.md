@@ -1,18 +1,63 @@
-# astrbot_plugin_image_trace 图片溯源
+<div align="center">
+<img src="./logo.png" width="128" alt="astrbot_plugin_image_trace logo">
 
-[![version](https://img.shields.io/badge/version-1.5.5-blue)](./CHANGELOG.md)
-[![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](./LICENSE)
-[![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4)](https://github.com/AstrBotDevs/AstrBot)
-[![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+# 图片溯源 · AstrBot Plugin
 
-群内发送 / 引用图片 + 触发指令 → 提取群内图片 → **双引擎**检索最相似的原图 → 相似度达标时把原图回传群聊：
+**群聊里随手转发的一张图，一键找回它的原图。**
 
-- **哈希引擎**（v1.1.0 起）：本地计算 pHash/dHash/aHash，与本地图库比对汉明距离；
-- **向量引擎**（v1.2.0 起）：调用多模态向量 AI 生成图片向量，在 Qdrant 向量库检索图床图片（图床侧每张上传经实时钩子自动入库，无需手动登记）。
+[![version](https://img.shields.io/badge/version-1.5.5-blue?style=flat-square)](./CHANGELOG.md)
+[![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4?style=flat-square)](https://github.com/AstrBotDevs/AstrBot)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat-square)](./LICENSE)
+[![Stars](https://img.shields.io/github/stars/diyushuang/astrbot_plugin_image_trace?style=flat-square&color=yellow)](https://github.com/diyushuang/astrbot_plugin_image_trace/stargazers)
+[![Issues](https://img.shields.io/github/issues/diyushuang/astrbot_plugin_image_trace?style=flat-square)](https://github.com/diyushuang/astrbot_plugin_image_trace/issues)
 
-消息链处理基于 AstrBot 事件与组件 API；QQ `aiocqhttp` 的回图链路额外使用 OneBot 原生接口直传 URL，避免适配器把图片转 base64。日常查询只依赖配置好的向量 AI / Qdrant（哈希引擎可全程本地）。
+<sub>感知哈希（pHash）+ Qdrant 多模态向量<b>双引擎</b> · OneBot 原生 URL 直传 · CloudFlare-ImgBed / R2 / OCI / 自建图床</sub>
 
-> 🤖 **AI 生成声明**：本项目代码由 AI 编程助手（ZCode，GLM 模型）辅助生成，经人工审查与多轮安全审计后发布；文档中的服务对接内容依据各服务官方文档整理。使用或二次分发前请自行审阅代码。
+_An AstrBot plugin that traces a reposted, compressed or cropped image back to its original, powered by perceptual hashing and Qdrant multimodal vector search._
+
+[快速开始](#快速开始) · [指令](#指令) · [配置项](#配置项) · [存储对接](#存储对接) · [工作原理](#工作原理) · [常见问题](#常见问题) · [更新日志](./CHANGELOG.md)
+
+</div>
+
+---
+
+> [!IMPORTANT]
+> **AI 生成声明**：本项目代码由 AI 编程助手（ZCode，GLM 模型）辅助生成，经人工审查与多轮安全审计后发布；文档中的服务对接内容依据各服务官方文档整理。使用或二次分发前请自行审阅代码。
+
+## 目录
+
+| | | |
+| --- | --- | --- |
+| [特性一览](#特性一览) | [快速开始](#快速开始) | [安装](#安装) |
+| [指令](#指令) | [配置项](#配置项) | [存储对接](#存储对接) |
+| [向量引擎](#向量引擎qdrant--多模态向量-ai) | [本地目录建库](#本地目录建库) | [工作原理](#工作原理) |
+| [项目结构与开发](#项目结构与开发) | [常见问题](#常见问题) | [数据与要求](#数据存储与环境要求) |
+
+## 特性一览
+
+| 能力 | 说明 |
+| --- | --- |
+| 🔍 **发图溯源** | 与图片同条消息（或引用图片）发送 `/溯源`，按当前引擎检索最相似的原图，相似度达标即回传 |
+| 🧠 **向量引擎**（可选） | 多模态向量 AI（OpenAI 兼容 `/v1/embeddings`）+ Qdrant 检索，对压缩、缩放、裁剪、水印比哈希更鲁棒 |
+| 🧮 **哈希引擎**（可离线） | pHash / dHash / aHash，纯 Pillow + numpy 实现，无需 GPU，数万张图毫秒级比对 |
+| ⚡ **URL 直传** | QQ `aiocqhttp` 经 OneBot 原生接口直传图床 URL（避免适配器转 base64），失败自动回退本地压缩 |
+| 🧩 **一次一条** | 向量命中的多张相似图合并为**一条**消息，图文交替排列，每张图的配文紧贴它自己 |
+| 🗂️ **多种存储** | 图床副本 / 通用 HTTP 图床（Lsky Pro、EasyImages、Chevereto…）/ CloudFlare-ImgBed / Cloudflare R2 / 甲骨文 OCI |
+| 🎲 **随机图** | `/随机图`、`/随机视频` 从图床随机接口取图回传，并可被 LLM 工具 `sendRandomMedia` 调用 |
+| 🖼️ **`/原图` 直取** | 从会话历史找回原图，或按文件名直接到图床取；均为原图 URL 直传，不下载、不本地中转 |
+| 🛡️ **安全加固** | 全部出网经 SSRF 防护（逐跳校验 + IP 钉扎 + 响应限长）；密钥字段在配置面板标记为 secret |
+
+> [!NOTE]
+> `/溯源` 日常查询只依赖配置好的向量 AI 与 Qdrant；哈希引擎可全程本地运行，不依赖任何外部服务。
+
+## 快速开始
+
+1. **登记原图** — 管理员在群里发送一张原图 + `/登记原图 长草颜文字素材`（或引用原图发送）；
+2. **触发溯源** — 之后有人发出该图的压缩/转发版本时，引用它发送 `/溯源`；
+3. **拿到原图** — 机器人回传相似度与登记时的原图，可直接发送 `/原图` 再取一次。
+
+批量建库：把所有原图放进一个目录（例如本地图床的存储目录），在配置 `scan_dirs` 填入该目录**绝对路径**，然后执行 `/溯源重扫`。
 
 ```mermaid
 flowchart LR
@@ -31,45 +76,26 @@ flowchart LR
     J --> L["/原图 [文件名]：剥离 width/height/fit/fallback，原图 URL 直取（不下载、不本地中转）"]
 ```
 
-## 目录
+## 安装
 
-- [功能特性](#功能特性)
-- [指令](#指令)
-- [安装](#安装)
-- [快速上手](#快速上手)
-- [向量引擎（Qdrant + 多模态向量 AI，v1.2.0）](#向量引擎qdrant--多模态向量-aiv120)
-- [图床对接（generic_http 模式）](#图床对接generic_http-模式)
-- [CloudFlare-ImgBed 对接（cloudflare_imgbed 模式）](#cloudflare-imgbed-对接cloudflare_imgbed-模式)
-- [储存桶设置（Cloudflare R2 / 甲骨文 OCI）](#储存桶设置cloudflare-r2--甲骨文-oci)
-- [本地目录建库说明](#本地目录建库说明)
-- [配置项](#配置项)
-- [工作原理](#工作原理)
-- [项目结构与开发](#项目结构与开发)
-- [常见问题](#常见问题)
-- [数据存储](#数据存储)
-- [环境要求](#环境要求)
-- [参与贡献](#参与贡献)
-- [许可证](#许可证)
-- [致谢](#致谢)
+**方式一 · 从仓库安装（推荐）**：WebUI →「插件管理」→ 从仓库安装，填入 `https://github.com/diyushuang/astrbot_plugin_image_trace`。
 
-## 功能特性
+**方式二 · 手动安装**：下载本仓库，将 `astrbot_plugin_image_trace` 目录放入 AstrBot 的 `data/plugins/` 下。
 
-- **发图溯源**：与图片同条消息发送 `/溯源`，或引用一张图片发送 `/溯源`，插件按当前引擎检索最相似的原图，达标即自动回传原图与相似度信息。
-- **向量引擎（可选，v1.2.0）**：配置 `vector_search` 后，用多模态向量 AI（OpenAI 兼容 `/v1/embeddings`，如 Qwen3-VL-Embedding 系）把查询图转成向量，到 Qdrant 向量库检索图床图片；图床侧每张上传由服务器钩子实时向量化入库。检索走 cosine 相似度，对压缩、缩放、裁剪、水印等改动比哈希更鲁棒，覆盖哈希难判定的构图近似变体。
-- **URL 直传与去重（v1.4.0）**：QQ `aiocqhttp` 平台优先用 OneBot 原生接口直传图床 URL；CloudFlare-ImgBed 直链默认附加官方 `width` / `height` / `fallback=original` 等比缩放参数，失败后回退本地压缩。向量命中先按 `src` / `image_url` 与候选向量相似度合并重复图，每组只回传一张代表图；去重详情只写入日志。
-- **向量命中先提示、合并回传（v1.5.2）**：先单独发送命中提示与“图片发送可能有延迟”，随后用**一条**消息回传全部相似图（此前是每张图各发一条）；该消息内**图文交替排列**，每张图的配文紧贴在自己那张图上方，一一对应、便于扫读。缩放或压缩图在配文里标注“已压缩，可发送 `/原图` 获取原图”。
-- **回传链路加固（v1.5.3）**：
-  - **压缩标识改为按证据判定**：只有实测（图床缩放版响应体更小）或本地压缩确实缩了字节，配文才写「已压缩」；图片不超过 `max_side` 时直接发原图 URL、不再追加缩放参数——此前按“URL 被改写”推断压缩，而图床在图片不大或图像处理不可用时会按 `fallback=original` 原样返回，于是出现「文字说已压缩、收到的却是原图」。新增 `image_delivery.verify_scaled` 开关（默认开启）。
-  - **一张图只会发一次**：OneBot 直发结果分「已送达 / 明确失败 / 结果未知」三态，只有协议端明确回报失败才允许换通道回退；超时属于「结果未知」（消息很可能已送达），一律不再重发，并按事件打去重标记，杜绝同一张图被发送两遍（原图体积大、协议端要自行下载图床 URL，最容易触发超时）。
-  - **HEIC/HEIF 支持**：新增 `pillow-heif` 依赖，iPhone 默认相册格式可直接溯源；未安装时给出明确提示，且不再对同一张图白跑一次注定失败的兜底下载。
-- **随机图与 /原图 直取（v1.5.0，v1.5.3 扩展直查）**：`/随机图 [目录]`、`/随机视频 [目录]` 直接从 CloudFlare-ImgBed 随机图接口取图回传（LLM 工具 `sendRandomMedia` 亦可调用），回传方式复用「图片回传设置」，无需另配发送策略；`/原图` 从会话级原图历史找回最近回传图片的原图，按图床读取 API 口径剥离 `width` / `height` / `fit` / `fallback` 后**原图 URL 直传、不下载不本地中转**；v1.5.3 起 `/原图 文件名` 还能**直接按文件名到图床取原图**（探测到文件存在才发），不再要求「本会话先回传过」。随机图接口出网同受 SSRF 校验，图床须公网可达。
-- **感知哈希特征**：pHash（DCT 感知哈希，默认 256bit）+ dHash + aHash，对压缩、缩放、轻微水印、EXIF 旋转均有较强鲁棒性；GIF 取首帧。纯 Pillow + numpy 实现，无需 scipy/GPU。
-- **可选 AI 复核**：开启 `ai_verify` 后，哈希命中的候选图会交给当前会话的视觉大模型二次确认"是否同一张图"，进一步降低误报；未配置视觉模型时自动跳过。
-- **泛用图床与储存桶接口**：登记原图的存储位置分两组配置，二选一即可——
-  - **图床设置**（`image_bed`）：`local`（原图副本保存到机器人数据目录，零配置）；`generic_http`（通过可配置的通用 HTTP 接口上传到自建图床，Lsky Pro、EasyImages、Chevereto 等）；`cloudflare_imgbed`（CloudFlare-ImgBed 自建图床，官方 REST API，`POST /upload` 上传，`/溯源删除` 可同步删除远端文件）；
-  - **储存桶设置**（`storage_bucket`，v1.3.0 独立成组）：`cloudflare_r2`（Cloudflare R2 对象存储，官方 S3 兼容 API）与 `oracle_oci`（甲骨文 OCI Object Storage，官方 Amazon S3 兼容 API）；**配置完整时优先于图床设置**；
-  - 远程存储上传失败或无法生成长期有效的公开直链时，自动回退本地副本，登记流程不中断。
-- **本地目录建库**：配置 `scan_dirs` 指向本地图库/图床存储目录，一键建立索引（支持增量重扫）。
+装好后：
+
+1. AstrBot 会自动读取 `requirements.txt` 安装依赖（Pillow、numpy、aiohttp、pillow-heif）；需手动安装时执行：
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. 在 WebUI「插件管理」中重载插件；
+3. 按上方[快速开始](#快速开始)完成首次登记与检索。
+
+> [!NOTE]
+> 本插件**尚未上架 AstrBot 插件市场**，请使用上面两种方式安装。
+
+> [!TIP]
+> 只想离线用本地图库？把 `search_engine` 设为 `hash`、把原图目录填进 `scan_dirs`，然后 `/溯源重扫` 即可，**无需任何外部服务**。
 
 ## 指令
 
@@ -77,149 +103,167 @@ flowchart LR
 | --- | --- | --- | --- |
 | `/溯源` | `/找原图` | 与图片同条消息发送，或引用图片发送，检索并回传原图 | 所有人 |
 | `/登记原图 [备注]` | `/原图登记` | 将图片作为原图登记入库 | 默认仅管理员（可配置） |
+| `/原图 [文件名]` | - | 取原图：带文件名时**直接到图床按名取**（无需先回传）；不带文件名取本会话最近回传的原图 | 所有人 |
+| `/随机图 [目录]` | `/随机图片` | 从图床随机图接口取一张随机图片并回传 | 所有人 |
+| `/随机视频 [目录]` | - | 从图床随机图接口取一段随机视频并回传 | 所有人 |
 | `/溯源状态` | - | 查看图库统计与配置摘要 | 所有人 |
 | `/溯源重扫 [force]` | - | 扫描 `scan_dirs` 目录建立/更新索引；`force` 重建全部 | 管理员 |
 | `/溯源删除 <编号>` | - | 按 ID 删除图库条目（同步清理插件侧写入的向量点、远端对象与本地副本） | 管理员 |
 | `/溯源帮助` | - | 使用帮助 | 所有人 |
-| `/随机图 [目录]` | `/随机图片` | 从图床随机图接口取一张随机图片并回传；可选指定目录 | 所有人 |
-| `/随机视频 [目录]` | - | 从图床随机图接口取一段随机视频并回传；可选指定目录 | 所有人 |
-| `/原图 [文件名]` | - | 取原图：带文件名时**直接到图床按名取**（无需先回传），不带文件名取本会话最近回传的原图；均为 URL 直传、不本地中转 | 所有人 |
 
-> 注意：`/原图` 与 `/登记原图` 是**两个不同的命令**——`/原图` 是**找回**原图（本文档「随机图与 /原图 直取」特性）；`/登记原图` 是把图片**登记入库**（默认仅管理员）。二者不冲突、名字相近，注意区分。
+> [!WARNING]
+> **`/原图` 与 `/登记原图` 是两个不同的命令**：前者是**找回**原图，后者是把图片**登记入库**（默认仅管理员）。名字相近，注意区分。
+
+<details>
+<summary><b>`/原图` 的查找顺序与直链口径（点击展开）</b></summary>
+
+1. 先查**本会话回传历史**（`/溯源`、`/随机图` 回传过的图片都会记入）；
+2. 历史未命中时，按文件名拼接 `{图床地址}/file/{文件名}` 并探测存在性后直传。图床地址取 `image_bed.cfi_base_url`（`cloudflare_imgbed` 模式）或 `random_media.base_url`；两者都未配置时会提示补配置；
+3. 文件名允许带上传目录，例如 `/原图 2026/09/abc.jpg`。
+
+直链口径：只按 CloudFlare-ImgBed 的 Read API 剥离 `width` / `height` / `fit` / `fallback`，其他图床的查询串原样保留（改动可能破坏签名或鉴权）。当前 `/原图` 只有「会话回传历史」与「图床直链」两条来源，不查 Qdrant 向量库与本地图库。
+
+</details>
+
+## 配置项
+
+> [!NOTE]
+> 面板标签里的【必填】= 启用对应功能后必须填写；【R2 必填】【OCI 必填】【generic_http 必填】【imgbed 必填】= 仅在所选模式下必填；【按需必填】= 取决于使用方式；【选填】= 可留空保持默认。
 >
-> `/原图 文件名` 的查找顺序：本会话回传历史 →（未命中时）按文件名拼 `{图床地址}/file/{文件名}` 并探测存在性后直传。图床地址取 `image_bed.cfi_base_url`（`cloudflare_imgbed` 模式）或 `random_media.base_url`；两者都未配置时会提示补配置。文件名允许带上传目录（如 `/原图 2026/09/abc.jpg`）。
+> **按需显隐**：储存桶组选择 `cloudflare_r2` / `oracle_oci` 后才展开对应字段，图床组选择 `generic_http` / `cloudflare_imgbed` 后才展开；进阶调优项收纳在顶层「显示进阶设置」与 `vector_search` 组内「显示进阶配置」两个开关后（默认关）。被隐藏字段的已填值保留，切换模式不丢失；旧版 WebUI 忽略显隐规则时所有字段照常显示。
 
-## 安装
+### 基础配置
 
-**获取插件**（二选一）：
-
-- **从仓库安装**：AstrBot WebUI →「插件管理」→ 从仓库安装，填入
-  `https://github.com/diyushuang/astrbot_plugin_image_trace`；
-- **手动安装**：下载本仓库，将 `astrbot_plugin_image_trace` 目录放入 AstrBot 的 `data/plugins/` 下。
-
-**装好之后**：
-
-1. 首次安装时 AstrBot 会自动读取 `requirements.txt` 安装依赖（Pillow、numpy、aiohttp、pillow-heif）；如需手动执行：
-   ```
-   pip install -r requirements.txt
-   ```
-2. 在 WebUI「插件管理」中重载插件，或在插件卡片菜单选择"重载插件"；
-3. 前往「快速上手」完成首次登记与检索。
-
-## 快速上手
-
-1. 管理员在群里发送一张原图 + `/登记原图 长草颜文字素材`（或引用原图发送）；
-2. 之后群里有人发出该图的压缩/转发版本时，引用它发送 `/溯源`；
-3. 机器人回传相似度与登记时的原图。
-
-也可以批量建库：把所有原图放进一个目录（例如本地图床 Lsky Pro 的存储目录），在插件配置 `scan_dirs` 中填入该目录的绝对路径，然后执行 `/溯源重扫`。
-
-## 向量引擎（Qdrant + 多模态向量 AI，v1.2.0）
-
-典型部署：图床（如 CloudFlare-ImgBed）与 Qdrant 跑在服务器上——**图床每上传一张图，由图床侧钩子/入库服务实时调向量 AI 算向量并写入 Qdrant**（入库侧属服务器侧部署，不属本插件范畴）；本插件只负责查询侧：收到 `/溯源` 图后调同一个向量 AI 向量化，再优先调用 Qdrant Query API `points/query` 检索（旧版服务端自动回退 `points/search`），相似度 ≥ 阈值即把 Qdrant payload 里的图床原图 URL 回传（payload 需含原图直链 `image_url` 字段）。
-
-**Qdrant 兼容矩阵（1.3.3 起）**
-
-| Qdrant 版本 | 检索接口 | 说明 |
+| 配置 | 默认 | 说明 |
 | --- | --- | --- |
-| 1.0 ~ 1.9 | `POST /points/search` | Query API 返回 404 时自动回退 |
-| 1.10 ~ 1.18 | `POST /points/query` | 优先使用官方 Query API |
-| 1.19+ | `POST /points/query` | `points/search` 已移除，必须使用 Query API |
+| `search_engine` | `auto` | `auto`=向量优先（未命中/不可用回退哈希）/ `vector` / `hash` |
+| `scan_dirs` | `[]` | 本地图库目录列表（绝对路径）；仅用 `/登记原图` 建库可留空 |
+| `image_bed.mode` | `local` | 图床模式：`local` / `generic_http` / `cloudflare_imgbed`；选定后组内展开对应字段 |
+| `image_delivery.mode` | `scaled-url` | 回图模式：[详见下文](#回图模式) |
+| `image_delivery.max_side` | `1920` | 缩放或本地压缩的最长边，范围 1~4096 |
+| `image_delivery.quality` | `85` | 本地 JPEG 压缩质量，范围 1~100 |
+| `image_delivery.verify_scaled` | `true` | 是否实测校验图床缩放真的生效（关闭后配文不再宣称「已压缩」） |
+| `similarity_threshold` | `0.85` | 相似度阈值（0~1，哈希引擎），相似度 = 1 − 汉明距离 ÷ 总位数 |
+| `ai_verify` | `false` | 是否用视觉大模型复核命中结果 |
+| `register_admin_only` | `true` | 仅管理员可登记原图 |
+| `random_media.base_url` | - | 【必填】随机图图床站点地址（公网可达 http/https） |
+| `random_media.*` | - | 随机图接口路径 / Token / 默认目录 / 超时 / 重试 / 附带文件名 / LLM 开关 |
+| `vector_search.*` | - | Qdrant 与向量 AI 配置，见[向量引擎](#向量引擎qdrant--多模态向量-ai) |
+| `storage_bucket.*` | - | 储存桶（R2 / OCI）配置，见[存储对接](#存储对接) |
 
-集合需使用默认未命名向量；若使用命名向量或多向量，需要在入库侧与查询侧统一调整请求结构。
+### 进阶配置（收纳在「显示进阶设置」后）
 
-**为什么插件也要填向量 AI？** Qdrant 向量库里只存"向量数字"，不存图片本身。`/溯源` 时插件收到的是一张查询图，必须先用与入库侧**相同**的多模态向量 AI 把这张查询图转成向量，才能去 Qdrant 检索——没有这一步，向量库无法比对图片。因此 `embed_base_url` / `embed_model` 必填（`embed_api_key` 在网关未开启鉴权时可留空），且必须与入库侧一致，否则两边向量不在同一空间、相似度无意义。
+| 配置 | 默认 | 说明 |
+| --- | --- | --- |
+| `hash_size` | `16` | pHash 精度：16→256bit（推荐）；可选 4/8/12/16/20/24/28/32（须为 4 的倍数）。**修改后需 `/溯源重扫 force`** |
+| `top_n` | `3` | 未命中时提示的最接近候选数，`0` 表示不提示 |
+| `max_images_per_query` | `3` | 单次溯源最大处理图片数 |
+| `max_download_mb` | `20` | 单张图片大小上限（MB） |
+| `image_delivery.target_kb` | `0` | 本地压缩的目标体积上限（KB，0=不限制）。非 0 时启用质量阶梯 |
+| `image_delivery.webp` | `false` | 本地压缩改用 WebP 输出（体积更小，编码更慢；噪声极多的图可能反而更大，此时自动回退原字节） |
+| `random_media.api_endpoint` | `/random` | 随机图接口相对路径（不能填完整 URL） |
+| `random_media.api_token` | - | 随机图接口 Token（`Authorization: Bearer`）；配置 Token 时图床地址必须为 `https` |
+| `random_media.default_dir` | - | 未指定目录时使用的默认目录（如 `风景/2026`），留空从根目录取图 |
+| `random_media.timeout` / `retry_count` | `10` / `3` | 单次请求超时（秒）/ 失败重试次数（指数退避，403 不重试） |
+| `random_media.show_file_info` / `enable_llm` | `true` / `true` | 回传时是否附带文件名 / 是否允许 LLM 工具调用 |
+| `advanced_settings` | `false` | 面板收纳开关 |
+| `vector_search.advanced` | `false` | 面板收纳开关：开启后才显示向量引擎的进阶项 |
 
-### 关键配置（`vector_search` 节）
+<a id="回图模式"></a>
 
-| 配置 | 说明 |
-| --- | --- |
-| `qdrant_url` | Qdrant REST 地址，如 `http://<你的服务器IP>:6333`。**须公网可达**（插件出网带 SSRF 校验，不访问内网地址） |
-| `qdrant_api_key` | Qdrant API Key（`QDRANT__SERVICE__API_KEY` 对应的值） |
-| `collection_name` | 集合名，默认 `imgbed_images`，需与入库侧一致 |
-| `embed_base_url` | 多模态向量 AI 的 base，如 `https://<你的网关域名>/v1`（实际请求 `POST {base}/embeddings`） |
-| `embed_api_key` | 该向量 AI 的 API Key；网关未开启鉴权时**可留空**（留空则不带鉴权头） |
-| `embed_model` | **接受图片输入**的 embedding 模型 ID（文本 embedding 模型无法对图片向量化），如 `Qwen/Qwen3-VL-Embedding-8B` |
-| `embed_image_input` | 图片输入序列化，**默认 `nemotron-vl`**（裸 dataURL + input_type，NVIDIA llama-nemotron-embed-vl 系只接受这一种）；备选 `qwen-vl`（content 数组，仅 Qwen3-VL-Embedding 系需要）/ `dataurl`（裸 dataURL）/ `jina-image`（base64 对象）。报 500 `'dict' object has no attribute 'strip'`（格式发给了只收字符串的模型）或 400 时切换 |
-| `embed_input_type` | 仅 nemotron-vl 模式相关：非对称模型的 input_type，图片只能走 passage 侧（插件固定使用 passage），需与图床入库侧核对一致 |
-| `similarity_threshold` | cosine 相似度阈值，默认 `0.80`（同图变体通常 0.85+，建议用成对图片实测校准） |
-| `duplicate_vector_threshold` | 重复图合并阈值，默认 `0.995`；候选向量 cosine 相似度达到该值时视为同一张图，只回传代表图 |
-| `top_k` | 每次取回候选数，默认 `5` |
-| `request_timeout` | 请求超时（秒），默认 `30` |
-| `vector_index_on_register` | `/登记原图` 后是否插件侧同步写向量库，默认开；`cloudflare_imgbed` 等图床自带服务器侧钩子时自动跳过，避免重复计算 |
+<details>
+<summary><b>回图模式（<code>image_delivery.mode</code>）与压缩策略详解（点击展开）</b></summary>
 
-### 一致性约束（重要）
+| 模式 | 行为 | 适用场景 |
+| --- | --- | --- |
+| `scaled-url`（默认） | CloudFlare-ImgBed 标准 `/file/` 直链追加官方 `width` / `height` / `fallback=original` 等比缩放参数后直传；图片不超过 `max_side` 时不追加参数 | 想省流量、又希望出问题时能回退到原图 |
+| `original-url` | 直接直传原图 URL，不做任何处理 | 图床带宽充裕，追求最短链路 |
+| `local-compress` | 插件下载后本地压缩再发（EXIF 转正、等比缩放、透明铺白底、JPEG 重编码、动图保持原样） | 图床直链协议端取不到，或必须转成 JPEG 才能被解析 |
 
-- `embed_model` / `embed_base_url` / `embed_image_input`（nemotron-vl 模式还包括 `embed_input_type`）的值**必须与图床入库侧完全一致**，否则查询向量与库中向量不在同一向量空间，相似度无意义；
-- 中途切换向量模型 = 需要把库中所有图片**全量重嵌入**一次（服务器侧执行强制回填），否则旧向量与新模型不兼容；
-- 引擎切换：`search_engine = auto`（默认，向量优先、未命中/不可用自动回退哈希）、`vector`（只用向量）、`hash`（只用哈希，保持 v1.1.0 行为）。
+**压缩标识只按证据写**：只有实测（图床缩放版字节更小）或本地压缩确实缩了字节，配文才写「已压缩」。图片不超过 `max_side` 时直接发原图 URL、不追加缩放参数——图床在图片不大或图像处理不可用时会按 `fallback=original` 原样返回，凭「URL 被改写」推断压缩会出现「文字说已压缩、收到的却是原图」。
 
-### 快速验证
+**回传链路的效率设计**：
 
-1. 配置完成后在群里发图 + `/溯源`：命中时回复相似度与图床原图 URL；
-2. `/溯源状态` 会显示当前引擎、向量库点数与 Embed 模型，便于确认连通；
-3. 若提示向量引擎未启用/出错，先检查 `vector_search` 配置项是否齐全、`/溯源状态` 中向量库计数是否为可用数字。
+- **单次发送保证**：OneBot 直发结果分「已送达 / 明确失败 / 结果未知」三态，只有明确失败才允许换通道回退；超时属「结果未知」（消息很可能已送达），一律不重发，并按事件打去重标记，杜绝同一张图发两遍。
+- **探测开销最小化**：所有探测并发执行（上限 4）且受 8 秒总预算约束，超预算按「说不准」处理；探测用独立的 5 秒超时；命中条目自带原图体积（向量 `payload.size_bytes` / 图库 `file_size`）时只探缩放版一次；图床明确拒绝缩放请求（405 / 501 / 400）后 600 秒内不再探测。
+- **回传计划只算一次**：URL 计划（含探测）在直发前算好，失败回退路径直接复用。
+- **本地压缩**：单次解码（不重复解码校验）、多图并发压缩（上限 3）、回退下载优先走内存（超过 8 MB 才落盘）。
+- **提示与图片并行**：OneBot 场景下命中提示与图片消息同时下发，首图不必等提示的整轮往返。
 
-## 图床对接（generic_http 模式）
+</details>
 
-插件通过"通用 HTTP 上传接口"对接图床，只需 4 个关键配置：
+## 存储对接
+
+登记原图的存储位置由两组配置决定，**二选一即可**；储存桶配置完整时优先。
+
+### 存储模式总览
+
+| 模式 | 说明 | 公开直链 |
+| --- | --- | --- |
+| `image_bed.mode = local`（默认） | 原图副本保存到机器人数据目录，零配置 | 用本地文件路径发送，要求协议端与 AstrBot 同一文件系统 |
+| `image_bed.mode = generic_http` | 通用 HTTP 接口上传到自建图床（Lsky Pro、EasyImages、Chevereto 等） | 图床提供 |
+| `image_bed.mode = cloudflare_imgbed` | CloudFlare-ImgBed 官方 REST API，`/溯源删除` 可同步删远端 | 图床提供 |
+| `storage_bucket.mode = cloudflare_r2` | Cloudflare R2（S3 兼容 API） | 需开启公开访问（`r2.dev` 或自定义域名） |
+| `storage_bucket.mode = oracle_oci` | 甲骨文 OCI Object Storage（S3 兼容 API） | 公共桶，或配置预认证请求（PAR） |
+
+> [!TIP]
+> 远程存储上传失败、或无法生成长期有效的公开直链时，插件会**自动回退为本地副本**，登记流程不会中断。
+
+<details>
+<summary><b>通用 HTTP 图床（<code>generic_http</code>）：4 个关键配置 + 常见图床参考值</b></summary>
 
 | 配置 | 说明 | Lsky Pro 示例 |
 | --- | --- | --- |
 | `api_url` | 上传接口地址 | `https://bed.example.com/api/v1/upload` |
-| `token` + `auth_header` + `auth_prefix` | 鉴权：发送 `auth_header: auth_prefix + token` 请求头 | `Authorization: Bearer 1|xxxxxx` |
+| `token` + `auth_header` + `auth_prefix` | 鉴权：发送 `auth_header: auth_prefix + token` | `Authorization: Bearer 1\|xxxxxx` |
 | `file_field` | multipart 文件字段名 | `file` |
-| `url_path` | 从响应 JSON 中按点号路径提取图片直链 | `data.url` |
+| `url_path` | 从响应 JSON 按点号路径提取直链 | `data.url` |
 
 常见图床参考值：
 
 - **Lsky Pro（兰空图床）**：`api_url=https://域名/api/v1/upload`，`auth_header=Authorization`，`auth_prefix=Bearer `（保留尾部空格），`file_field=file`，`url_path=data.url`。Token 在图床个人中心 → API 中生成。
-- **EasyImages（简单图床）**：`api_url=https://域名/index.php`（开启 API 上传），常见 `auth_header=token`，`auth_prefix` 留空，`file_field=file`，`url_path=url`。
+- **EasyImages（简单图床）**：`api_url=https://域名/index.php`（需开启 API 上传），常见 `auth_header=token`，`auth_prefix` 留空，`file_field=file`，`url_path=url`。
 - **Chevereto**：`api_url=https://域名/api/1/upload`（需带 `key` 参数，可放入 `extra_fields`），`file_field=source`，`url_path=image.url`。
 
-注意：
+注意：图床地址必须是**公网可访问**的 http/https（插件拒绝指向内网/环回地址的请求）；回传用直链需协议端 / QQ 服务器可访问，私有读图床请改用 `local` 模式。
 
-- 图床地址必须是**公网可访问的 http/https 地址**，插件会拒绝指向内网/环回地址的请求（SSRF 防护）；
-- 回传原图时若使用图床直链，该直链需要协议端 / QQ 服务器可访问（即公网可读）；若图床是私有读，请使用 `local` 模式；
-- 上传失败会自动回退为本地副本保存，登记流程不会中断。
+</details>
 
-## CloudFlare-ImgBed 对接（cloudflare_imgbed 模式）
+<details>
+<summary><b>CloudFlare-ImgBed（<code>cloudflare_imgbed</code>）：配置项与对接细节</b></summary>
 
-按 [CloudFlare-ImgBed 官方文档](https://github.com/MarSeventh/CloudFlare-ImgBed)（REST API 详见官方文档站 `/api/` 页面）实现：
+按 [CloudFlare-ImgBed 官方文档](https://github.com/MarSeventh/CloudFlare-ImgBed)实现：
 
 | 配置 | 说明 |
 | --- | --- |
-| `cfi_base_url` | 你部署的站点首页地址（必填），如 `https://img.example.com` |
-| `cfi_token` | API Token：站点后台「系统设置 → 安全设置 → API Token 管理」创建；上传需 `upload` 权限，`/溯源删除` 同步删远端文件需 `delete` 权限 |
+| `cfi_base_url` | 【必填】站点首页地址，如 `https://img.example.com` |
+| `cfi_token` | API Token：后台「系统设置 → 安全设置 → API Token 管理」创建；上传需 `upload` 权限，`/溯源删除` 同步删远端需 `delete` 权限 |
 | `cfi_auth_code` | 上传鉴权码（`authCode` 查询参数），站点启用登录校验时使用，与 Token 二选一或同时配置 |
-| `cfi_upload_channel` | 存储渠道（`uploadChannel` 查询参数）：`telegram`、`cfr2`、`s3`、`discord`、`huggingface`、`webdav`，留空用站点默认 |
-| `cfi_channel_name` | 具体渠道名（`channelName` 查询参数），多渠道场景使用 |
-| `cfi_upload_folder` | 上传目录（`uploadFolder` 查询参数，相对路径，如 `img/test`） |
+| `cfi_upload_channel` | 存储渠道（`uploadChannel`）：`telegram`、`cfr2`、`s3`、`discord`、`huggingface`、`webdav`，留空用站点默认 |
+| `cfi_channel_name` | 具体渠道名（`channelName`），多渠道场景使用 |
+| `cfi_upload_folder` | 上传目录（`uploadFolder`，相对路径，如 `img/test`） |
 
-对接细节（严格按官方文档）：
+对接细节：
 
-- **上传**：`POST {站点}/upload`，multipart 表单文件字段名 `file`；鉴权用 `Authorization: Bearer <Token>` 请求头（官方推荐格式）或 `authCode` 查询参数；两者都未配置且站点未开启登录校验时直接匿名上传；
-- **响应**：成功返回数组 `[{"src": "/file/xxx.jpg", "publicUrl": "..."}]`。插件落库直链 = `cfi_base_url + src`（不使用 `publicUrl`，保证链接与站点同源，`/溯源删除` 才能反解文件路径）；
-- **删除同步**：`/溯源删除` 时按 `POST /api/manage/delete/batch`（body `{"fileIds": [... ]}`）best-effort 删除远端文件——仅当 Token 已配置且直链前缀与当前站点匹配时才发起，失败不影响本地条目删除；
-- 上传失败自动回退本地副本。
+- **上传**：`POST {站点}/upload`，multipart 字段名 `file`；鉴权用 `Authorization: Bearer <Token>` 或 `authCode` 查询参数；都未配置且站点未开启登录校验时直接匿名上传。
+- **响应**：成功返回 `[{"src": "/file/xxx.jpg", "publicUrl": "..."}]`。插件落库直链 = `cfi_base_url + src`（不使用 `publicUrl`，保证与站点同源，`/溯源删除` 才能反解文件路径）。
+- **删除同步**：`/溯源删除` 按 `POST /api/manage/delete/batch`（body `{"fileIds": [...]}`）best-effort 删除远端文件——仅当 Token 已配置且直链前缀与当前站点匹配时才发起，失败不影响本地条目删除。
 
-## 储存桶设置（Cloudflare R2 / 甲骨文 OCI）
+> [!NOTE]
+> **Read API 已知约束**（影响 `/原图` 与缩放直传）：带缩放参数的请求**只接受 GET**（其他方法 405）；`Range` 不能与缩放参数同时使用（400）；图片处理默认关闭，需在后台「系统设置 → 安全设置 → 访问管理」开启，未开启时带参数的请求返回 403；`fallback=original` 会在格式不支持/超限/处理失败时回退原图。
 
-v1.3.0 起，两种对象存储从图床模式中独立为单独的**储存桶设置（`storage_bucket`）**配置组，与图床设置分开填写：
+</details>
 
-- `storage_bucket.mode = none`（默认）：不使用储存桶，登记原图走图床设置；
-- 储存桶**配置完整**时优先于图床设置（完整 = 该模式必填项齐全，且公开直链条件满足：R2 需 `r2_public_base_url`，OCI 需公共桶或 `oci_public_base_url` 二选一）；
-- 配置不完整时自动改用图床设置（日志会提示缺哪些项），两种远程存储上传失败时仍会回退本地副本。
+<details>
+<summary><b>储存桶：Cloudflare R2 与甲骨文 OCI 的配置步骤</b></summary>
 
-> **从 v1.2.x 升级**：原先填在 `image_bed.mode = cloudflare_r2 / oracle_oci` 及对应 `r2_*` / `oci_*` 字段的老配置，会在插件启动时**自动迁移**到 `storage_bucket` 组，无需手动操作（日志有迁移记录）。
+两种对象存储按各家官方文档的 **Amazon S3 兼容 API** 实现（AWS Signature Version 4 签名，纯标准库，无新增依赖）。储存桶配置完整时**优先于图床设置**（R2 需 `r2_public_base_url`，OCI 需公共桶或 `oci_public_base_url`）；配置不完整时自动改用图床设置。
 
-两种储存桶均按各家官方文档的 **Amazon S3 兼容 API** 实现（AWS Signature Version 4 签名，纯标准库实现，无新增依赖）：
+**Cloudflare R2（`storage_bucket.mode = cloudflare_r2`）**
 
-### Cloudflare R2（`storage_bucket.mode = cloudflare_r2`）
-
-1. Cloudflare 控制台 → R2，创建存储桶，并记下概览页的**账户 ID**；
-2. 「管理 R2 API 令牌」→ 创建 API 令牌（权限需含**对象读写**），获得 `r2_access_key_id` 与 `r2_secret_access_key`（仅显示一次）；
-3. 在存储桶「设置 → 公开访问」中开启 **r2.dev 子域**或绑定**自定义域名**，作为 `r2_public_base_url`（如 `https://pub-xxxx.r2.dev`）。
+1. Cloudflare 控制台 → R2，创建存储桶，记下概览页的**账户 ID**；
+2. 「管理 R2 API 令牌」→ 创建令牌（权限需含**对象读写**），获得 `r2_access_key_id` 与 `r2_secret_access_key`（仅显示一次）；
+3. 存储桶「设置 → 公开访问」中开启 **r2.dev 子域**或绑定**自定义域名**，作为 `r2_public_base_url`。
 
 | 配置 | 填写 |
 | --- | --- |
@@ -229,93 +273,101 @@ v1.3.0 起，两种对象存储从图床模式中独立为单独的**储存桶�
 | `r2_public_base_url` | r2.dev 子域或自定义域名（`https://` 开头，不带尾斜杠） |
 | `r2_endpoint` | 可选；欧盟司法区桶填 `https://<账户ID>.eu.r2.cloudflarestorage.com` |
 
-按官方文档：endpoint 为 `https://<账户ID>.r2.cloudflarestorage.com`（欧盟等司法区有对应子域），签名 region 固定为 `auto`，单次 PutObject 最大 5 GiB。
+按官方文档：endpoint 为 `https://<账户ID>.r2.cloudflarestorage.com`，签名 region 固定 `auto`，单次 PutObject 最大 5 GiB。
 
-### 甲骨文 OCI Object Storage（`storage_bucket.mode = oracle_oci`）
+**甲骨文 OCI（`storage_bucket.mode = oracle_oci`）**
 
-1. OCI 控制台确认存储桶所在**区域**（如 `ap-osaka-1`）与 **Object Storage 命名空间**（Namespace 字符串）；
-2. 「用户设置 → Customer Secret Keys（客户密钥）」→ 生成密钥，获得 `oci_access_key_id`（Access Key）与 `oci_secret_access_key`（Secret Key，仅显示一次）；
-3. 公开直链二选一：
-   - 将存储桶可见性设为 **Public**（公共桶），开启 `oci_public_bucket`，直链使用官方对象 URL 格式 `https://objectstorage.<区域>.oraclecloud.com/n/<命名空间>/b/<桶>/o/<对象名>`；
-   - 或在控制台为存储桶创建一条**带对象名前缀的预认证请求（PAR，AnyObjectRead）**，把其 URL（以 `/o/` 结尾）填入 `oci_public_base_url`，直链 = 该地址 + 对象名。
+1. OCI 控制台确认存储桶**区域**（如 `ap-osaka-1`）与 **Object Storage 命名空间**；
+2. 「用户设置 → Customer Secret Keys」→ 生成密钥，获得 `oci_access_key_id` 与 `oci_secret_access_key`（仅显示一次）；
+3. 公开直链二选一：把桶设为 **Public**（开启 `oci_public_bucket`），或在控制台创建**带对象名前缀的预认证请求（PAR，AnyObjectRead）**并把其 URL（以 `/o/` 结尾）填入 `oci_public_base_url`。
 
 按官方文档：S3 兼容 endpoint 为 `https://<命名空间>.compat.objectstorage.<区域>.oraclecloud.com`（仅 path-style），签名 region 使用 OCI 区域标识。
 
-> 两种对象存储的删除同步：`/溯源删除` 删除图库条目时会一并调用 DeleteObject 删除远端对象（仅删除与当前配置桶匹配的直链，失败不影响删除流程）。
-> 直链需 QQ 服务器可访问（公网可读）才能回图；R2 未开启公开访问、OCI 桶为私有且未配置 PAR 时，插件自动回退本地副本并在登记回复中说明原因。
+`/溯源删除` 会一并调用 DeleteObject 删除远端对象（仅删除与当前配置桶匹配的直链）。直链需 QQ 服务器可访问才能回图；R2 未开公开访问、OCI 桶为私有且未配置 PAR 时，插件自动回退本地副本并在登记回复中说明原因。
 
-## 本地目录建库说明
+</details>
 
-- `scan_dirs` 必须是 **机器人进程可访问的绝对路径**；若 AstrBot 运行在 Docker 中，需将目录挂载进容器；
-- 回传扫描目录中的原图使用本地文件路径发送（`Image.fromFileSystem`），要求**协议端（如 NapCat）与 AstrBot 在同一文件系统**；如果协议端独立部署，建议登记原图时走 `generic_http` 图床模式（回传走直链），或将目录共享挂载；
-- `/溯源重扫` 为增量扫描（跳过已索引文件），`/溯源重扫 force` 重建全部扫描索引；文件被移出目录后，对应条目会在下次重扫时自动清理。
+> **从 v1.2.x 升级**：原先填在 `image_bed.mode = cloudflare_r2 / oracle_oci` 及对应 `r2_*` / `oci_*` 字段的老配置，会在插件启动时**自动迁移**到 `storage_bucket` 组（日志有迁移记录），无需手动操作。
 
-## 配置项
+## 向量引擎（Qdrant + 多模态向量 AI）
 
-**面板标签与显隐说明**（v1.3.2 起）：
+典型部署：图床（如 CloudFlare-ImgBed）与 Qdrant 跑在服务器上——**图床每上传一张图，由图床侧钩子/入库服务实时调向量 AI 算向量并写入 Qdrant**（入库侧属服务器侧部署，不属本插件范畴）。本插件只负责**查询侧**：收到 `/溯源` 图后调同一个向量 AI 向量化，再检索 Qdrant，相似度达标即把 payload 里的原图 URL 回传（payload 需含 `image_url` 字段）。
 
-- 每个配置项标签带必填标注：【必填】=启用对应功能后必须填写；【R2 必填】【OCI 必填】【generic_http 必填】【imgbed 必填】=仅在所选模式下必填；【OCI 必填·二选一】=两项至少填一个；【按需必填】=取决于使用方式（见提示）；【选填】=可留空保持默认。
-- **按需显隐**：储存桶组选择 `cloudflare_r2` / `oracle_oci` 后才展开对应字段，图床组选择 `generic_http` / `cloudflare_imgbed` 后才展开对应字段；进阶调优项收纳在顶层「显示进阶设置」与 `vector_search` 组内「显示进阶配置」两个开关后（默认关），开启后才显示。
-- 被隐藏字段的已填值保留，切换模式不丢失；旧版 WebUI 忽略显隐规则时所有字段照常显示，不影响使用。
+> [!IMPORTANT]
+> **为什么插件也要填向量 AI？** Qdrant 里只存「向量数字」，不存图片。`/溯源` 时插件收到的是一张查询图，必须先用与入库侧**相同**的多模态向量 AI 把它转成向量才能比对——`embed_base_url` / `embed_model` 必填（网关无鉴权时 `embed_api_key` 可留空），且必须与入库侧一致，否则两边向量不在同一空间、相似度无意义。
 
-| 配置 | 默认 | 说明 |
+<details>
+<summary><b>关键配置（<code>vector_search</code> 组）</b></summary>
+
+| 配置 | 说明 |
+| --- | --- |
+| `qdrant_url` | Qdrant REST 地址，如 `http://<你的服务器IP>:6333`。**须公网可达**（插件出网带 SSRF 校验，不访问内网地址） |
+| `qdrant_api_key` | Qdrant API Key（`QDRANT__SERVICE__API_KEY` 对应的值） |
+| `collection_name` | 集合名，默认 `imgbed_images`，需与入库侧一致 |
+| `embed_base_url` | 多模态向量 AI 的 base，如 `https://<网关域名>/v1`（实际请求 `POST {base}/embeddings`） |
+| `embed_api_key` | 该向量 AI 的 API Key；网关未开启鉴权时**可留空**（留空则不带鉴权头） |
+| `embed_model` | **接受图片输入**的 embedding 模型 ID（文本 embedding 模型无法对图片向量化），如 `Qwen/Qwen3-VL-Embedding-8B` |
+| `embed_image_input` | 图片输入序列化，**默认 `nemotron-vl`**（裸 dataURL + input_type，NVIDIA llama-nemotron-embed-vl 系只接受这一种）；备选 `qwen-vl`（content 数组，Qwen3-VL-Embedding 系）/ `dataurl` / `jina-image`。报 500 `'dict' object has no attribute 'strip'`（格式发给了只收字符串的模型）或 400 时切换 |
+| `embed_input_type` | 仅 nemotron-vl 相关：非对称模型的 input_type，图片只能走 passage 侧（插件固定 passage），需与入库侧一致 |
+| `similarity_threshold` | cosine 相似度阈值，默认 `0.80`（建议用成对图片实测校准） |
+| `duplicate_vector_threshold` | 重复图合并阈值，默认 `0.995`；达到该值视为同一张图，只回传代表图 |
+| `top_k` | 每次取回候选数，默认 `5` |
+| `request_timeout` | 请求超时（秒），默认 `30` |
+| `vector_index_on_register` | `/登记原图` 后是否插件侧同步写向量库，默认开；图床自带服务器侧钩子时自动跳过，避免重复计算 |
+
+**一致性约束**：`embed_model` / `embed_base_url` / `embed_image_input`（nemotron-vl 模式还包括 `embed_input_type`）**必须与入库侧完全一致**；中途切换向量模型需把库中所有图片**全量重嵌入**一次，否则旧向量与新模型不兼容。
+
+**Qdrant 兼容矩阵**：
+
+| Qdrant 版本 | 检索接口 | 说明 |
 | --- | --- | --- |
-| `search_engine` | `auto` | `auto`=向量优先（未命中/不可用回退哈希）/ `vector` / `hash` |
-| `scan_dirs` | `[]` | 本地图库目录列表（绝对路径）；检索已有本地图库时必填，仅用 /登记原图 建库可留空 |
-| `vector_search.*` | - | Qdrant 地址/Key/集合、向量 AI 地址/Key/模型/输入格式、向量阈值/top_k/超时/登记同步开关（详见上方章节） |
-| `vector_search.advanced` | `false` | 面板收纳开关：开启后才显示 `embed_image_input` / `embed_input_type` / `top_k` / `request_timeout` |
-| `image_delivery.mode` | `scaled-url` | 回图模式：`scaled-url`（ImgBed 等比缩放 URL 直传，默认）/ `original-url`（原图 URL 直传）/ `local-compress`（本地压缩） |
-| `image_delivery.max_side` | `1920` | 缩放或本地压缩的最长边，范围 1~4096 |
-| `image_delivery.quality` | `85` | 本地 JPEG 压缩质量，范围 1~100 |
-| `image_delivery.verify_scaled` | `true` | 是否实测校验图床缩放是否真的生效：开启时缩放 URL 直传前用 HEAD 比对缩放版与原图的响应体长度，只有确实更小才在配文标注「已压缩」；命中条目已记录原图体积（向量 `payload.size_bytes` / 图库 `file_size`）时只探测缩放版一次；所有探测并发执行且受 8 秒总预算约束，图床明确拒绝缩放请求（405/501/400）后 600 秒内不再探测；图片不超过 `max_side` 时跳过缩放参数。关闭后不再宣称压缩 |
-| `image_delivery.target_kb` | `0` | 本地压缩的目标体积上限（KB，0=不限制，进阶项）。非 0 时启用质量阶梯：先按 `quality` 编码，仍超上限就逐档降 10 质量（最低 45）重编，最多 3 次 |
-| `image_delivery.webp` | `false` | 本地压缩是否改用 WebP 输出（进阶项）。平滑内容通常比同质量 JPEG 小 25%~60%，但编码耗时高一个量级（实测 1920 长边约 0.2~0.5 秒/张），噪声极多的图反而可能更大（此时自动回退原字节）；动图仍原样发送 |
-| `random_media.base_url` | - | 【必填】随机图图床站点地址（公网可达的 http/https）；`/随机图`、`/随机视频`、`/原图` 与 LLM 工具 `sendRandomMedia` 均依赖本组 |
-| `random_media.api_endpoint` | `/random` | 随机图接口相对路径（不能填完整 URL） |
-| `random_media.api_token` | - | 随机图接口 Token（`Authorization: Bearer`）；配置 Token 时图床地址必须为 `https`，否则插件拒绝请求 |
-| `random_media.default_dir` | - | 未在命令中指定目录时使用的默认目录（如 `风景/2026`），留空则从图床根目录取图 |
-| `random_media.timeout` | `10` | 随机图接口单次请求超时（秒） |
-| `random_media.retry_count` | `3` | 失败重试次数（指数退避，范围 0~10）；403 不重试 |
-| `random_media.show_file_info` | `true` | 回传随机媒体时是否附带文件名 |
-| `random_media.enable_llm` | `true` | 是否允许 LLM 工具 `sendRandomMedia` 调用随机图 |
-| `similarity_threshold` | `0.85` | 相似度阈值（0~1，哈希引擎），相似度 = 1 - 汉明距离/总位数 |
-| `storage_bucket.mode` | `none` | 储存桶模式：`none`（不使用）/ `cloudflare_r2` / `oracle_oci`；**配置完整时优先于图床设置**；选定模式后组内展开对应字段 |
-| `storage_bucket.r2_*` | - | cloudflare_r2：账户 ID、API 令牌凭据、存储桶、endpoint、公开访问域名 |
-| `storage_bucket.oci_*` | - | oracle_oci：命名空间、区域、Customer Secret Key 凭据、存储桶、公开桶开关/自定义公开地址 |
-| `image_bed.mode` | `local` | 图床模式：`local` / `generic_http` / `cloudflare_imgbed`；选定模式后组内展开对应字段 |
-| `image_bed.api_url` 等 | - | generic_http 模式的上传接口、鉴权、字段名、响应直链 JSON 路径等 |
-| `image_bed.cfi_*` | - | cloudflare_imgbed 模式：站点地址、API Token、鉴权码、存储渠道、渠道名、上传目录 |
-| `ai_verify` | `false` | 是否用视觉大模型复核命中结果 |
-| `register_admin_only` | `true` | 仅管理员可登记原图 |
-| `advanced_settings` | `false` | 面板收纳开关：开启后才显示下方四个进阶项 |
-| `hash_size` | `16` | pHash 精度：16→256bit（推荐）；可选 4/8/12/16/20/24/28/32，均为 4 的倍数；修改后需 `/溯源重扫 force` |
-| `top_n` | `3` | 未命中时提示的最接近候选数，0 表示不提示 |
-| `max_images_per_query` | `3` | 单次溯源最大处理图片数 |
-| `max_download_mb` | `20` | 单张图片大小上限（MB） |
+| 1.0 ~ 1.9 | `POST /points/search` | Query API 返回 404 时自动回退 |
+| 1.10 ~ 1.18 | `POST /points/query` | 优先使用官方 Query API |
+| 1.19+ | `POST /points/query` | `points/search` 已移除，必须使用 Query API |
+
+集合需使用默认未命名向量；若使用命名向量或多向量，需在入库侧与查询侧统一调整请求结构。
+
+**快速验证**：配置完成后在群里发图 + `/溯源`，命中时回复相似度与图床原图 URL；`/溯源状态` 会显示当前引擎、向量库点数与 Embed 模型；若提示向量引擎未启用/出错，先检查 `vector_search` 配置是否齐全。
+
+</details>
+
+## 本地目录建库
+
+- `scan_dirs` 必须是**机器人进程可访问的绝对路径**；AstrBot 运行在 Docker 中时需把目录挂载进容器。
+- 回传扫描目录中的原图使用本地文件路径发送（`Image.fromFileSystem`），要求**协议端（如 NapCat）与 AstrBot 在同一文件系统**；协议端独立部署时，建议登记原图走 `generic_http` 图床模式（回传走直链），或共享挂载目录。
+- `/溯源重扫` 为增量扫描（跳过已索引文件），`/溯源重扫 force` 重建全部扫描索引；文件被移出目录后，对应条目会在下次重扫时自动清理。
 
 ## 工作原理
 
-1. **图片提取**：遍历 `event.message_obj.message` 消息链，直接取 `Image` 段；引用消息从 `Reply.chain`（被引用消息段）中提取图片。去重按 `url` / `file` / `path` 三个标识求交——同一张图在消息链与被引用消息里往往只带其中一部分字段，只取其一会让同一张图被溯源两次、回传两遍。
-2. **取图**：优先调用 AstrBot 内置的 `Image.convert_to_file_path()` 媒体解析（自动处理 URL 下载、base64、本地文件），产物先经完整解码校验。校验失败时分两种：认不出任何图片容器（图床错误体、rkey 过期、防盗链）才走自带下载兜底（含 SSRF 校验）；已经认得出容器却解不开（缺解码器的 HEIC / 截断文件）说明内容本身有问题，直接带具体原因返回、不再重下。
-3. **特征计算**：灰度化 → EXIF 转正 → 缩放 → DCT（预计算正交矩阵）→ 低频中值二值化得到 pHash；辅以 dHash/aHash。计算在 `asyncio.to_thread` 中执行，不阻塞事件循环。
-4. **相似度检索**：图库哈希常驻内存（numpy 位矩阵，整体替换 + 快照读），XOR + 查表 popcount 批量计算汉明距离，数万张图毫秒级检索；dHash/aHash 一并入库留存，预留给后续的二级确认，当前检索仅使用 pHash。
-5. **结果回传**：QQ `aiocqhttp` 优先经 OneBot 原生接口直传 URL（`scaled-url` 模式下图片超过 `max_side` 才追加图床缩放参数），失败后回退本地压缩；其他平台走标准消息链。**单次发送保证**：直发结果分已送达 / 明确失败 / 结果未知，只有明确失败才允许回退，超时等「结果未知」一律不再重发。配文里的「已压缩」只在实测（缩放版字节更小）或本地压缩确实缩了字节时才出现。
-   - **回传计划只算一次**：URL 计划（含探测）在直发前算好后，失败回退路径直接复用，不会重跑一遍探测。
-   - **探测开销被压到最低**：全部探测并发执行（上限 4 并发）且有 8 秒总预算，超预算的按「说不准」处理、绝不等它；探测用独立的 5 秒超时（不再借用 30 秒的下载超时）；命中条目自带原图体积时只探缩放版一次；图床明确拒绝缩放请求后 600 秒内不再探测。
-   - **本地压缩**：单次解码（不再先做一次完整校验解码）、多图并发压缩（上限 3）、回退下载优先走内存（超过 8MB 才落盘）。
-   - **提示与图片并行**：OneBot 场景下命中提示与图片消息同时下发，首图不再等提示的整轮往返。
-6. **随机图与原图直取**：`/随机图`、`/随机视频` 经随机图接口（GET `/random`，出网同受 SSRF 校验）取到媒体直链后，图片复用上面的统一回传入口、视频走标准消息链；`/溯源` 与 `/随机图` 命中回传的图片都会记入会话级原图历史，`/原图` 据此把原图直链（剥离 ImgBed 缩放参数）直接下发，不下载不本地中转；历史未命中时 `/原图 文件名` 按文件名拼图床直链、探测存在后直传。
+1. **图片提取** — 遍历 `event.message_obj.message` 消息链取 `Image` 段；引用消息从 `Reply.chain` 提取。去重按 `url` / `file` / `path` 三个标识求交（同一张图在不同位置往往只带其中一部分字段，只取其一会让同一张图被溯源两次）。
+2. **取图** — 优先用 AstrBot 内置的 `Image.convert_to_file_path()` 媒体解析（自动处理 URL 下载、base64、本地文件），产物先经完整解码校验。认不出任何图片容器（图床错误体、rkey 过期、防盗链）才走自带下载兜底（含 SSRF 校验）；已认得出容器却解不开（缺解码器的 HEIC / 截断文件）直接带原因返回，不再重下。
+3. **特征计算** — 灰度化 → EXIF 转正 → 缩放 → DCT（预计算正交矩阵）→ 低频中值二值化得到 pHash，辅以 dHash/aHash；全程在 `asyncio.to_thread` 中执行，不阻塞事件循环。
+4. **相似度检索** — 图库哈希常驻内存（numpy 位矩阵，整体替换 + 快照读），XOR + 查表 popcount 批量算汉明距离，数万张图毫秒级；向量引擎走 Qdrant 检索并做同图去重。
+5. **结果回传** — 统一入口收口哈希、向量、随机图三条链路：QQ `aiocqhttp` 优先经 OneBot 原生接口直传 URL，失败后回退本地压缩，最后回退标准消息链（细节见[回图模式](#回图模式)）。
+6. **`/原图` 直取** — `/溯源` 与 `/随机图` 回传的图片都记入会话级原图历史；`/原图` 据此把原图直链直接下发，不下载不本地中转；历史未命中时按文件名拼图床直链、探测存在后直传。
+
+<details>
+<summary><b>技术细节：为什么哈希引擎也"AI"？pHash 是怎么算的？</b></summary>
+
+- **相似度的"AI"体现在哪**：特征提取与比对属于计算机视觉中的**感知哈希**算法（DCT 频域特征 + 汉明距离），全程本地运行，不调用大模型；需要大模型参与判断时开启 `ai_verify`，由视觉模型二次确认「是否同一张图」。
+- **pHash 流程**：转灰度 → 统一缩放到 `hash_size × 4` 见方 → 二维 DCT → 取左上 `hash_size × hash_size` 低频块 → 与中值比较二值化 → 打包成十六进制字符串。默认 `hash_size=16` 即 256 bit。
+- **为什么换 `hash_size` 要重扫**：pHash 的十六进制长度由 `hash_size` 决定，长度与库中记录不一致的行会被判为不匹配、索引等于被清空，因此必须 `/溯源重扫 force`。
+
+</details>
 
 ## 项目结构与开发
 
-代码按职责拆分为 12 个模块，依赖方向单向（`main` → 各子模块；子模块 → `common` / `http_client` / `url_guard`）：
+<details>
+<summary><b>模块职责与关键约束（12 个模块，点击展开）</b></summary>
+
+依赖方向单向：`main` → 各子模块；子模块 → `common` / `http_client` / `url_guard`。
 
 | 文件 | 职责 | 关键约束 |
 | --- | --- | --- |
-| `main.py` | 插件入口：指令、图片提取、引擎调度、AI 复核、生命周期 | auto 引擎的"向量优先、失败回退哈希"由本层编排 |
+| `main.py` | 插件入口：指令、图片提取、引擎调度、AI 复核、生命周期 | auto 引擎的「向量优先、失败回退哈希」由本层编排 |
 | `http_client.py` | 共享受管 HTTP 客户端 | 统一持有启用 IP pinning 的 `aiohttp` 会话 |
-| `features.py` | pHash / dHash / aHash 感知特征计算（Pillow + numpy + pillow-heif） | pHash 十六进制长度统一由 `phash_hex_len()` 提供，任何处不得自行推导；HEIF/HEIC 解码器在此防御式注册，缺失时降级为明确提示；支持格式表只维护一份，`image_file_ok(path)` 与 `image_bytes_ok(data)` 判据必须一致 |
-| `library.py` | SQLite 图库 + 内存哈希位矩阵检索 | 写路径持锁，缓存整体替换 + 快照读；重操作需经 `asyncio.to_thread` 调用 |
+| `features.py` | pHash / dHash / aHash 感知特征计算（Pillow + numpy + pillow-heif） | pHash 十六进制长度统一由 `phash_hex_len()` 提供，任何处不得自行推导；HEIF/HEIC 解码器在此防御式注册；支持格式表只维护一份，`image_file_ok(path)` 与 `image_bytes_ok(data)` 判据必须一致 |
+| `library.py` | SQLite 图库 + 内存哈希位矩阵检索 | 写路径持锁，缓存整体替换 + 快照读；重操作需经 `asyncio.to_thread` |
 | `image_bed.py` | 图床与储存桶各模式的上传、直链反解、远端删除 | 上传失败一律回退本地副本，登记流程不中断 |
 | `image_delivery.py` | URL 缩放/原图还原、本地压缩、压缩证据三态、直发结果分类、图床直链拼装、向量命中去重的纯函数 | 不直接访问网络或 AstrBot 事件，便于独立测试 |
 | `random_media.py` | ImgBed 随机图接口客户端与响应解析纯函数 | 出网经共享 HTTP 客户端；403 特判不重试；只取直链、不落地字节 |
@@ -325,7 +377,7 @@ v1.3.0 起，两种对象存储从图床模式中独立为单独的**储存桶�
 | `url_guard.py` | SSRF 防护：逐跳校验、IP 钉扎、响应限长 | 所有出网经共享 HTTP 客户端调用，不绕过防护 |
 | `common.py` | 配置解析工具与共享常量 | 真值表/常量只在此维护一份，各模块不得自备 |
 
-两条核心数据流：
+**两条核心数据流**
 
 ```
 登记原图：
@@ -341,64 +393,114 @@ v1.3.0 起，两种对象存储从图床模式中独立为单独的**储存桶�
         → 统一回传入口（OneBot URL 直传优先，失败本地压缩，最后标准消息链）
 ```
 
-开发注意：
+**开发约束**
 
-- 出网请求（图床、向量服务、对象存储、兜底下载）一律经 `url_guard.guarded_request`，
-  连接器用 `make_pinned_connector()` 创建；不要新建裸 `aiohttp.ClientSession` 直连；
-- 配置解析使用 `common.as_int` / `as_float` / `truthy` / `is_blank`，不要写
-  `value or default`（会把合法的 0 / False 吞掉）；
+- 出网请求（图床、向量服务、对象存储、兜底下载）一律经 `url_guard.guarded_request`，连接器用 `make_pinned_connector()` 创建；不要新建裸 `aiohttp.ClientSession` 直连；
+- 配置解析使用 `common.as_int` / `as_float` / `truthy` / `is_blank`，不要写 `value or default`（会把合法的 0 / False 吞掉）；
 - 涉及 SQLite 或大文件复制的调用若出现在 async 上下文，应包 `asyncio.to_thread`；
 - 群聊回复文案保持脱敏：含内网地址 / Key 的错误细节只进日志，不进群聊；
-- 发布包按白名单打包 18 个文件（12 个 `.py` + README / CHANGELOG / metadata /
-  requirements / _conf_schema / LICENSE），不含 `.git`、`data/` 与会话状态目录。
+- 发布包按白名单打包 **19 个文件**（12 个 `.py` + `README.md` / `CHANGELOG.md` / `metadata.yaml` / `requirements.txt` / `_conf_schema.json` / `LICENSE` / `logo.png`），不含 `.git`、`data/` 与会话状态目录；
+- 提交前确认 `metadata.yaml` 的 `version` 使用无 `v` 前缀的 SemVer，并与 `CHANGELOG.md`、README 徽章一致。
+
+</details>
 
 ## 常见问题
 
-- **命中了但不是同一张图？** 提高 `similarity_threshold`，或开启 `ai_verify` 让视觉大模型复核。
-- **明明登记过却没找到？** 检查图片是否被严重裁剪/拼贴（感知哈希对大幅构图变化不敏感），可适当降低阈值试试；另外确认 `hash_size` 与建库时一致（不一致请 `/溯源重扫 force`）。
-- **回传的图发不出来？** 使用图床直链时确认直链公网可读；使用本地文件时确认协议端能访问该路径。
-- **向量引擎显示未启用/报错？** 运行 `/溯源状态` 查看原因：`vector_search` 配置缺项会直接提示缺哪个字段；Qdrant 连接失败多为地址/Key 错误或端口未放行。
-- **为什么要填向量 AI（embed 配置）？** Qdrant 只存向量不存图片，`/溯源` 时插件必须调用与入库侧相同的向量 AI 把查询图转成向量才能检索；`embed_base_url` / `embed_model` 必填，`embed_api_key` 在网关无鉴权时可留空。详见「向量引擎」章节。
-- **同时配置了储存桶和图床，登记原图存哪？** 储存桶配置完整时优先用储存桶（直链长期有效，更适合溯源回图）；储存桶没配、`mode=none` 或配置不完整时用图床。`/溯源状态` 的「存储方式」一行会显示当前生效来源。
-- **升级到 v1.3.0 后，原来填在图床设置里的 R2/OCI 配置去哪了？** 插件首次启动时会自动把它们迁移到独立的「储存桶设置」（`storage_bucket`）组，图床模式归位为 `local`，无需手动操作。
-- **刚上传到图床的图检索不到？** 图床侧入库由钩子/入库服务完成，通常秒到分钟级；可稍等后重试，或在服务器侧查看入库服务日志与向量库计数。
-- **向量阈值怎么定？** 用「同图变体对」与「不同图对」各几组实测相似度：取高于所有不同图、低于所有同图变体的分界（一般 0.80~0.90 之间）。
-- **相似度的"AI"体现在哪？** 特征提取与比对使用计算机视觉中的感知哈希算法（DCT 频域特征），全程本地运行；如需大模型参与判断，开启 `ai_verify` 即可。
-- **iPhone 拍的 HEIC 图片溯源不了？** v1.5.3 起已通过 `pillow-heif` 支持 HEIC/HEIF。若日志出现「检测到 HEIC/HEIF 图片…未安装 pillow-heif」，说明依赖没装上：`pip install "pillow-heif>=0.16"`（或重装插件依赖）后重载插件即可；哈希图库若之前跳过了 `.heic` 文件，可执行 `/溯源重扫` 补录。
-- **日志报 `pillowmd ... OSError: cannot open resource`？** 这与本插件无关：堆栈里的 `astrbot_plugin_outputpro` 是另一个插件，它在 `result_decorate` 阶段把长文本回复转成图片时打不开字体文件（配置的字体路径在该容器内不存在，常见于从 Windows 迁配置带上了 `C:\Windows\Fonts\...`，或自定义 ttf 被删）。修复三步（任选）：
-  1. 在该插件的 t2i/字体配置里指向容器内**真实存在**的字体文件（先 `docker exec -it <容器> ls <配置里的路径>` 确认）；
-  2. 安装一套中文字体后重载插件，例如 `apt-get update && apt-get install -y fonts-noto-cjk`，或把思源黑体挂载进容器再填其路径；
-  3. 临时关闭那个插件的文字转图开关（或把本插件的长回复改用 `/溯源帮助` 按需触发）。
-- **`/原图 文件名` 说「图床里没有找到」？** 它会按 `{图床地址}/file/{文件名}` 直接探测：先确认名字与图床里的实际文件名一致（含上传目录时写成 `/原图 2026/09/abc.jpg`）；若图床不是 CloudFlare-ImgBed，或文件放在自定义目录，请改用 `/溯源` 命中后再发 `/原图`。当前 `/原图` 只接「会话回传历史」与「图床直链」两条来源，不查 Qdrant 向量库与本地图库。只有 HTTP 404/410 才判「确定不存在」；403（防盗链/访问规则）、429（限流）等只说明这次没读到，此时插件照常把直链发出去（不再误报找不到）。
+<details>
+<summary><b>命中了但不是同一张图 / 明明登记过却找不到？</b></summary>
 
-## 数据存储
+- **误报**：提高 `similarity_threshold`，或开启 `ai_verify` 让视觉大模型复核。
+- **漏报**：图片若被严重裁剪、拼贴，感知哈希对大幅构图变化不敏感，可适当降低阈值试试；另外确认 `hash_size` 与建库时一致（不一致请 `/溯源重扫 force`）。
 
-- 图库索引：`data/plugin_data/astrbot_plugin_image_trace/library.db`（SQLite）
-- 本地图床副本：`data/plugin_data/astrbot_plugin_image_trace/images/`
-- 临时文件：`data/plugin_data/astrbot_plugin_image_trace/tmp/`（自动清理）
+</details>
+
+<details>
+<summary><b>回传的图发不出来？</b></summary>
+
+- 用图床直链时，确认直链**公网可读**且协议端 / QQ 服务器能访问；
+- 用本地文件时，确认协议端能访问该路径（容器部署常见坑：宿主机路径在协议端容器内不可见）；
+- 图床开启了防盗链时，协议端取图可能被拦，改用 `local-compress` 模式可绕开。
+
+</details>
+
+<details>
+<summary><b>向量引擎显示未启用 / 报错？</b></summary>
+
+- 先跑 `/溯源状态`：`vector_search` 配置缺项会直接提示缺哪个字段；
+- Qdrant 连接失败多为地址/Key 错误或端口未放行——注意插件出网带 SSRF 校验，**不访问内网地址**，Qdrant 需公网可达；
+- 报 500 `'dict' object has no attribute 'strip'` 说明 `embed_image_input` 与模型不匹配（格式发给了只收字符串的模型），按模型切换该配置。
+
+</details>
+
+<details>
+<summary><b>同时配置了储存桶和图床，登记原图存哪？升级后老配置去哪了？</b></summary>
+
+- 储存桶配置完整时优先用储存桶（直链长期有效，更适合溯源回图）；储存桶没配、`mode=none` 或配置不完整时用图床。`/溯源状态` 的「存储方式」一行会显示当前生效来源。
+- 升级到 v1.3.0 后，原先填在图床设置里的 R2/OCI 配置会在插件首次启动时自动迁移到独立的 `storage_bucket` 组，图床模式归位为 `local`，无需手动操作。
+
+</details>
+
+<details>
+<summary><b>刚上传到图床的图检索不到 / 向量阈值怎么定？</b></summary>
+
+- 图床侧入库由钩子/入库服务完成，通常秒到分钟级；可稍等后重试，或在服务器侧查看入库服务日志与向量库计数。
+- 阈值用「同图变体对」与「不同图对」各几组实测相似度：取高于所有不同图、低于所有同图变体的分界（一般 0.80~0.90 之间）。
+
+</details>
+
+<details>
+<summary><b>iPhone 拍的 HEIC 图片溯源不了？</b></summary>
+
+v1.5.3 起已通过 `pillow-heif` 支持 HEIC/HEIF。若日志出现「检测到 HEIC/HEIF 图片…未安装 pillow-heif」，说明依赖没装上：`pip install "pillow-heif>=0.16"`（或重装插件依赖）后重载插件；哈希图库若之前跳过了 `.heic` 文件，可执行 `/溯源重扫` 补录。
+
+</details>
+
+<details>
+<summary><b><code>/原图 文件名</code> 说「图床里没有找到」？</b></summary>
+
+它会按 `{图床地址}/file/{文件名}` 直接探测。先确认名字与图床里的实际文件名一致（含上传目录时写成 `/原图 2026/09/abc.jpg`）；若图床不是 CloudFlare-ImgBed，或文件放在自定义目录，请改用 `/溯源` 命中后再发 `/原图`。
+
+只有 HTTP **404 / 410** 才判「确定不存在」；**403**（防盗链/访问规则）、**429**（限流）等只说明这次没读到，此时插件照常把直链发出去，不会误报找不到。
+
+</details>
+
+<details>
+<summary><b>日志报 <code>pillowmd ... OSError: cannot open resource</code>？</b></summary>
+
+这与本插件无关：堆栈里的 `astrbot_plugin_outputpro` 是另一个插件，它在 `result_decorate` 阶段把长文本回复转成图片时打不开字体文件（配置的字体路径在该容器内不存在，常见于从 Windows 迁配置带上了 `C:\Windows\Fonts\...`，或自定义 ttf 被删）。修复三步（任选）：
+
+1. 在该插件的 t2i/字体配置里指向容器内**真实存在**的字体文件（先 `docker exec -it <容器> ls <配置里的路径>` 确认）；
+2. 安装一套中文字体后重载插件，例如 `apt-get install -y fonts-noto-cjk`，或把思源黑体挂载进容器再填其路径；
+3. 临时关闭那个插件的文字转图开关。
+
+</details>
+
+## 数据存储与环境要求
+
+| 项 | 位置 / 要求 |
+| --- | --- |
+| 图库索引 | `data/plugin_data/astrbot_plugin_image_trace/library.db`（SQLite） |
+| 本地图床副本 | `data/plugin_data/astrbot_plugin_image_trace/images/` |
+| 临时文件 | `data/plugin_data/astrbot_plugin_image_trace/tmp/`（自动清理） |
+| AstrBot | `>= 4.0.0` |
+| Python | `3.10+` |
+| 依赖 | Pillow、numpy、aiohttp、pillow-heif（见 `requirements.txt`） |
 
 更新插件不会覆盖 `data` 目录下的数据。
 
-## 环境要求
-
-- AstrBot >= 4.0.0
-- Python 3.10+
-- 依赖：Pillow、numpy、aiohttp（见 `requirements.txt`）
-
 ## 参与贡献
 
-欢迎通过 Issue 反馈问题，或提交 Pull Request 改进代码：
+欢迎通过 [Issue](https://github.com/diyushuang/astrbot_plugin_image_trace/issues) 反馈问题，或提交 Pull Request：
 
-- Issue 请附 `/溯源状态` 输出与关键日志（注意先脱敏，不要贴 Key / 内网地址）；
-- 开发约束见「项目结构与开发」：出网一律经 `url_guard`，配置解析用 `common`，
-  群聊回复文案脱敏，SQLite / 大文件等重操作包 `asyncio.to_thread`；
-- 提交前确认 `metadata.yaml` 的 `version` 使用无 `v` 前缀的 SemVer，并与 `CHANGELOG.md` 一致。
-
-## 许可证
-
-本项目以 [AGPL-3.0](./LICENSE) 协议开源。
+- Issue 请附 `/溯源状态` 输出与关键日志（**注意脱敏**，不要贴 Key / 内网地址）；
+- 开发约束见[项目结构与开发](#项目结构与开发)：出网一律经 `url_guard`，配置解析用 `common`，群聊文案脱敏，重操作包 `asyncio.to_thread`；
+- 提交前确认 `metadata.yaml` 的 `version`、`CHANGELOG.md`、README 徽章三处一致。
 
 ## 致谢
 
 - [AstrBot](https://github.com/AstrBotDevs/AstrBot) — 易于扩展的多平台 LLM 聊天机器人框架；
 - [Qdrant](https://github.com/qdrant/qdrant)、[CloudFlare-ImgBed](https://github.com/MarSeventh/CloudFlare-ImgBed)、Cloudflare R2、Oracle Cloud Infrastructure — 对接均按各自官方文档实现。
+
+## 许可证
+
+本项目以 [AGPL-3.0](./LICENSE) 协议开源。
