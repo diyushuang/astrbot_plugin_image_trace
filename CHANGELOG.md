@@ -1,5 +1,41 @@
 # 更新日志
 
+## 1.5.6（2026-09-17，默认回传改本地压缩：压缩 100% 生效、混合载荷提速、修复 URL 编码回归）
+
+线上实测暴露两类问题：配文写「已压缩」但用户实际收到原图（传输还更慢），以及
+含空格/中文文件名的图床直链被截断。本版把默认回传模式改为 `local-compress`、
+补上混合载荷提速，并修掉 1.5.5 引入的编码回归。
+
+- **默认模式改为 `local-compress`（修「已压缩却发原图」）**：QQ 协议端
+  （NapCat / LiteLoader）实测会**剥离 URL 查询参数**，`scaled-url` 追加的
+  `width` / `height` 等缩放参数到达图床时已被剥掉，图床按原图返回——配文
+  却按「URL 被改写」声称已压缩。本地压缩后压缩字节经 OneBot `base64` 段
+  **直达 QQ、不经协议端二次下载**，压缩 100% 生效且配文为实测精确值；同一条
+  消息里各图配文不再一图说压缩、一图不说的不一致。仍要 URL 直传可显式改回
+  `scaled-url`。
+- **混合载荷（local-compress 提速）**：逐图决定 URL 段还是 base64 段——
+  已知小图（向量 `payload.size_bytes` / 图库 `file_size` 记录的体积 ≤200KB
+  且协议端能解析宽高）跳过下载直发 URL 段，省一次「下载 + base64 33% 膨胀」
+  的往返；其余下载压缩后内联 base64；未压缩且超 8MB 的巨型动图退回 URL 段，
+  避免单条消息撑爆 websocket 帧。
+- **local-compress 零探测**：本地压缩不依赖图床缩放能力，整条链路不向图床
+  发任何探测请求（`scaled-url` 才需要探测原图/缩放版体积来判定压缩证据）。
+- **修复 URL 编码回归（1.5.5 引入）**：`_extract_imgbed_file_path` 返回解引号
+  （`unquote`）后的路径，重建 URL 时未重新编码，含空格或中文的文件名
+  （如 `风景 1.jpg`）在缩放/还原 URL 里被截断、图床 404。新增
+  `_requote_imgbed_path` 在 `build_scaled_url` / `build_original_url` 里统一
+  重新编码（保留 `/` 与 `:`），缩放参数往返语义不变。
+- **新增 `scaled_url_style` 配置（仅 `scaled-url` 模式生效）**：`query`=查询
+  参数式（默认，兼容任何 CloudFlare-ImgBed 部署，但可能被协议端剥离）；
+  `cf-path`=Cloudflare Image Resizing 路径式
+  （`/cdn-cgi/image/width=…,fit=scale-down/file/…`），参数嵌在路径里剥不掉、
+  图床→协议端流量必为压缩后，但要求图床域名经 Cloudflare 代理且开启
+  Image Resizing（付费功能）——IP 直连自建部署不可用，请保持 `query` 或改用
+  `local-compress`。
+- **AVIF 给可操作诊断**：标准 Pillow（<11.3）无 AVIF 解码器，此前这类图
+  「探测、下载后既压不了也验不了」只有笼统的回退日志。现在明确提示
+  「升级 Pillow>=11.3 可启用 AVIF 本地压缩」并改走 URL 发送。
+
 ## 1.5.5（2026-09-16，回传链路提速：探测并发化、体积证据复用、压缩与提示并行）
 
 回传路径逐段梳理后的性能优化，功能语义与配文规则均不变（不改「已压缩」的判定

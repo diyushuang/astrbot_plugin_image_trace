@@ -129,15 +129,26 @@
   "image_delivery": {
     "description": "图片回传设置",
     "type": "object",
-    "hint": "默认 scaled-url：在 QQ aiocqhttp 平台优先通过 OneBot 原生接口直传图床缩放 URL，失败后回退本地压缩；其他平台使用标准消息链。original-url 直传原图 URL；local-compress 始终下载后本地压缩。仅 CloudFlare-ImgBed 标准 /file/ 直链会附加官方 width/height/fallback 参数。",
+    "hint": "默认 local-compress：插件下载后本地压缩，压缩字节经 OneBot 接口直达 QQ——QQ 协议端（NapCat 等）实测会剥离 URL 查询参数，图床缩放 URL 直传拿回的常是原图，本地压缩可确保压缩 100% 生效且配文为实测精确值。scaled-url 直传图床缩放 URL（依赖协议端下载行为，可能收到原图）；original-url 直传原图 URL。已知小图（≤200KB）自动跳过下载、仍以 URL 段直发以省时。",
     "items": {
       "mode": {
         "description": "【选填】图片回传模式",
         "type": "string",
-        "options": ["scaled-url", "original-url", "local-compress"],
-        "default": "scaled-url",
+        "options": ["local-compress", "scaled-url", "original-url"],
+        "default": "local-compress",
         "obvious_hint": true,
-        "hint": "scaled-url=图床等比缩放 URL 直传（默认，推荐）；original-url=原图 URL 直传；local-compress=插件下载后本地压缩。"
+        "hint": "local-compress=本地下载压缩后直发（默认，推荐，压缩必定生效）；scaled-url=图床等比缩放 URL 直传（快，但 QQ 协议端可能剥离缩放参数导致实际收到原图）；original-url=原图 URL 直传。"
+      },
+      "scaled_url_style": {
+        "description": "【选填】缩放 URL 风格",
+        "type": "string",
+        "options": ["query", "cf-path"],
+        "default": "query",
+        "obvious_hint": true,
+        "hint": "仅 scaled-url 模式生效。query=查询参数式（?width=…&fallback=original），兼容任何 CloudFlare-ImgBed 部署，但 QQ 协议端下载时可能剥离参数；cf-path=Cloudflare Image Resizing 路径式（/cdn-cgi/image/width=…,fit=scale-down/file/…），参数嵌在路径里剥离不掉、图床→协议端流量必为压缩后，但要求图床域名经 Cloudflare 代理且开启 Image Resizing（付费功能）——IP 直连自建部署（无 Cloudflare 代理域名）不可用，请保持 query 或改用 local-compress 模式。",
+        "condition": {
+          "mode": "scaled-url"
+        }
       },
       "max_side": {
         "description": "【选填】缩放/压缩最长边（像素）",

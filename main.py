@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import os
 import secrets
@@ -80,6 +81,8 @@ try:
         is_napcat_parseable_url,
         is_scaling_capability_rejection,
         is_scaling_needed,
+        prefer_inline_bytes,
+        prefer_url_direct,
         prepare_image_bytes,
         sniff_image_format,
         upgrade_to_https,
@@ -141,6 +144,8 @@ except ImportError:  # 兼容插件以独立模块方式加载
         is_napcat_parseable_url,
         is_scaling_capability_rejection,
         is_scaling_needed,
+        prefer_inline_bytes,
+        prefer_url_direct,
         prepare_image_bytes,
         sniff_image_format,
         upgrade_to_https,
@@ -650,11 +655,14 @@ class ImageTracePlugin(Star):
                 "HEAD", url, prepare=self._image_download_headers, timeout=timeout
             ) as resp:
                 head_status = resp.status
-                if not allow_range and is_scaling_capability_rejection(resp.status):
-                    # 405 先不记冷却：它可能只是 HEAD 方法不被允许，而不是
-                    # 缩放功能本身不可用。下面回退 GET 再确认。
-                    if resp.status != 405:
-                        self._note_scaled_unsupported(resp.status)
+                # 405 先不记冷却：它可能只是 HEAD 方法不被允许，而不是缩放
+                # 功能本身不可用，下面回退 GET 再确认。
+                if (
+                    not allow_range
+                    and resp.status != 405
+                    and is_scaling_capability_rejection(resp.status)
+                ):
+                    self._note_scaled_unsupported(resp.status)
                 exists = classify_probe_status(resp.status)
                 if exists is False:
                     return False, None
@@ -748,7 +756,7 @@ class ImageTracePlugin(Star):
         except OSError:
             pass
 
-    def _delivery_config(self) -> tuple[str, int, int]:
+    def _delivery_config(self) -> tuple[str, int, int, str]:
         return delivery_settings(self.config.get("image_delivery"))
 
     def _random_settings(self) -> dict:
@@ -855,16 +863,18 @@ class ImageTracePlugin(Star):
         return f"{prefix} {caption}".strip() if prefix else caption
 
     async def _send_via_onebot(
-        self, event: AstrMessageEvent, header: str, blocks: list[dict], urls: list[str]
+        self, event: AstrMessageEvent, header: str, blocks: list[dict], payloads: list[str | bytes]
     ) -> SendOutcome:
         """通过 OneBot 原生接口直发消息，消息段按「标题 →（配文 → 图片）…」交替排列。
 
         每张图的配文紧贴在自己那张图的上方，与标准消息链路径（_yield_delivery
         末尾）顺序一致，两条发送通道观感相同。
 
-        urls 与 blocks 中的有图 block 同序一一对应；调用方（_yield_delivery 的
-        URL 直传分支、_send_prompt）已保证两者数量相等，故这里按遍历到的有图
-        block 依次取用，无需再做长度校验。
+        payloads 与 blocks 中的有图 block 同序一一对应，元素为 URL 字符串（原样
+        作 data.file）或图片字节（编码为 base64:// 段，压缩结果直达 QQ、不经
+        协议端二次下载）。调用方（_yield_delivery 的两个直发分支、
+        _send_prompt）已保证数量相等，故这里按遍历到的有图 block 依次取用，
+        无需再做长度校验。
 
         返回三态而非布尔：只有协议端明确回报失败（FAILED）才允许换通道重发。
         超时等 UNKNOWN 情形请求可能已经送达，调用方必须先看返回值再决定是否
@@ -876,13 +886,16 @@ class ImageTracePlugin(Star):
             message.append({"type": "at", "data": {"qq": str(sender_id)}})
         if header:
             message.append({"type": "text", "data": {"text": header + "\n"}})
-        pending_urls = iter(urls)
+        pending_payloads = iter(payloads)
         for block in blocks:
             text = str(block.get("text") or "").strip()
             if text:
                 message.append({"type": "text", "data": {"text": text + "\n"}})
             if block.get("url") or block.get("path"):
-                message.append({"type": "image", "data": {"file": next(pending_urls)}})
+                payload = next(pending_payloads)
+                if isinstance(payload, bytes):
+                    payload = "base64://" + base64.b64encode(payload).decode()
+                message.append({"type": "image", "data": {"file": payload}})
 
         params: dict = {"message": message}
         group_id = event.get_group_id()
@@ -908,9 +921,9 @@ class ImageTracePlugin(Star):
                     "为避免同一张图重复发送，本次不再走任何回退"
                 )
             else:
-                logger.warning(f"OneBot URL 直传图片失败，准备回退: {exc}")
+                logger.warning(f"OneBot 图片直发失败，准备回退: {exc}")
             return outcome
-        logger.info(f"OneBot URL 直传图片成功: {action}")
+        logger.info(f"OneBot 图片直发成功: {action}")
         return SendOutcome.SENT
 
     async def _send_prompt(self, event: AstrMessageEvent, text: str) -> bool:
@@ -978,7 +991,7 @@ class ImageTracePlugin(Star):
         gather 收集结果而不是 as_completed。任一张失败即整体返回 None，
         调用方据此改走 URL 链——与逐张串行时的语义一致。
         """
-        mode, max_side, quality = self._delivery_config()
+        mode, max_side, quality, _ = self._delivery_config()
         target_bytes, use_webp = self._encode_options()
         semaphore = asyncio.Semaphore(COMPRESS_CONCURRENCY)
 
@@ -1006,6 +1019,14 @@ class ImageTracePlugin(Star):
                         f"大小={len(data) / 1024:.0f}KB"
                     )
                     return data, False
+                if sniff_image_format(data) == "AVIF":
+                    # Pillow<11.3 无 AVIF 解码器：探测、下载后既压不了也验不了，
+                    # 只能让协议端自己拉 URL。给出可操作的提示而不是笼统的失败。
+                    logger.warning(
+                        f"AVIF 图片当前环境无法解码（Pillow 版本过低），改用 URL 发送: "
+                        f"大小={len(data) / 1024:.0f}KB；升级 Pillow>=11.3 可启用 AVIF 本地压缩"
+                    )
+                    return None
                 logger.warning(
                     f"回退图片无法解码，改用 URL 发送: 格式={sniff_image_format(data) or '未知'}, "
                     f"大小={len(data) / 1024:.0f}KB"
@@ -1018,6 +1039,56 @@ class ImageTracePlugin(Star):
         if any(item is None for item in prepared):
             return None
         return list(prepared)
+
+    async def _local_compress_delivery(
+        self,
+        event: AstrMessageEvent,
+        header: str,
+        blocks: list[dict],
+        image_blocks: list[dict],
+        *,
+        mark_compressed: bool,
+    ) -> SendOutcome | None:
+        """local-compress 模式在 OneBot 下的混合载荷直发。
+
+        逐图决定 URL 段还是 base64 段：已知小图（≤COMPRESS_MIN_BYTES 且协议端
+        能解析宽高）跳过下载、直发原图 URL——本地压缩本就会跳过这类图，下载再
+        base64 回发纯属浪费一次往返；其余并发下载+压缩后内联 base64，压缩结果
+        不经协议端二次下载，100% 到达 QQ（QQ 协议端会剥离 URL 查询参数，缩放
+        URL 直传拿回的常是原图）。未压缩且超内联上限的巨型图（动图等）退回
+        URL 段，避免单条消息过大。
+
+        返回 None 表示准备失败（任一张下载/解码失败），调用方整批改走 URL 链；
+        否则返回 _send_via_onebot 的三态结果。
+        """
+        prepare_blocks = [block for block in image_blocks if not prefer_url_direct(block)]
+        prepared = await self._prepare_delivery_blocks(prepare_blocks, compress=True)
+        if prepared is None:
+            return None
+
+        payloads: list[str | bytes] = []
+        evidences: list[CompressionEvidence] = []
+        pending = iter(prepared)
+        for block in image_blocks:
+            url = str(block.get("url") or "")
+            if prefer_url_direct(block):
+                payloads.append(build_original_url(url) or url)
+                evidences.append(CompressionEvidence.ORIGINAL)
+                continue
+            data, compressed = next(pending)
+            if prefer_inline_bytes(len(data), compressed, url):
+                payloads.append(data)
+            else:
+                payloads.append(build_original_url(url) or url)
+            evidences.append(
+                CompressionEvidence.COMPRESSED if compressed else CompressionEvidence.ORIGINAL
+            )
+
+        if mark_compressed:
+            self._mark_compressed_captions(blocks, evidences)
+        elif any(evidence is CompressionEvidence.COMPRESSED for evidence in evidences):
+            header += "（已压缩）"
+        return await self._send_via_onebot(event, header, blocks, payloads)
 
     def _encode_options(self) -> tuple[int, bool]:
         """本地压缩进阶选项：目标体积上限（字节，0 表示不限制）与 WebP 输出。"""
@@ -1035,7 +1106,8 @@ class ImageTracePlugin(Star):
         return value if value > 0 else 0
 
     async def _url_delivery_plan(
-        self, image_blocks: list[dict], max_side: int, mode: str
+        self, image_blocks: list[dict], max_side: int, mode: str,
+        quality: int = 85, scaled_url_style: str = "query",
     ) -> tuple[list[str], list[CompressionEvidence]]:
         """决定每张图 URL 直传实际发哪个 URL，并给出压缩证据，两者同序对应。
 
@@ -1063,7 +1135,7 @@ class ImageTracePlugin(Star):
                 urls.append(original or str(block.get("url") or ""))
                 jobs.append(None)
                 continue
-            scaled = build_scaled_url(original, max_side)
+            scaled = build_scaled_url(original, max_side, quality=quality, style=scaled_url_style)
             if is_scaling_needed(size, max_side) is False or scaled == original:
                 # 尺寸证明不会被缩放，或这条直链本来就带不了缩放参数
                 urls.append(original)
@@ -1145,7 +1217,14 @@ class ImageTracePlugin(Star):
         allow_local_fallback: bool = True,
         mark_compressed: bool = False,
     ):
-        """统一回传入口：URL 直传优先，本地压缩只作为失败回退。
+        """统一回传入口：按模式选主路径，失败后逐级回退。
+
+        - scaled-url / original-url：URL 直传优先，本地压缩只作为失败回退；
+        - local-compress（默认）：OneBot 下压缩字节经 base64 段直发（混合载荷，
+          已知小图跳过下载直发 URL），失败改走标准消息链 URL；其他平台走
+          chain_result(fromBytes)。QQ 协议端（NapCat 等）会剥离 URL 查询参数，
+          缩放 URL 直传拿回的常是原图，本地压缩是唯一能保证压缩 100% 生效的
+          路径。
 
         mode_override 供 /原图 强制走 original-url、无视全局回传模式；
         allow_local_fallback=False 时彻底不进入下载字节/本地压缩分支，保证
@@ -1157,22 +1236,25 @@ class ImageTracePlugin(Star):
         三处既有调用点行为与改造前一致。
 
         单次发送保证：同一批图片在一次调用里只发起一次发送。只有 OneBot 直发
-        明确失败（FAILED）才允许走字节回退；结果未知（超时）一律就此打住——
+        明确失败（FAILED）才允许换通道重发；结果未知（超时）一律就此打住——
         请求可能已经送达，再发一次用户就会收到两张一模一样的图。
         """
         if self._event_already_sent(event):
             logger.warning("本次事件已投递过图片，跳过重复投递")
             return
         self._remember_blocks(event, blocks)
-        mode, max_side, _ = self._delivery_config()
+        mode, max_side, quality, scaled_url_style = self._delivery_config()
         if mode_override is not None:
             mode = mode_override
         image_blocks = [block for block in blocks if block.get("url") or block.get("path")]
         raw_urls = [str(block["url"]) for block in image_blocks if block.get("url")]
         all_urls = bool(image_blocks) and len(raw_urls) == len(image_blocks)
         direct_mode = mode in {"scaled-url", "original-url"}
-        # 非 NapCat 可解析的扩展名（avif 等）协议端拿不到宽高，这种情况在
-        # scaled-url 模式下改走本地压缩，把图片转成 JPEG 再发
+        # URL 直发条件：模式允许 + 全是 URL + 能走 OneBot + 所有 URL 扩展名
+        # 能被协议端解析出宽高（否则 QQ 侧拿不到尺寸，体验差）。
+        # scaled-url 模式下默认走 URL 直传；若 QQ 协议端会剥离查询参数导致
+        # 图床返回原图，可把 scaled_url_style 改为 "cf-path"（路径式，参数
+        # 嵌在路径里不会被剥离，但需图床域名开启 Cloudflare Image Resizing）。
         direct_ok = (
             direct_mode
             and all_urls
@@ -1184,7 +1266,7 @@ class ImageTracePlugin(Star):
         # 第二次（图床还会因此多做一次缩放处理）。
         plan: tuple[list[str], list[CompressionEvidence]] | None = None
         if direct_ok:
-            plan = await self._url_delivery_plan(image_blocks, max_side, mode)
+            plan = await self._url_delivery_plan(image_blocks, max_side, mode, quality=quality, scaled_url_style=scaled_url_style)
             urls, evidences = plan
             if mark_compressed:
                 self._mark_compressed_captions(blocks, evidences)
@@ -1203,41 +1285,55 @@ class ImageTracePlugin(Star):
             # 让协议端解析不了宽高、压根没尝试直发的情形（改本地压缩成 JPEG 再发）
             onebot_failed = self._can_send_via_onebot(event) and direct_mode and all_urls
             if should_compress or onebot_failed:
-                prepared = await self._prepare_delivery_blocks(
-                    image_blocks, compress=mode != "original-url"
-                )
-                if prepared is not None:
-                    evidences = [
-                        CompressionEvidence.COMPRESSED if compressed else CompressionEvidence.ORIGINAL
-                        for _, compressed in prepared
-                    ]
-                    if mark_compressed:
-                        self._mark_compressed_captions(blocks, evidences)
-                    fallback_header = header
-                    if any(
-                        item is CompressionEvidence.COMPRESSED for item in evidences
-                    ):
-                        fallback_header += "（已压缩）"
-                    chain = [Comp.At(qq=event.get_sender_id())]
-                    if fallback_header:
-                        chain.append(Comp.Plain(" " + fallback_header))
-                    image_index = 0
-                    for block in blocks:
-                        if block.get("text"):
-                            chain.append(Comp.Plain("\n" + str(block["text"])))
-                        if block.get("url") or block.get("path"):
-                            data, _ = prepared[image_index]
-                            chain.append(Comp.Image.fromBytes(data))
-                            image_index += 1
-                    self._mark_event_sent(event)
-                    yield event.chain_result(chain)
-                    return
-                logger.warning("本地图片回退失败，改用标准消息链 URL 发送")
+                if mode == "local-compress" and self._can_send_via_onebot(event):
+                    # OneBot 下 local-compress 直发压缩字节（混合载荷）：压缩结果
+                    # 经 base64 段直达 QQ，不经协议端二次下载，压缩 100% 生效
+                    outcome = await self._local_compress_delivery(
+                        event, header, blocks, image_blocks, mark_compressed=mark_compressed
+                    )
+                    if outcome is not None and outcome is not SendOutcome.FAILED:
+                        # SENT 已送达；UNKNOWN 可能已送达——两者都不能再发第二次
+                        self._mark_event_sent(event)
+                        event.stop_event()
+                        return
+                    # None=准备失败 或 FAILED=直发失败：字节路径已试过，整批改走 URL 链
+                    logger.warning("OneBot 压缩直发未成功，改用标准消息链 URL 发送")
+                else:
+                    prepared = await self._prepare_delivery_blocks(
+                        image_blocks, compress=mode != "original-url"
+                    )
+                    if prepared is not None:
+                        evidences = [
+                            CompressionEvidence.COMPRESSED if compressed else CompressionEvidence.ORIGINAL
+                            for _, compressed in prepared
+                        ]
+                        if mark_compressed:
+                            self._mark_compressed_captions(blocks, evidences)
+                        fallback_header = header
+                        if any(
+                            item is CompressionEvidence.COMPRESSED for item in evidences
+                        ):
+                            fallback_header += "（已压缩）"
+                        chain = [Comp.At(qq=event.get_sender_id())]
+                        if fallback_header:
+                            chain.append(Comp.Plain(" " + fallback_header))
+                        image_index = 0
+                        for block in blocks:
+                            if block.get("text"):
+                                chain.append(Comp.Plain("\n" + str(block["text"])))
+                            if block.get("url") or block.get("path"):
+                                data, _ = prepared[image_index]
+                                chain.append(Comp.Image.fromBytes(data))
+                                image_index += 1
+                        self._mark_event_sent(event)
+                        yield event.chain_result(chain)
+                        return
+                    logger.warning("本地图片回退失败，改用标准消息链 URL 发送")
 
         if self._event_already_sent(event):
             return
         if plan is None:
-            plan = await self._url_delivery_plan(image_blocks, max_side, mode)
+            plan = await self._url_delivery_plan(image_blocks, max_side, mode, quality=quality, scaled_url_style=scaled_url_style)
         urls, evidences = plan
         if mark_compressed:
             self._mark_compressed_captions(blocks, evidences)

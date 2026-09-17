@@ -139,7 +139,7 @@ flowchart LR
 | `search_engine` | `auto` | `auto`=向量优先（未命中/不可用回退哈希）/ `vector` / `hash` |
 | `scan_dirs` | `[]` | 本地图库目录列表（绝对路径）；仅用 `/登记原图` 建库可留空 |
 | `image_bed.mode` | `local` | 图床模式：`local` / `generic_http` / `cloudflare_imgbed`；选定后组内展开对应字段 |
-| `image_delivery.mode` | `scaled-url` | 回图模式：[详见下文](#回图模式) |
+| `image_delivery.mode` | `local-compress` | 回图模式：[详见下文](#回图模式) |
 | `image_delivery.max_side` | `1920` | 缩放或本地压缩的最长边，范围 1~4096 |
 | `image_delivery.quality` | `85` | 本地 JPEG 压缩质量，范围 1~100 |
 | `image_delivery.verify_scaled` | `true` | 是否实测校验图床缩放真的生效（关闭后配文不再宣称「已压缩」） |
@@ -161,6 +161,7 @@ flowchart LR
 | `max_download_mb` | `20` | 单张图片大小上限（MB） |
 | `image_delivery.target_kb` | `0` | 本地压缩的目标体积上限（KB，0=不限制）。非 0 时启用质量阶梯 |
 | `image_delivery.webp` | `false` | 本地压缩改用 WebP 输出（体积更小，编码更慢；噪声极多的图可能反而更大，此时自动回退原字节） |
+| `image_delivery.scaled_url_style` | `query` | 仅 `scaled-url` 模式生效。`query`=查询参数式（兼容任何部署，但 QQ 协议端下载时可能剥离参数收到原图）；`cf-path`=Cloudflare Image Resizing 路径式（参数嵌在路径里剥不掉、必为压缩后流量，但要求图床域名经 Cloudflare 代理且开启 Image Resizing） |
 | `random_media.api_endpoint` | `/random` | 随机图接口相对路径（不能填完整 URL） |
 | `random_media.api_token` | - | 随机图接口 Token（`Authorization: Bearer`）；配置 Token 时图床地址必须为 `https` |
 | `random_media.default_dir` | - | 未指定目录时使用的默认目录（如 `风景/2026`），留空从根目录取图 |
@@ -176,16 +177,18 @@ flowchart LR
 
 | 模式 | 行为 | 适用场景 |
 | --- | --- | --- |
-| `scaled-url`（默认） | CloudFlare-ImgBed 标准 `/file/` 直链追加官方 `width` / `height` / `fallback=original` 等比缩放参数后直传；图片不超过 `max_side` 时不追加参数 | 想省流量、又希望出问题时能回退到原图 |
+| `local-compress`（默认） | 插件下载后本地压缩（EXIF 转正、等比缩放、透明铺白底、JPEG 重编码、动图保持原样），压缩字节经 OneBot `base64` 段直达 QQ、不经协议端二次下载；已知小图（体积已知且 ≤200KB）自动跳过下载、仍以 URL 段直发 | 需要压缩 100% 生效的场景。QQ 协议端（NapCat 等）实测会剥离 URL 查询参数，`scaled-url` 直传拿回的常是原图 |
+| `scaled-url` | CloudFlare-ImgBed 标准 `/file/` 直链追加官方 `width` / `height` / `fallback=original` 等比缩放参数后直传；图片不超过 `max_side` 时不追加参数。参数风格由 `scaled_url_style` 决定（`query` / `cf-path`） | 图床域名经 Cloudflare 代理且开启 Image Resizing 时选 `cf-path`（参数嵌在路径里剥不掉）；否则只能 `query`，需接受「协议端可能剥离参数收到原图」 |
 | `original-url` | 直接直传原图 URL，不做任何处理 | 图床带宽充裕，追求最短链路 |
-| `local-compress` | 插件下载后本地压缩再发（EXIF 转正、等比缩放、透明铺白底、JPEG 重编码、动图保持原样） | 图床直链协议端取不到，或必须转成 JPEG 才能被解析 |
 
 **压缩标识只按证据写**：只有实测（图床缩放版字节更小）或本地压缩确实缩了字节，配文才写「已压缩」。图片不超过 `max_side` 时直接发原图 URL、不追加缩放参数——图床在图片不大或图像处理不可用时会按 `fallback=original` 原样返回，凭「URL 被改写」推断压缩会出现「文字说已压缩、收到的却是原图」。
 
 **回传链路的效率设计**：
 
 - **单次发送保证**：OneBot 直发结果分「已送达 / 明确失败 / 结果未知」三态，只有明确失败才允许换通道回退；超时属「结果未知」（消息很可能已送达），一律不重发，并按事件打去重标记，杜绝同一张图发两遍。
-- **探测开销最小化**：所有探测并发执行（上限 4）且受 8 秒总预算约束，超预算按「说不准」处理；探测用独立的 5 秒超时；命中条目自带原图体积（向量 `payload.size_bytes` / 图库 `file_size`）时只探缩放版一次；图床明确拒绝缩放请求（405 / 501 / 400）后 600 秒内不再探测。
+- **混合载荷（local-compress）**：已知小图（向量 `payload.size_bytes` / 图库 `file_size` 记录的体积 ≤200KB 且协议端能解析宽高）跳过下载、直发 URL 段省一次往返；其余下载压缩后内联 base64，压缩结果不经协议端二次下载；未压缩且超 8MB 的巨型动图退回 URL 段，避免单条消息过大。
+- **local-compress 零探测**：本地压缩不依赖图床缩放能力，整条链路不向图床发任何探测请求（`scaled-url` 才需要探测原图/缩放版体积来判定压缩证据）。
+- **探测开销最小化（scaled-url / original-url）**：所有探测并发执行（上限 4）且受 8 秒总预算约束，超预算按「说不准」处理；探测用独立的 5 秒超时；命中条目自带原图体积时只探缩放版一次；图床明确拒绝缩放请求（405 / 501 / 400）后 600 秒内不再探测。
 - **回传计划只算一次**：URL 计划（含探测）在直发前算好，失败回退路径直接复用。
 - **本地压缩**：单次解码（不重复解码校验）、多图并发压缩（上限 3）、回退下载优先走内存（超过 8 MB 才落盘）。
 - **提示与图片并行**：OneBot 场景下命中提示与图片消息同时下发，首图不必等提示的整轮往返。

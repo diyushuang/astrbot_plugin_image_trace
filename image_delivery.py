@@ -100,15 +100,35 @@ def bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, result))
 
 
-def delivery_settings(config: Any) -> tuple[str, int, int]:
-    """归一化图片回传配置，返回 (mode, max_side, quality)。"""
+SCALED_URL_STYLES = frozenset({"query", "cf-path"})
+
+
+def delivery_settings(config: Any) -> tuple[str, int, int, str]:
+    """归一化图片回传配置，返回 (mode, max_side, quality, scaled_url_style)。
+
+    默认 local-compress：QQ 协议端（NapCat 等）实测会剥离 URL 查询参数，
+    图床缩放 URL 直传拿回的是原图；本地压缩后的字节经 base64 段直达 QQ，
+    压缩 100% 生效，配文证据也是实测精确值。
+
+    scaled_url_style：scaled-url 模式下缩放参数的 URL 风格：
+    - query（默认）：查询参数式，如 /file/abc.jpg?width=1920&height=1920&fallback=original
+      优点是兼容 CloudFlare-ImgBed 原生接口，且任何图床站点都能用；
+      缺点是 QQ 协议端下载时可能剥离查询参数，导致 fallback=original 返回原图。
+    - cf-path：Cloudflare Image Resizing 路径式，如
+      /cdn-cgi/image/width=1920,height=1920,quality=85,fit=scale-down/file/abc.jpg
+      优点是缩放参数嵌在路径里，QQ 协议端剥离不掉，图床→OneBot 流量一定
+      是压缩后的；缺点是需图床域名开启 Cloudflare Image Resizing（付费）。
+    """
     raw = config if isinstance(config, dict) else {}
-    mode = str(raw.get("mode") or "scaled-url").strip().lower()
+    mode = str(raw.get("mode") or "local-compress").strip().lower()
     if mode not in DELIVERY_MODES:
-        mode = "scaled-url"
+        mode = "local-compress"
     max_side = bounded_int(raw.get("max_side"), 1920, 1, 4096)
     quality = bounded_int(raw.get("quality"), 85, 1, 100)
-    return mode, max_side, quality
+    style = str(raw.get("scaled_url_style") or "query").strip().lower()
+    if style not in SCALED_URL_STYLES:
+        style = "query"
+    return mode, max_side, quality, style
 
 
 def _error_text(exc: BaseException) -> str:
@@ -166,50 +186,115 @@ def classify_send_error(exc: BaseException) -> SendOutcome:
     return SendOutcome.UNKNOWN
 
 
+_CF_IMAGE_PREFIX = "/cdn-cgi/image/"
+
+
 def is_cloudflare_imgbed_url(url: str) -> bool:
-    """按 CloudFlare-ImgBed 标准 /file/ 路径识别可缩放直链。"""
+    """按 CloudFlare-ImgBed 标准 /file/ 路径识别可缩放直链。
+
+    同时识别 Cloudflare Image Resizing 路径式（/cdn-cgi/image/.../file/...），
+    因为这种 URL 的源文件仍是 ImgBed /file/ 直链，只是缩放参数嵌在路径里。
+    """
     try:
         parsed = urlsplit(str(url or ""))
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             return False
-        return unquote(parsed.path).startswith("/file/")
+        path = unquote(parsed.path)
+        if path.startswith("/file/"):
+            return True
+        if path.startswith(_CF_IMAGE_PREFIX):
+            # /cdn-cgi/image/.../file/... 才算——源文件在 /file/ 下
+            return "/file/" in path[len(_CF_IMAGE_PREFIX):]
+        return False
     except Exception:
         return False
 
 
-def build_scaled_url(url: str, max_side: int) -> str:
-    """构造 ImgBed 等比缩放 URL；非 ImgBed URL 原样返回。"""
+def _extract_imgbed_file_path(path: str) -> str | None:
+    """从 ImgBed URL 路径中提取 /file/... 部分，识别不到返回 None。
+
+    支持两种格式：
+      /file/abc.jpg                    → /file/abc.jpg
+      /cdn-cgi/image/opts/file/abc.jpg → /file/abc.jpg
+    """
+    p = unquote(path)
+    if p.startswith("/file/"):
+        return p
+    if p.startswith(_CF_IMAGE_PREFIX):
+        rest = p[len(_CF_IMAGE_PREFIX):]
+        idx = rest.find("/file/")
+        if idx >= 0:
+            return rest[idx:]
+    return None
+
+
+def _requote_imgbed_path(file_path: str) -> str:
+    """把解引号后的 /file/ 路径按 URL 规则重新编码。
+
+    _extract_imgbed_file_path 为匹配方便返回解引号路径，重建 URL 前必须
+    重新编码，否则文件名里的空格/中文/特殊字符会原样进入 URL，协议端会
+    截断或拒收。
+    """
+    return quote(file_path, safe="/:")
+
+
+def build_scaled_url(url: str, max_side: int, quality: int = 85, style: str = "query") -> str:
+    """构造 ImgBed 等比缩放 URL；非 ImgBed URL 原样返回。
+
+    style="query"（默认）：查询参数式，兼容 CloudFlare-ImgBed 原生接口。
+    style="cf-path"：Cloudflare Image Resizing 路径式，参数嵌在路径里，
+                     QQ 协议端剥离不掉，能保证压缩生效。
+    """
     if not is_cloudflare_imgbed_url(url):
         return url
     side = bounded_int(max_side, 1920, 1, 4096)
+    q = bounded_int(quality, 85, 1, 100)
     parsed = urlsplit(url)
+    file_path = _extract_imgbed_file_path(parsed.path)
+    if not file_path:
+        return url
+
+    if style == "cf-path":
+        # Cloudflare Image Resizing 路径式：/cdn-cgi/image/width=W,height=W,quality=Q,fit=scale-down/file/...
+        options = f"width={side},height={side},quality={q},fit=scale-down"
+        new_path = f"{_CF_IMAGE_PREFIX.rstrip('/')}/{options}{_requote_imgbed_path(file_path)}"
+        return urlunsplit((parsed.scheme, parsed.netloc, new_path, parsed.query, parsed.fragment))
+
+    # query 风格：在查询串里追加 width/height/fallback
     query = [
         (key, value)
         for key, value in parse_qsl(parsed.query, keep_blank_values=True)
         if key.lower() not in IMGBED_MANAGED_QUERY_KEYS
     ]
     query.extend([("width", str(side)), ("height", str(side)), ("fallback", "original")])
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, _requote_imgbed_path(file_path), urlencode(query), parsed.fragment)
+    )
 
 
 def build_original_url(url: str) -> str:
     """还原 ImgBed 读取 API 意义上的“未处理原文件”直链。
 
-    与 build_scaled_url 对称：后者追加 width/height/fallback 处理参数，本函数
-    反向剥离这些参数。之所以需要它：回传用的直链在历史里可能已带缩放参数
-    （例如用户曾手动发过缩放链接、或旧版本写入过），/原图 若直接复用，拿到的
-    仍是处理后的版本，与“原图”语义不符。非 ImgBed /file/ 直链原样返回——其他
-    图床没有这套处理参数，改动其查询串反而可能破坏签名或鉴权。
+    与 build_scaled_url 对称：
+    - query 风格：剥离 width/height/fit/fallback 查询参数
+    - cf-path 风格：剥离 /cdn-cgi/image/... 前缀，还原为 /file/ 直链
+
+    非 ImgBed 直链原样返回。
     """
     if not is_cloudflare_imgbed_url(url):
         return url
     parsed = urlsplit(url)
+    file_path = _extract_imgbed_file_path(parsed.path)
+    if not file_path:
+        return url
     query = [
         (key, value)
         for key, value in parse_qsl(parsed.query, keep_blank_values=True)
         if key.lower() not in IMGBED_MANAGED_QUERY_KEYS
     ]
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, _requote_imgbed_path(file_path), urlencode(query), parsed.fragment)
+    )
 
 
 def is_scaling_needed(image_size, max_side) -> bool | None:
@@ -271,6 +356,46 @@ def is_napcat_parseable_url(url: str) -> bool:
     except Exception:
         return False
     return any(path.endswith(extension) for extension in NAPCAT_PARSEABLE_EXTENSIONS)
+
+
+# 内联（base64）字节段的上限：与下载口径 MEMORY_DOWNLOAD_MAX_BYTES 对齐，
+# 超过这个体积的 base64 消息有撑爆 websocket 帧的风险，改走 URL 段。
+MAX_INLINE_IMAGE_BYTES = 8 * 1024 * 1024
+
+
+def prefer_url_direct(block: Mapping) -> bool:
+    """已知小图是否值得跳过下载、直接以 URL 段发送。
+
+    与 prepare_image_bytes 的跳压缩阈值对齐：体积已知且 ≤ COMPRESS_MIN_BYTES
+    的图本地压缩本就会被跳过，下载再 base64 回发纯属浪费一次往返 + 33% 膨胀，
+    不如让协议端直接拉小文件。体积未知（0/缺字段）不享受该优化——万一是
+    大图，URL 直传会绕过压缩。
+    """
+    try:
+        size_bytes = int(block.get("size_bytes") or 0)
+    except (TypeError, ValueError):
+        return False
+    url = str(block.get("url") or "")
+    return 0 < size_bytes <= COMPRESS_MIN_BYTES and is_napcat_parseable_url(url)
+
+
+def prefer_inline_bytes(
+    data_len: int,
+    compressed: bool,
+    url: str,
+    *,
+    max_inline_bytes: int = MAX_INLINE_IMAGE_BYTES,
+) -> bool:
+    """拿到字节后决定发 base64 段还是 URL 段。
+
+    压缩成功的字节必须内联——这是 local-compress 模式的全部意义，不能
+    交给协议端二次下载。未压缩的字节仅在内联安全（≤上限）或 URL 不可用
+    （无 URL / 协议端解析不了宽高）时内联；未压缩且超上限的巨型动图等
+    交给 URL 段，避免单条消息过大。
+    """
+    if compressed or not url or not is_napcat_parseable_url(url):
+        return True
+    return data_len <= max_inline_bytes
 
 
 def upgrade_to_https(url: str, base_url: str) -> str:
