@@ -114,3 +114,31 @@ class MediaHistory:
     def count(self, session) -> int:
         """该会话当前记录的历史键数（0 表示尚未回传过任何图片）。"""
         return len(self._history.get(self._key(session)) or {})
+
+    def forget(self, matcher) -> int:
+        """删除**所有会话**中满足 matcher(name) 的历史键，返回删除条数。
+
+        用途：修掉早期版本遗留的脏键。1.6.1 之前 `_remember_blocks` 把配文前缀
+        （`🖼️ ` / `🎬 ` / `1. `）连同文件名一起登记成了历史键，于是「引用那条消息
+        发 /原图」时前缀会被当名字的一部分拼进 URL（线上 404 的 直接原因）。
+
+        清洗逻辑修好后新写入的键自然是干净的，但**旧键不会自己消失**——它们是
+        纯内存 LRU，只有在进程重启或该会话累积到 30 条淘汰时才可能被挤掉。故
+        提供这个入口让用户主动清一次；跨会话扫描是因为脏键分散在各群/各用户下，
+        而它属于同一类污染、应一次性清干净。
+
+        顺带修好：`forget` 删除键后若该会话已空，一并回收该会话条目，避免
+        长期运行下 `_history` 沉淀大量空 OrderedDict。
+        """
+        removed = 0
+        empty_sessions: list[str] = []
+        for session_key, history in self._history.items():
+            doomed = [name for name in history if matcher(name)]
+            for name in doomed:
+                del history[name]
+                removed += 1
+            if not history:
+                empty_sessions.append(session_key)
+        for session_key in empty_sessions:
+            self._history.pop(session_key, None)
+        return removed

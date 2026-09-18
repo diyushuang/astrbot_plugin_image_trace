@@ -68,6 +68,29 @@ THUMBNAIL_DIR = "thumbnails"
 # 所以清洗只能做「去掉时间戳前缀」这一步，`@` 只能靠 URL 里的原图直链取回。
 THUMBNAIL_PREFIX_PATTERN = re.compile(r"^\d{10,}_")
 
+# 本插件自己给配文加的表情前缀（`🖼️ 名字`、`🎬 名字`、`{n}. 名字`）。
+# 之所以要剥离：配文会被下游（引用消息回的、转发回图片的）重新当作「文件名」
+# 解析回来，前缀一旦进到解析入口就会被当成名字的一部分去拼 URL。
+# 反例（线上实测，报错回显的直链里带着 `%F0%9F%96%BC%EF%B8%8F%20`）：
+#   /原图 的引用图分支取到文件名 `🖼️ 【抖音@赵今麦工作室】…【live】.jpeg`
+#   → build_imgbed_file_url 拼出 /file/🖼️%20【抖音…】  → 必然 404
+# 注意这是个**循环**：越清洗不掉，越会把带前缀的名字记回历史、再被解析一次。
+#
+# 形态用**显式白名单**而不用 Unicode 区间：实测区间写法（`[\u2000-\u3300…]`）
+# 过于贪婪，会把 `【`(U+3010)、`】`(U+3011) 这类中文标点一并吃掉，
+# 把 `【微博@X】a.jpg` 削成 `微博@X】a.jpg`——反而破坏了合法文件名。
+# 故只列插件真正会生成的两个图标；要加新图标就往这里补一个字符。
+DECORATION_ICON_PATTERN = re.compile(r"^(?:🖼️|🖼|🎬|📷|🎞️|🖼\ufe0f)+\s*")
+
+# 消息段序号前缀（多图回传时由 main 的 block["prefix"] 加上的 `1.` / `12、`），
+# 与表情前缀同理：它属于排版信息，不属于文件名。
+#
+# 分隔符**必须**是 `.` 或 `、` 且其后紧跟空白（或紧邻下一个前缀），
+# 否则会误伤「文件名本身以数字编号开头」的合法情形：
+#   `1.2米海报.jpg` 的 `1.` 后是 `2`，不满足空白要求 → 不剥（正确）
+#   `1. 图.jpg`     的 `1.` 后是空格     → 剥（正确）
+LIST_INDEX_PREFIX_PATTERN = re.compile(r"^\d{1,3}[.、]\s+")
+
 HttpGetter = Callable[[], Awaitable[GuardedHttpClient]]
 
 
@@ -283,15 +306,75 @@ def strip_thumbnail_prefix(name) -> str:
     return THUMBNAIL_PREFIX_PATTERN.sub("", text)
 
 
+def strip_decoration_prefix(name) -> str:
+    """去掉名字前的排版装饰：表情图标与序号（`🖼️ `、`🎬 `、`1. `）。
+
+    这两类前缀都不是文件名的一部分，而是本插件（`🖼️ {name}（原图）`、
+    `_random_caption` 的 icon、多图回传的 `block["prefix"]`）为了可读性加上去的。
+    它们之所以必须在这里剥掉，是因为配文会绕一圈再回到解析入口：
+
+        发图（配文带 `🖼️ `）→ 用户引用那条消息发 /原图
+        → 引用段里取到的名字**自带前缀**
+        → 拼 URL 时前缀被编码进路径 → 必然 404
+
+    实测报错的直链里就带着这串编码：`%F0%9F%96%BC%EF%B8%8F%20`（即 `🖼️ `）。
+    不剥就是死循环：名字带前缀 → 查不到 → 提示文案里再复述一遍前缀。
+
+    **循环剥**：前缀可能叠着出现（`1. 🖼️ 名字`、`🖼️ 1. 名字`），且序号可能
+    夹在图标之间，故反复剥直到不再变化。
+
+    安全闸：只在「剥完之后剩下的部分**看起来仍是个完整文件名**」时才认这一刀，
+    判据两条同时成立：
+      1. 剩余内容里有 `.`（像个扩展名）
+      2. `.` 之前还有**主名**（不能只剩扩展名）
+    这样：
+      `🖼️ 图.jpg`  → `图.jpg`      ✔ 主名 `图` 还在
+      `🖼️.jpg`     → 原样保留       ✔ 剥完只剩 `.jpg`，主名为空，拒绝
+      `🎬 视频.mp4` → `视频.mp4`     ✔
+      `🖼️ 【抖音】…jpeg` → `【抖音】…jpeg` ✔
+    单靠「剩余非空」不够——剥成 `.jpg` 这种残骸比不剥更糟，它会让解析拿到
+    一个没有主名的名字。不碰中文标点：只认显式白名单里的图标字符。
+    """
+    text = str(name or "")
+    while True:
+        for pattern in (DECORATION_ICON_PATTERN, LIST_INDEX_PREFIX_PATTERN):
+            candidate = pattern.sub("", text, count=1)
+            if candidate == text or not candidate.strip():
+                continue
+            if not _looks_like_filename(candidate):
+                continue
+            text = candidate
+            break
+        else:
+            break
+    return text.strip()
+
+
+def _looks_like_filename(text: str) -> bool:
+    """带扩展名且 `.` 前有主名——用于判定「剥前缀后没把名字削成残骸」。"""
+    body = str(text or "").strip()
+    if "." not in body:
+        return False
+    return bool(body.rsplit(".", 1)[0].strip())
+
+
 def clean_display_name(url_or_name) -> str | None:
-    """把缩略图直链/改名后的文件名，转成适合展示给用户的干净文件名。
+    """把缩略图直链/改名后的文件名，转成适合展示与直查的干净文件名。
 
-    缩略图名形如 `1789658616018_【微博_赵今麦工作室official】….jpg`——前缀是无意义
-    的毫秒时间戳，展示给用户纯属噪声；`@` 还被换成了 `_`。本函数只做「去时间戳
-    前缀」这一步确定的清洗，返回可供展示的名字。
+    清洗由三层组成，**顺序不可换**：
 
-    传入普通原图文件名/直链时**不改变内容**（无前缀可剥），因此可以无条件对任何
-    名字调用。取不到合法文件名时返回 None，由调用方决定回退文案。
+    1. **解析出文件名**（`media_filename`，取 URL 末段并 unquote）。
+    2. **剥装饰前缀**（`strip_decoration_prefix`）：`🖼️ ` / `🎬 ` / `1. `，
+       循环剥以覆盖叠加形态。
+    3. **剥时间戳前缀**（`strip_thumbnail_prefix`）：`1789658616018_`。
+
+    第 2 步是 1.6.1 新增的关键修复：此前只做第 3 步，于是「配文里带 `🖼️ ` 的
+    名字」被当作合法文件名原样通过、拼进 URL 后必然 404（线上报的 `图床里没有
+    找到「🖼️ 【抖音@…】…jpeg」` 就是它）。`🖼️ ` 一旦没被剥掉，这个函数就
+    失去意义——它本就是名字流转回解析入口的**唯一**清洗点。
+
+    传入普通原图文件名/直链时**不改变内容**（无任何前缀可剥），因此可以无条件
+    对任何名字调用。取不到合法文件名时返回 None，由调用方决定回退文案。
     """
     if not url_or_name:
         return None
@@ -302,7 +385,8 @@ def clean_display_name(url_or_name) -> str | None:
         name = raw if "." in raw.rsplit("/", 1)[-1] else None
     if not name:
         return None
-    return strip_thumbnail_prefix(name) or None
+    cleaned = strip_thumbnail_prefix(strip_decoration_prefix(name))
+    return cleaned or None
 
 
 def media_kind(url, hint=None) -> str | None:

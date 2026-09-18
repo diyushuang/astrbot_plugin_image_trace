@@ -2178,6 +2178,7 @@ class ImageTracePlugin(Star):
             "· /随机视频 [目录] —— 从图床随机取一个视频并回传\n"
             "· /原图 [文件名] —— 取原图：带文件名时直接到图床按名取（无需先回传），"
             "不带文件名取本会话最近回传的原图\n"
+            "· /原图修复 —— 清理会话历史里带配文前缀（🖼️ / 🎬 / 序号）的旧记录\n"
             "· /溯源帮助 —— 显示本说明\n"
             "检索引擎：auto=向量优先（未命中/不可用自动回退哈希）；hash/vector 可在插件配置 search_engine 切换。\n"
             "提示：哈希阈值、向量阈值与模型、图床接口、随机图接口等均可在 WebUI 插件配置中调整。"
@@ -2371,6 +2372,59 @@ class ImageTracePlugin(Star):
             return "", "", f"图床里没有找到「{name}」，已尝试：{candidate}"
         return name, candidate, ""
 
+    @filter.command("原图修复")
+    async def original_repair(self, event: AstrMessageEvent):
+        """清理会话历史里带配文前缀/装饰的脏键（1.6.1 前的旧数据）。
+
+        为什么需要这个命令：1.6.1 之前 `_remember_blocks` 会把配文前缀
+        （`🖼️ `、`🎬 `、多图的 `1. `）连同文件名一起登记进历史。于是
+
+            引用那条带前缀的消息发 /原图 → 历史/引用图里取到的名字自带前缀
+            → 拼成 /file/🖼️%20【…】 → 必然 404
+            → 提示文案里再复述一遍带前缀的名字，用户完全看不出问题在哪儿
+
+        清洗逻辑现在已修（见 random_media.clean_display_name），**新写入的键是
+        干净的**；但旧键是纯内存 LRU，不会自己消失——只在进程重启或该会话累积
+        到上限被淘汰时才可能挤掉。故给一个显式入口。
+
+        只管历史，**不动图床**：前缀从来不是图床里的真实文件，脏的只是本地键。
+        """
+        cleaned = self._repair_history_keys()
+        if not cleaned:
+            yield event.plain_result(
+                "✅ 会话历史里没有带前缀的脏记录，无需修复。\n"
+                "（前台提示文案本插件从不写入文件，无需清理）"
+            )
+            return
+        logger.info(f"/原图修复 清理了 {cleaned} 条带前缀的会话历史键")
+        yield event.plain_result(
+            f"✅ 已清理 {cleaned} 条带前缀的会话历史记录。\n"
+            "现在可以重新「引用那张图 + /原图」取原图了；"
+            "若仍取不到，再引用一次 /随机图 刚发出的图重试。"
+        )
+
+    def _repair_history_keys(self) -> int:
+        """把会话历史里带装饰前缀的键改名成干净形态；返回处理条数。
+
+        做的是**改名而非删除**：URL 是好的，脏的只是键。直接删会让用户白白
+        丢掉一条本来可用的历史，改名则让它立刻变成可命中的干净键。
+        新旧键只差前缀时用 `remember` 重写（它自带去重与 LRU 归位）；若该键
+        已被清理过（改名后与既有键重合），`remember` 的「先删后插」正好完成合并。
+        """
+        history = getattr(self.history, "_history", None)
+        if not isinstance(history, dict):
+            return 0
+        dirty: list[tuple[str, str, str]] = []
+        for session_key, entries in list(history.items()):
+            for key, url in list(entries.items()):
+                cleaned = clean_display_name(key)
+                if cleaned and cleaned != key:
+                    dirty.append((session_key, key, url))
+        for session_key, key, url in dirty:
+            self.history.forget(lambda name, _k=key: name == _k)
+            self.history.remember(session_key, url, display_name=clean_display_name(key))
+        return len(dirty)
+
     @filter.command("原图")
     async def original_image(self, event: AstrMessageEvent):
         """重发最近回传过的图片的原图；也可直接按文件名到图床取（/原图 风景.jpg）"""
@@ -2389,6 +2443,15 @@ class ImageTracePlugin(Star):
                 return
             if status == "found":
                 name, url = payload
+            else:
+                # 历史没命中时 query 会退化成**直查图床的文件名**，此时它可能
+                # 自带装饰前缀——最常见的是用户从配文里复制粘贴（配文是
+                # `🖼️ 名字`，复制过来就带了 `🖼️ `）。不清洗就会拼出
+                # `/file/🖼️%20名字` 而必然 404。命中历史的分支无需清洗：
+                # 历史键本就是干净文件名（1.6.1 起写入时即已清洗）。
+                cleaned = clean_display_name(query)
+                if cleaned:
+                    query = cleaned
         else:
             latest = self.history.latest(session)
             if latest is not None:
