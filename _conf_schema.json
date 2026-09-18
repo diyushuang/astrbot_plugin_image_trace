@@ -185,6 +185,15 @@
           "advanced_settings": true
         },
         "hint": "仅本地压缩与回退路径生效。WebP 在平滑内容上通常比同质量 JPEG 小 25%~60%，但编码耗时高一个量级（实测 1920 长边约 0.2~0.5 秒/张），且内容噪声极多时反而可能更大（此时会自动回退原字节），CPU 较弱的机器不建议开启；动图仍原样发送。"
+      },
+      "onebot_image_timeout": {
+        "description": "【选填】OneBot 图片段的下载超时（秒）",
+        "type": "int",
+        "default": 60,
+        "condition": {
+          "advanced_settings": true
+        },
+        "hint": "写入每个 image 段的 timeout 字段，即协议端（NapCat 等）下载网络图片的超时窗口。若日志报 sendMsg 超时（retcode 1200，结果未知因而不重发），说明协议端等待客户端回调的窗口被耗尽，多图或大图时更易触发。可适当调大本值，减少大图下载慢导致的回执超时；base64 段不经下载，带该字段无副作用。建议范围 10~300。"
       }
     }
   },
@@ -540,6 +549,12 @@
         "type": "bool",
         "default": true,
         "hint": "是否允许 LLM 通过 sendRandomMedia 工具请求随机图；关闭后仅可用 /随机图、/随机视频 命令，工具调用会提示已禁用。"
+      },
+      "send_thumbnail": {
+        "description": "【选填】随机图发送缩略图",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后 /随机图 先按图床取原图、再把它换成同一点的缩略图直链发出（文件小、协议端下载快、sendMsg 回执超时概率低），会话历史仍记录原图，故 /原图 仍返回全尺寸。缩略图由 img-indexer 预生成并写在 Qdrant 同一张图的 thumb_url 上；查不到替身时自动按原图发送。关闭则始终发原图。"
       }
     }
   },

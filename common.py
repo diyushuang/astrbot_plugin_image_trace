@@ -43,6 +43,13 @@ COMPRESS_CONCURRENCY = 3
 # 回退下载优先走内存的上限（字节）：超过则落盘，避免多张大图并发时内存峰值过高。
 MEMORY_DOWNLOAD_MAX_BYTES = 8 * 1024 * 1024
 
+# OneBot image 段的 timeout 字段（秒）：URL 段由协议端（NapCat 等）自行下载，
+# 该值即协议端下载网络图片的超时。OneBot v11 规范里此参数默认「不超时」，但
+# NapCat 实际另有 sendMsg 内部回调窗口；大图/多图时显式放宽可减少回调超时
+# （表现为 retcode 1200 的 sendMsg Timeout，结果不确定因而不敢重发）。
+# base64 段不经下载，带该字段无副作用。
+ONEBOT_IMAGE_TIMEOUT = 60
+
 # 临时文件最长保留时间（秒），超过后在插件加载/卸载时清理
 TMP_MAX_AGE_SECONDS = 86400
 

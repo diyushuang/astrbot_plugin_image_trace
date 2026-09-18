@@ -5,7 +5,7 @@
 
 **群聊里随手转发的一张图，一键找回它的原图。**
 
-[![version](https://img.shields.io/badge/version-1.5.5-blue?style=flat-square)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.5.8-blue?style=flat-square)](./CHANGELOG.md)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4?style=flat-square)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat-square)](./LICENSE)
@@ -42,7 +42,7 @@ _An AstrBot plugin that traces a reposted, compressed or cropped image back to i
 | 🧠 **向量引擎**（可选） | 多模态向量 AI（OpenAI 兼容 `/v1/embeddings`）+ Qdrant 检索，对压缩、缩放、裁剪、水印比哈希更鲁棒 |
 | 🧮 **哈希引擎**（可离线） | pHash / dHash / aHash，纯 Pillow + numpy 实现，无需 GPU，数万张图毫秒级比对 |
 | ⚡ **URL 直传** | QQ `aiocqhttp` 经 OneBot 原生接口直传图床 URL（避免适配器转 base64），失败自动回退本地压缩 |
-| 🧩 **一次一条** | 向量命中的多张相似图合并为**一条**消息，图文交替排列，每张图的配文紧贴它自己 |
+| 🧩 **一次一条** | 向量命中的多张相似图合并为**一条**消息，配文集中在开头（带 `1.`/`2.` 序号）、图片连续排在末尾，避免 QQ 把图片裁成正方形缩略图 |
 | 🗂️ **多种存储** | 图床副本 / 通用 HTTP 图床（Lsky Pro、EasyImages、Chevereto…）/ CloudFlare-ImgBed / Cloudflare R2 / 甲骨文 OCI |
 | 🎲 **随机图** | `/随机图`、`/随机视频` 从图床随机接口取图回传，并可被 LLM 工具 `sendRandomMedia` 调用 |
 | 🖼️ **`/原图` 直取** | 从会话历史找回原图，或按文件名直接到图床取；均为原图 URL 直传，不下载、不本地中转 |
@@ -161,12 +161,14 @@ flowchart LR
 | `max_download_mb` | `20` | 单张图片大小上限（MB） |
 | `image_delivery.target_kb` | `0` | 本地压缩的目标体积上限（KB，0=不限制）。非 0 时启用质量阶梯 |
 | `image_delivery.webp` | `false` | 本地压缩改用 WebP 输出（体积更小，编码更慢；噪声极多的图可能反而更大，此时自动回退原字节） |
+| `image_delivery.onebot_image_timeout` | `60` | OneBot 图片段的 `timeout`（秒），即协议端下载网络图片的窗口。日志报 `sendMsg` 超时（retcode 1200）时可调大；范围 10~300 |
 | `image_delivery.scaled_url_style` | `query` | 仅 `scaled-url` 模式生效。`query`=查询参数式（兼容任何部署，但 QQ 协议端下载时可能剥离参数收到原图）；`cf-path`=Cloudflare Image Resizing 路径式（参数嵌在路径里剥不掉、必为压缩后流量，但要求图床域名经 Cloudflare 代理且开启 Image Resizing） |
 | `random_media.api_endpoint` | `/random` | 随机图接口相对路径（不能填完整 URL） |
 | `random_media.api_token` | - | 随机图接口 Token（`Authorization: Bearer`）；配置 Token 时图床地址必须为 `https` |
-| `random_media.default_dir` | - | 未指定目录时使用的默认目录（如 `风景/2026`），留空从根目录取图 |
+| `random_media.default_dir` | - | 未指定目录时使用的默认目录（如 `风景/2026`），留空从根目录取图。支持用 `,` 给出**目录池**（如 `风景,人像,日常`），此时每次请求随机取其一——图床的 `dir` 只收单值，池用于「不指定目录时尽量覆盖整库」 |
 | `random_media.timeout` / `retry_count` | `10` / `3` | 单次请求超时（秒）/ 失败重试次数（指数退避，403 不重试） |
 | `random_media.show_file_info` / `enable_llm` | `true` / `true` | 回传时是否附带文件名 / 是否允许 LLM 工具调用 |
+| `random_media.send_thumbnail` | `true` | `/随机图` 发送缩略图替身：按图床取原图后，再按原图 id 查它同一点的 `thumb_url` 发出（小文件、协议端下载快）。会话历史仍记原图，故 `/原图` 仍返回全尺寸；查不到替身时自动发原图 |
 | `advanced_settings` | `false` | 面板收纳开关 |
 | `vector_search.advanced` | `false` | 面板收纳开关：开启后才显示向量引擎的进阶项 |
 
@@ -185,7 +187,8 @@ flowchart LR
 
 **回传链路的效率设计**：
 
-- **单次发送保证**：OneBot 直发结果分「已送达 / 明确失败 / 结果未知」三态，只有明确失败才允许换通道回退；超时属「结果未知」（消息很可能已送达），一律不重发，并按事件打去重标记，杜绝同一张图发两遍。
+- **文字在上、图片在下是必须的**：QQ 会把「text 段 + 紧邻其后的 image 段」合并渲染成图文混排卡片，卡片内图片按行内插图裁成**正方形缩略图**，与图片实际宽高比无关；连续多个 image 段才按普通大图渲染、保留宽高比。因此多图回传一律「文字集中成一段（含 `1.`/`2.` 序号）→ 图片连续排在末尾」，序号负责维持文字与图片的对应关系。
+- **单次发送保证**：OneBot 直发结果分「已送达 / 明确失败 / 结果未知」三态，只有明确失败才允许换通道回退；超时属「结果未知」（消息很可能已送达），一律不重发，并按事件打去重标记，杜绝同一张图发两遍。日志不再只写「结果未知」，而是按成因给结论（超时 / 连接不可用 / 协议端拒绝 / 未分类）与排查方向；三态判定与回退决策不受日志影响。
 - **混合载荷（local-compress）**：已知小图（向量 `payload.size_bytes` / 图库 `file_size` 记录的体积 ≤200KB 且协议端能解析宽高）跳过下载、直发 URL 段省一次往返；其余下载压缩后内联 base64，压缩结果不经协议端二次下载；未压缩且超 8MB 的巨型动图退回 URL 段，避免单条消息过大。
 - **local-compress 零探测**：本地压缩不依赖图床缩放能力，整条链路不向图床发任何探测请求（`scaled-url` 才需要探测原图/缩放版体积来判定压缩证据）。
 - **探测开销最小化（scaled-url / original-url）**：所有探测并发执行（上限 4）且受 8 秒总预算约束，超预算按「说不准」处理；探测用独立的 5 秒超时；命中条目自带原图体积时只探缩放版一次；图床明确拒绝缩放请求（405 / 501 / 400）后 600 秒内不再探测。
@@ -464,6 +467,69 @@ v1.5.3 起已通过 `pillow-heif` 支持 HEIC/HEIF。若日志出现「检测到
 它会按 `{图床地址}/file/{文件名}` 直接探测。先确认名字与图床里的实际文件名一致（含上传目录时写成 `/原图 2026/09/abc.jpg`）；若图床不是 CloudFlare-ImgBed，或文件放在自定义目录，请改用 `/溯源` 命中后再发 `/原图`。
 
 只有 HTTP **404 / 410** 才判「确定不存在」；**403**（防盗链/访问规则）、**429**（限流）等只说明这次没读到，此时插件照常把直链发出去，不会误报找不到。
+
+</details>
+
+<details>
+<summary><b>回传的多张图里，有的被显示成正方形缩略图？</b></summary>
+
+这是 QQ 客户端的渲染分组行为，v1.5.7 起已规避。
+
+QQ 会把「text 段 + 紧邻其后的 image 段」合并成图文混排卡片，卡片内的图片按**行内富文本插图**处理，一律裁成正方形缩略图——与图片实际宽高比无关。所以旧版「配文紧贴自己那张图」的排列，会让除最后一张外的图都被裁方。
+
+v1.5.7 起改为「文字集中 → 图片集中」：标题与全部配文合成**一个** text 段放在最前（配文带 `1.`/`2.`/`3.` 序号，顺序即对应关系），所有 image 段连续排在末尾。连续 image 段按普通大图渲染，宽高比正常。
+
+若升级后仍见正方形缩略图，请核对实际运行版本：`/溯源状态` 或插件管理页的版本号应为 `1.5.7` 及以上。
+
+</details>
+
+<details>
+<summary><b>随机图发出来的图好像变小了？缩略图是从哪来的？</b></summary>
+
+不是图坏了——v1.5.8 起 `/随机图` **有意发送缩略图替身**，用来降低 `sendMsg` 回执超时：小文件协议端下载快，回执窗口更不容易耗尽。
+
+缩略图由 **img-indexer** 在图床侧预生成（默认长边 720、JPEG q72），上传回图床的 `thumbnails/` 目录，并把直链写在 Qdrant **同一个点**的 `thumb_url` 字段上：
+
+```jsonc
+// Qdrant 上的一个点：id = UUID5(原图 id)
+{
+  "image_url": "http://bed/file/12、日常分享/…/xxx.jpg",          // 原图（向量就是它算的）
+  "thumb_url": "http://bed/file/thumbnails/1789658616018_xxx.jpg" // 缩略图（发送用替身）
+}
+```
+
+原图与缩略图的对应**只靠这个「同一个点」**，既不需要映射表，也无法靠文件名——图床给缩略图改过名（加时间戳前缀、`@` 换成 `_` 并移入 `thumbnails/`）。
+
+三点保证：
+
+1. **`/原图` 仍给全尺寸**：随机图发送时走「发替身、记原图」，会话历史里存的是原图直链，所以 `/原图` 拿回的是原图而不是那张 720px 小图；
+2. **查不到替身就发原图**：点没有 `thumb_url`（如尚未生成缩略图的旧图）、或向量引擎未配置/不可达时，自动退回原图，不影响可用性；
+3. **可关闭**：把 `random_media.send_thumbnail` 设为 `false`，`/随机图` 就始终发原图。
+
+</details>
+
+<details>
+<summary><b>日志报 <code>sendMsg</code> 超时（retcode 1200）是插件的问题吗？</b></summary>
+
+不是插件缺陷，且**消息很可能已经发出去了**。
+
+超时发生在 QQNT 客户端内部：NapCat 调用 `NodeIKernelMsgService/sendMsg` 后，需要等 `NodeIKernelMsgListener/onMsgInfoListUpdate` 回调——图片消息还要客户端先把图上传到 QQ 服务器才会回调。一次发的图多、或单图体积大时，这个窗口会被耗尽，于是抛出 `Timeout`，被包成 `retcode=1200` 的 `ActionFailed`。
+
+因此插件把它归为「结果未知」（不是「失败」）：**不重发**、不换通道回退，否则同一张图会发两遍。v1.5.7 起日志按成因给结论，例如：
+
+```text
+OneBot 图片直发（send_group_msg，4 张）：发送未确认：协议端 sendMsg 等待客户端回调超时
+（图片已上传但回执超时，通常是图片较大或一次发送多张所致，非插件缺陷），已按「不重发」处理
+以免重复发图；retcode=1200。若频繁出现：升级 NapCat 至 4.7.8+ 并重启 QQ，
+或调小 image_delivery.max_side / 开启 target_kb 降低单图体积
+```
+
+排查与缓解（按性价比排序）：
+
+1. **确认收到没收到**：超时≠失败，先看群里图有没有到；
+2. **降低单图体积**：调小 `image_delivery.max_side`，或开启 `target_kb` 目标体积压缩；
+3. **升级协议端**：NapCat 升级到 4.7.8+（配套 QQNT 33139+），重启 QQ 进程；社区另有清理 moehoo 目录、把 `o3HookMode` 调为 `0` 的处置；
+4. **`timeout` 字段已放宽**：v1.5.7 起每个 image 段携带 `timeout=60`（协议端下载网络图片的窗口），减少大图下载慢导致的回执超时。
 
 </details>
 

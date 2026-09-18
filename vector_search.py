@@ -520,6 +520,44 @@ class VectorEngine:
                 return 0
             raise
 
+    async def thumb_url_for(self, file_id: str) -> str | None:
+        """取该原图对应点上的缩略图直链（payload.thumb_url）；没有则为 None。
+
+        「一图一向量一替身」：点 id = UUID5(NAMESPACE_URL, 原图 id)，同一张原图的
+        `image_url`（原图）与 `thumb_url`（缩略图）落在**同一个点**上。所以「原图 →
+        缩略图」只需按 id 取点，既不需要映射表，也不能靠文件名——图床给缩略图改过
+        名（加时间戳前缀、`@` 换 `_` 并移入 thumbnails/ 目录）。
+
+        本方法**永不抛错**：缩略图只是提速手段，取不到就由调用方照常发原图，
+        绝不能因为查不到替身而让发送失败。
+        """
+        key = str(file_id or "").strip()
+        if not key or not self.enabled:
+            return None
+        try:
+            obj = await self._request_json(
+                "POST",
+                self._points_url(),
+                json_body={
+                    "ids": [self.point_id_for(key)],
+                    "with_payload": True,
+                    "with_vector": False,
+                },
+                headers=self._qd_headers(),
+            )
+        except Exception as exc:  # 网络/鉴权/集合缺失一律视为「没有替身」
+            logger.debug(f"查询缩略图失败（按无替身处理）{key}: {exc}")
+            return None
+        result = obj.get("result")
+        if not isinstance(result, list) or not result:
+            return None
+        first = result[0]
+        payload = first.get("payload") if isinstance(first, dict) else None
+        if not isinstance(payload, dict):
+            return None
+        thumb = str(payload.get("thumb_url") or "").strip()
+        return thumb or None
+
     # ------------------------------------------------------------------
     # 登记原图时同步入向量库（图床无服务器侧钩子时的兜底通道）
     # ------------------------------------------------------------------

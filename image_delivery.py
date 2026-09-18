@@ -170,6 +170,9 @@ def classify_send_error(exc: BaseException) -> SendOutcome:
     压过类型名。retcode 只在非 0 时才当作失败——OneBot 里 0 表示成功，异常却带着
     成功码时说明状态不明，宁可判 UNKNOWN 也不再重发；比较前按字符串归一化，
     让 0 与 "0" 一视同仁，避免字符串码被误当成失败而触发重发。
+
+    判定结果只有三态，不接受「差不多算失败」的模糊档：这是防「同一张图发两遍」
+    的闸门，宁可少发也不可多发。想区分超时的具体成因请用 describe_send_error。
     """
     if isinstance(exc, _TIMEOUT_ERRORS):
         return SendOutcome.UNKNOWN
@@ -184,6 +187,79 @@ def classify_send_error(exc: BaseException) -> SendOutcome:
     if any(hint in message for hint in _UNCONNECTED_HINTS):
         return SendOutcome.FAILED
     return SendOutcome.UNKNOWN
+
+
+# 发送结果的可诊断细分。三态（SENT/FAILED/UNKNOWN）决定「要不要回退」，这个细分
+# 只决定「日志怎么讲」。分开的理由：UNKNOWN 是最容易被误读成「什么都没发生」的
+# 一档，而它其实意味着「请求已发出、只是没拿到回执」——把这个信息、成因与对应的
+# 处置写清楚，日志才有排障价值，而不是留一句「未知」让人无从下手。
+SEND_REASON_SENT = "sent"
+SEND_REASON_TIMEOUT = "timeout"
+SEND_REASON_PROTOCOL_REJECT = "protocol-reject"
+SEND_REASON_DISCONNECTED = "disconnected"
+SEND_REASON_UNCLASSIFIED = "unclassified"
+
+
+def send_outcome_reason(exc: BaseException | None) -> str:
+    """给出发送异常的具体成因档位（仅用于日志与诊断展示）。
+
+    与 classify_send_error 共用同一套线索，但**不参与回退决策**，因此可以比
+    三态更细：超时再按「带 retcode 的协议端回调超时」与「纯超时」分开，前者多
+    见于 NapCat 的 sendMsg 回调窗口耗尽，后者是网络栈层面的超时。
+    """
+    if exc is None:
+        return SEND_REASON_SENT
+    message = _error_text(exc)
+    retcode = getattr(exc, "retcode", None)
+    if isinstance(exc, _TIMEOUT_ERRORS):
+        return SEND_REASON_TIMEOUT
+    if any(hint in message for hint in _TIMEOUT_HINTS):
+        return SEND_REASON_TIMEOUT
+    # 未连接线索排在类名之前：`ActionFailed("not connected")` 这类异常类名看着
+    # 像协议端拒绝，语义其实是「连接没建起来」，两者排查方向完全不同。
+    if any(hint in message for hint in _UNCONNECTED_HINTS):
+        return SEND_REASON_DISCONNECTED
+    if type(exc).__name__ in _DEFINITE_FAILURE_NAMES:
+        return SEND_REASON_PROTOCOL_REJECT
+    if retcode is not None and str(retcode).strip() != "0":
+        return SEND_REASON_PROTOCOL_REJECT
+    return SEND_REASON_UNCLASSIFIED
+
+
+def send_diagnosis(exc: BaseException) -> str:
+    """给出发送异常的一句话结论（含成因与建议动作），供日志直接输出。
+
+    目的：把「结果未知」变成一条**有结论的日志**——讲清「请求已发出、未拿到
+    回执、因此按不重发处理」，再附上成因与可操作的排查方向。超时这一档在此处
+    是**正常且预期**的现象（大图 + 多图 + 协议端自行下载时最容易触发），不是
+    插件缺陷，所以要明确写出来，避免每次都被误当成故障上报。
+    """
+    reason = send_outcome_reason(exc)
+    message = _error_text(exc)
+    retcode = getattr(exc, "retcode", None)
+    detail = f"retcode={retcode}" if retcode is not None else "无 retcode"
+    if reason == SEND_REASON_TIMEOUT:
+        if any(hint in message for hint in _TIMEOUT_HINTS) and "sendmsg" in message.replace(" ", ""):
+            # NapCat 的 sendMsg 等待 QQNT onMsgInfoListUpdate 回调超时：图片消息
+            # 需要客户端把图上传到 QQ 服务器后才回调，图越大/越多越容易超窗口
+            return (
+                "发送未确认：协议端 sendMsg 等待客户端回调超时（图片已上传但回执超时，"
+                "通常是图片较大或一次发送多张所致，非插件缺陷），已按「不重发」处理以免重复发图；"
+                f"{detail}。若频繁出现：升级 NapCat 至 4.7.8+ 并重启 QQ，"
+                "或调小 image_delivery.max_side / 开启 target_kb 降低单图体积"
+            )
+        return (
+            "发送未确认：请求已发出但等待响应超时，已按「不重发」处理以免重复发图；"
+            f"{detail}。若频繁出现请检查与协议端之间的网络与协议端负载"
+        )
+    if reason == SEND_REASON_DISCONNECTED:
+        return f"发送失败：与协议端的连接不可用，已改走回退通道；{detail}"
+    if reason == SEND_REASON_PROTOCOL_REJECT:
+        return f"发送失败：协议端明确拒绝，已改走回退通道；{detail}"
+    return (
+        "发送未确认：异常未匹配到已知成因，保守按「不重发」处理以免重复发图；"
+        f"{type(exc).__name__}; {detail}"
+    )
 
 
 _CF_IMAGE_PREFIX = "/cdn-cgi/image/"

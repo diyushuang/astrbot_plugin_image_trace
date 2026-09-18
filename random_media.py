@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import re
 from collections.abc import Awaitable, Callable
 from urllib.parse import unquote, urlencode, urljoin, urlsplit
@@ -64,6 +65,35 @@ class RandomMediaError(Exception):
 def _is_media_content_type(header: str) -> bool:
     """响应头是否表明直接返回了媒体（image/* 或 video/*）。"""
     return str(header or "").split(";", 1)[0].strip().lower().startswith(("image/", "video/"))
+
+
+def parse_directory_pool(raw) -> list[str]:
+    """把 default_dir 配置解析为目录池（去掉空项与首尾空白）。
+
+    单个目录是最常见的写法；用 `,` 可给出一个池，请求时随机取其一。之所以需要
+    池：图床的 /random 只接受**单一** dir 参数，而一旦图床设置了
+    `randomImageAPI.allowedDir`，不带 dir 的裸请求会被判「目录不允许」而 403，
+    因此「不指定目录时随机整库」无法用一次请求表达，只能由客户端在一次请求里
+    挑一个目录来逼近。
+    """
+    if raw is None:
+        return []
+    text = raw if isinstance(raw, str) else ",".join(str(item) for item in raw)
+    return [part.strip() for part in text.split(",") if part.strip()]
+
+
+def pick_default_directory(settings: dict, *, choice=None) -> str:
+    """未指定目录时从 default_dir 池中挑一个；池为空返回空串。
+
+    只挑一个而不是全部：/random 的 dir 参数是单值。choice 用于注入确定性选择
+    （下标函数），便于测试。
+    """
+    pool = parse_directory_pool((settings or {}).get("default_dir"))
+    if not pool:
+        return ""
+    if choice is None:
+        return random.choice(pool)
+    return pool[choice(len(pool))]
 
 
 def build_random_api_url(base_url, endpoint, *, directory, content_type) -> str:
@@ -273,6 +303,9 @@ class RandomMediaClient:
 
     async def fetch(self, directory=None, content_type=None) -> str:
         """请求一条随机媒体直链；失败抛 RandomMediaError。"""
+        # 单独留一份本次实际发出的目录，供 403 诊断定位（build_random_api_url 会
+        # 把它编码进查询串，反解回来只为了日志/提示可读）
+        api_dir = str(directory or "").strip()
         api_url = build_random_api_url(
             self.settings.get("base_url"),
             self.settings.get("api_endpoint"),
@@ -303,10 +336,31 @@ class RandomMediaClient:
                     "GET", api_url, prepare=prepare, timeout=timeout
                 ) as resp:
                     if resp.status == 403:
-                        logger.warning("随机图接口返回 403：图床站点可能未开启随机图功能")
-                        raise RandomMediaError(
-                            "图床返回 403：站点可能未开启随机图功能，请先在图床后台开启后再试"
-                        )
+                        # 403 有两种成因，提示必须能区分，否则用户会照着错的方向修：
+                        # ①图床没开随机图功能；②目录不在图床的 allowedDir 白名单里
+                        # （CloudFlare-ImgBed 只回 {"error":"Directory not allowed"}）。
+                        detail = ""
+                        try:
+                            detail = (await self._read_body(resp)).strip()
+                        except Exception:  # 读体失败不影响判定，退回通用提示
+                            detail = ""
+                        if "Directory not allowed" in detail:
+                            hint = (
+                                f"图床返回 403：目录「{api_dir or '(未指定)'}」不在图床允许的"
+                                "目录内。请在图床「系统设置→其他设置→随机图 API」的"
+                                "允许目录中加上该目录，或把插件配置 random_media.default_dir "
+                                "改成已允许的目录"
+                            )
+                        elif "Random is disabled" in detail:
+                            hint = (
+                                "图床返回 403：站点未开启随机图功能，"
+                                "请先在图床后台开启后再试"
+                            )
+                        else:
+                            snippet = f"，图床回应：{detail[:120]}" if detail else ""
+                            hint = f"图床返回 403：站点拒绝了本次请求{snippet}"
+                        logger.warning(f"随机图接口返回 403（dir={api_dir or '(未指定)'}）：{detail[:200]}")
+                        raise RandomMediaError(hint)
                     if not 200 <= resp.status < 300:
                         last_error = f"图床返回 HTTP {resp.status}"
                         logger.warning(f"随机图请求失败: {last_error}")

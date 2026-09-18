@@ -21,7 +21,7 @@ import os
 import secrets
 import time
 from collections.abc import AsyncGenerator
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import aiohttp
 import astrbot.api.message_components as Comp
@@ -42,6 +42,7 @@ try:
         DOWNLOAD_CHUNK_SIZE,
         DOWNLOAD_TIMEOUT,
         MEMORY_DOWNLOAD_MAX_BYTES,
+        ONEBOT_IMAGE_TIMEOUT,
         PLAN_TOTAL_TIMEOUT,
         PROBE_CONCURRENCY,
         PROBE_TIMEOUT,
@@ -84,6 +85,7 @@ try:
         prefer_inline_bytes,
         prefer_url_direct,
         prepare_image_bytes,
+        send_diagnosis,
         sniff_image_format,
         upgrade_to_https,
     )
@@ -96,6 +98,7 @@ try:
         extract_directory,
         media_filename,
         media_kind,
+        pick_default_directory,
     )
     from .vector_search import VectorEngine, VectorEngineError
 except ImportError:  # 兼容插件以独立模块方式加载
@@ -105,6 +108,7 @@ except ImportError:  # 兼容插件以独立模块方式加载
         DOWNLOAD_CHUNK_SIZE,
         DOWNLOAD_TIMEOUT,
         MEMORY_DOWNLOAD_MAX_BYTES,
+        ONEBOT_IMAGE_TIMEOUT,
         PLAN_TOTAL_TIMEOUT,
         PROBE_CONCURRENCY,
         PROBE_TIMEOUT,
@@ -147,6 +151,7 @@ except ImportError:  # 兼容插件以独立模块方式加载
         prefer_inline_bytes,
         prefer_url_direct,
         prepare_image_bytes,
+        send_diagnosis,
         sniff_image_format,
         upgrade_to_https,
     )
@@ -159,6 +164,7 @@ except ImportError:  # 兼容插件以独立模块方式加载
         extract_directory,
         media_filename,
         media_kind,
+        pick_default_directory,
     )
     from vector_search import VectorEngine, VectorEngineError  # type: ignore[no-redef]
 
@@ -731,6 +737,17 @@ class ImageTracePlugin(Star):
         raw = self._dict_cfg("image_delivery").get("verify_scaled")
         return True if is_blank(raw) else truthy(raw)
 
+    def _onebot_image_timeout(self) -> int:
+        """image_delivery.onebot_image_timeout：image 段 timeout 字段（秒）。
+
+        该字段是协议端（NapCat 等）下载网络图片的窗口，不是插件的出网超时。
+        未配置或填了非数字时用 common.ONEBOT_IMAGE_TIMEOUT；其余值收敛到
+        [10, 300]——填 0 会落到 10 而不是原样写 0，否则等于告诉协议端「立刻
+        放弃下载」，图片必然拉不到。
+        """
+        raw = self._dict_cfg("image_delivery").get("onebot_image_timeout")
+        return bounded_int(raw, ONEBOT_IMAGE_TIMEOUT, 10, 300)
+
     async def _get_http(self) -> GuardedHttpClient:
         if self._http is None:
             # 连接器启用 IP 钉扎：出网连接只允许落在 url_guard 校验过的地址上
@@ -765,6 +782,9 @@ class ImageTracePlugin(Star):
         与其它配置组同源：数值用 common 的容错解析、布尔用真值表、空串按未
         配置处理。缺 base_url 时不在这里拦截，交由 RandomMediaClient 抛
         RandomMediaError，使“未配置”提示集中在一处。
+
+        default_dir 支持单个目录或用 `,` 分隔的目录池：图床的 /random 只收单一
+        dir，池用于「不指定目录时尽量覆盖整库」——见 pick_default_directory。
         """
         raw = self._dict_cfg("random_media")
         timeout = as_float(raw.get("timeout"), 10.0)
@@ -781,6 +801,7 @@ class ImageTracePlugin(Star):
             "retry_count": bounded_int(raw.get("retry_count"), 3, 0, 10),
             "show_file_info": self._random_bool(raw.get("show_file_info"), True),
             "enable_llm": self._random_bool(raw.get("enable_llm"), True),
+            "send_thumbnail": self._random_bool(raw.get("send_thumbnail"), True),
         }
 
     @staticmethod
@@ -865,10 +886,19 @@ class ImageTracePlugin(Star):
     async def _send_via_onebot(
         self, event: AstrMessageEvent, header: str, blocks: list[dict], payloads: list[str | bytes]
     ) -> SendOutcome:
-        """通过 OneBot 原生接口直发消息，消息段按「标题 →（配文 → 图片）…」交替排列。
+        """通过 OneBot 原生接口直发消息，消息段按「文字集中 → 图片集中」排列。
 
-        每张图的配文紧贴在自己那张图的上方，与标准消息链路径（_yield_delivery
-        末尾）顺序一致，两条发送通道观感相同。
+        文字在前、图片在后是**必须**的，不是排版偏好：QQ 客户端会把
+        「text 段 + 紧邻其后的 image 段」合并渲染成一个图文混排卡片，卡片内的
+        图片按行内富文本插图处理，**一律裁成正方形缩略图**（无论原图多高）。
+        此前按「标题 →（配文 → 图）…」图文交替排列，多图时每一张图都恰好紧跟在
+        一段文字后面，于是几张图全是正方形缩略图；只有排在最后、后面没有更多
+        文字重新分组的那张偶尔能拿到正确尺寸——线上报的「前三张方、第四张正常」
+        就是这个渲染分组的结果。把全部 text 段提到最前、image 段连续排在末尾后，
+        QQ 会把连续图片段按普通大图渲染，宽高比得以保留。
+
+        配文因此不再紧贴各自的图片，改为在配文里前置序号（block["prefix"]，如
+        「1.」「2.」），与图片的先后顺序一一对应，用户仍能分辨哪句配文属于哪张图。
 
         payloads 与 blocks 中的有图 block 同序一一对应，元素为 URL 字符串（原样
         作 data.file）或图片字节（编码为 base64:// 段，压缩结果直达 QQ、不经
@@ -876,26 +906,48 @@ class ImageTracePlugin(Star):
         _send_prompt）已保证数量相等，故这里按遍历到的有图 block 依次取用，
         无需再做长度校验。
 
+        image 段带 OneBot 标准的 `timeout` 字段（秒）：URL 段由协议端自行下载，
+        大图 + 多图时下载耗时会让 NapCat 的 sendMsg 回调窗口吃紧（实测超时形态
+        见 classify_send_error 注释）。显式放宽该窗口可减少「结果未知」。base64
+        段不经下载，带该字段无副作用。
+
         返回三态而非布尔：只有协议端明确回报失败（FAILED）才允许换通道重发。
         超时等 UNKNOWN 情形请求可能已经送达，调用方必须先看返回值再决定是否
         回退，否则同一张图会被发两遍。
         """
-        message = []
+        message: list[dict] = []
         sender_id = event.get_sender_id()
         if sender_id:
             message.append({"type": "at", "data": {"qq": str(sender_id)}})
+
+        # 1) 全部文字段集中在最前：标题一段，随后每张图各一段配文。
+        #    连续 text 段之间不会再插入 image 段，QQ 不会把它们拆成图文卡片。
+        text_lines: list[str] = []
         if header:
-            message.append({"type": "text", "data": {"text": header + "\n"}})
-        pending_payloads = iter(payloads)
+            text_lines.append(header)
         for block in blocks:
             text = str(block.get("text") or "").strip()
             if text:
-                message.append({"type": "text", "data": {"text": text + "\n"}})
-            if block.get("url") or block.get("path"):
-                payload = next(pending_payloads)
-                if isinstance(payload, bytes):
-                    payload = "base64://" + base64.b64encode(payload).decode()
-                message.append({"type": "image", "data": {"file": payload}})
+                text_lines.append(text)
+        if text_lines:
+            # 单段承载全部文字：段数越少，QQ 越不容易按「文字+图」重新分组
+            message.append({"type": "text", "data": {"text": "\n".join(text_lines)}})
+
+        # 2) 全部图片段连续排在末尾：连续 image 段按普通大图渲染，保留宽高比。
+        image_timeout = self._onebot_image_timeout()
+        pending_payloads = iter(payloads)
+        for block in blocks:
+            if not (block.get("url") or block.get("path")):
+                continue
+            payload = next(pending_payloads)
+            if isinstance(payload, bytes):
+                payload = "base64://" + base64.b64encode(payload).decode()
+            message.append(
+                {
+                    "type": "image",
+                    "data": {"file": payload, "timeout": image_timeout},
+                }
+            )
 
         params: dict = {"message": message}
         group_id = event.get_group_id()
@@ -910,20 +962,23 @@ class ImageTracePlugin(Star):
         if self_id:
             params["self_id"] = self_id
 
+        image_count = sum(1 for seg in message if seg["type"] == "image")
         try:
             await event.bot.call_action(action, **params)
         except Exception as exc:
             outcome = classify_send_error(exc)
-            logger.debug(f"OneBot 直发异常分类: {type(exc).__name__} -> {outcome.value}")
-            if outcome is SendOutcome.UNKNOWN:
-                logger.warning(
-                    f"OneBot 直发结果未知（{type(exc).__name__}: {exc}）：消息可能已送达，"
-                    "为避免同一张图重复发送，本次不再走任何回退"
-                )
-            else:
-                logger.warning(f"OneBot 图片直发失败，准备回退: {exc}")
+            # 日志按成因给结论：不再只写「结果未知」，而是讲清「请求已发出、
+            # 未拿到回执、因此按不重发处理」以及成因与排查方向。三态判定与
+            # 回退决策一字未改，这里只换表达。
+            logger.warning(
+                f"OneBot 图片直发（{action}，{image_count} 张）：{send_diagnosis(exc)}"
+            )
+            logger.debug(
+                f"OneBot 直发异常原始信息: {type(exc).__name__} -> {outcome.value}; "
+                f"retcode={getattr(exc, 'retcode', None)}; echo={getattr(exc, 'echo', None)}; {exc}"
+            )
             return outcome
-        logger.info(f"OneBot 图片直发成功: {action}")
+        logger.info(f"OneBot 图片直发成功: {action}（{image_count} 张）")
         return SendOutcome.SENT
 
     async def _send_prompt(self, event: AstrMessageEvent, text: str) -> bool:
@@ -1216,6 +1271,7 @@ class ImageTracePlugin(Star):
         mode_override: str | None = None,
         allow_local_fallback: bool = True,
         mark_compressed: bool = False,
+        remember_blocks: list[dict] | None = None,
     ):
         """统一回传入口：按模式选主路径，失败后逐级回退。
 
@@ -1238,11 +1294,15 @@ class ImageTracePlugin(Star):
         单次发送保证：同一批图片在一次调用里只发起一次发送。只有 OneBot 直发
         明确失败（FAILED）才允许换通道重发；结果未知（超时）一律就此打住——
         请求可能已经送达，再发一次用户就会收到两张一模一样的图。
+
+        remember_blocks 供「发缩略图、记原图」使用：/随机图 发出去的是替身
+        （thumb_url），但会话历史必须留下原图直链，否则 /原图 只能找回那张 720px
+        的缩略图。缺省 None 表示记的就是本次发出的 blocks（其余调用点行为不变）。
         """
         if self._event_already_sent(event):
             logger.warning("本次事件已投递过图片，跳过重复投递")
             return
-        self._remember_blocks(event, blocks)
+        self._remember_blocks(event, blocks if remember_blocks is None else remember_blocks)
         mode, max_side, quality, scaled_url_style = self._delivery_config()
         if mode_override is not None:
             mode = mode_override
@@ -2248,8 +2308,12 @@ class ImageTracePlugin(Star):
         local-compress），视频走标准消息链 Video.fromURL；无法识别类型时回退
         纯文本直链。同域 http 直链先升级为 https，减少协议端一次跳转。
         """
+        # 未指定目录时回退到配置的 default_dir 池：图床若设置了
+        # randomImageAPI.allowedDir，不带 dir 的裸 /random 会被判为「目录不允许」
+        # 而 403，故由客户端补一个目录；池有多项时随机取其一，以尽量覆盖整库。
+        target_dir = str(directory or "").strip() or pick_default_directory(settings)
         try:
-            media_url = await self._random_client().fetch(directory, content_type)
+            media_url = await self._random_client().fetch(target_dir, content_type)
         except RandomMediaError as exc:
             logger.warning(f"获取随机媒体失败: {exc}")
             yield event.plain_result(f"⚠️ 获取随机媒体失败：{exc}")
@@ -2261,11 +2325,64 @@ class ImageTracePlugin(Star):
             yield event.chain_result([Comp.Plain(caption), Comp.Video.fromURL(media_url)])
             return
         if kind == "image":
+            # 发送用缩略图替身、历史留原图：QQ 侧下载小图更快，sendMsg 回执超时
+            # 概率显著下降；而 /原图 仍能凭历史里的原图直链取回全尺寸文件。
+            send_url = await self._random_send_url(media_url, settings)
+            # 配文用**原图**文件名：缩略图被图床改过名（时间戳前缀 + `@` 换 `_`），
+            # 直接显示会是一串看不出所以然的字符
             caption = self._random_caption(media_url, "image", settings)
-            async for result in self._yield_delivery(event, caption, [{"url": media_url}]):
+            blocks = [{"url": send_url}]
+            async for result in self._yield_delivery(
+                event,
+                caption,
+                blocks,
+                remember_blocks=blocks if send_url == media_url else [{"url": media_url}],
+            ):
                 yield result
             return
         yield event.plain_result(f"随机媒体获取成功：{media_url}")
+
+    @staticmethod
+    def _bed_file_id(url: str) -> str:
+        """从图床直链里取出文件 id（即 S3 对象键）。
+
+        图床直链形如 `{base}/file/{id}`，id 可能含中文与 `@`/`#`（故 URL 里是
+        百分号编码的），必须 unquote 还原成原始键才能算出同一个点 id。取不到
+        返回空串，由调用方按「无替身」处理。
+        """
+        path = urlparse(str(url or "")).path
+        marker = "/file/"
+        index = path.find(marker)
+        if index < 0:
+            return ""
+        return unquote(path[index + len(marker) :]).strip()
+
+    async def _random_send_url(self, media_url: str, settings: dict) -> str:
+        """把随机到的原图换成它的缩略图直链；取不到替身就原样返回原图。
+
+        缩略图与原图落在同一个 Qdrant 点上（点 id = UUID5(原图 id)），所以只要
+        随机到的是内容目录里的原图，就能按 id 查出它的 thumb_url——不需要映射表，
+        也不能靠文件名（图床给缩略图改过名）。整条链路都失败时静默退回原图：
+        替身只是提速手段，绝不能因为它缺席而让 /随机图 发不出图。
+        """
+        if not settings.get("send_thumbnail", True):
+            return media_url
+        file_id = self._bed_file_id(media_url)
+        if not file_id:
+            return media_url
+        if not self.vector.enabled:
+            # 向量引擎没配好就无从查替身；这不是错误，直接发原图
+            return media_url
+        try:
+            thumb = await self.vector.thumb_url_for(file_id)
+        except Exception as exc:  # thumb_url_for 已兜错，这里再保一层
+            logger.warning(f"查询缩略图失败，改发原图: {exc}")
+            return media_url
+        if not thumb:
+            logger.debug(f"该图无缩略图替身，按原图发送: {file_id}")
+            return media_url
+        logger.debug(f"随机图改发缩略图替身: {file_id} -> {thumb}")
+        return thumb
 
     @staticmethod
     def _random_caption(media_url: str, kind: str, settings: dict) -> str:
