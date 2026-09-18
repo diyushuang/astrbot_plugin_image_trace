@@ -375,6 +375,12 @@ def clean_display_name(url_or_name) -> str | None:
 
     传入普通原图文件名/直链时**不改变内容**（无任何前缀可剥），因此可以无条件
     对任何名字调用。取不到合法文件名时返回 None，由调用方决定回退文案。
+
+    ⚠️ **本函数会丢弃目录层级**（第 1 步只取末段）。用在「展示名」与「按名直查
+    图床」两处都对（图床是按完整对象键取的，见 main._lookup_imgbed_file 的
+    反查路径）；但**不要**拿它去清洗用户手写的相对路径——那会把
+    `7、综艺节目/…/海报.jpg` 削成 `海报.jpg`。这种场景用
+    `strip_leading_decoration()`（保目录，只剥开头装饰）。
     """
     if not url_or_name:
         return None
@@ -387,6 +393,23 @@ def clean_display_name(url_or_name) -> str | None:
         return None
     cleaned = strip_thumbnail_prefix(strip_decoration_prefix(name))
     return cleaned or None
+
+
+def strip_leading_decoration(text) -> str:
+    """只剥开头的排版装饰（`🖼️ ` / `🎬 ` / `1. `），**保留目录层级与其余内容**。
+
+    与 `clean_display_name` 的区别：那个先取 URL/路径末段（丢目录），适合
+    「展示」与「按裸名查库」；这个原地剥前缀，适合「用户手写的查询串」——
+    它可能自带完整相对路径（`7、综艺节目/…/海报.jpg`），一旦走了取末段的
+    路子目录就没了，图床按裸名必然取不到。
+
+    时间戳前缀（`1789658616018_`）也一并剥：用户从缩略图消息里复制出来的名字
+    常带它。它同样只作用于**起始处**，不碰路径中间。
+
+    传入普通路径/文件名时是无副作用的空操作。
+    """
+    return strip_thumbnail_prefix(strip_decoration_prefix(str(text or ""))).strip()
+
 
 
 def media_kind(url, hint=None) -> str | None:

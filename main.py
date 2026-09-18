@@ -101,6 +101,7 @@ try:
         media_filename,
         media_kind,
         pick_default_directory,
+        strip_leading_decoration,
     )
     from .vector_search import VectorEngine, VectorEngineError
 except ImportError:  # 兼容插件以独立模块方式加载
@@ -169,6 +170,7 @@ except ImportError:  # 兼容插件以独立模块方式加载
         media_filename,
         media_kind,
         pick_default_directory,
+        strip_leading_decoration,
     )
     from vector_search import VectorEngine, VectorEngineError  # type: ignore[no-redef]
 
@@ -2328,6 +2330,22 @@ class ImageTracePlugin(Star):
     async def _lookup_imgbed_file(self, name: str, *, quoted: str = "") -> tuple[str, str, str]:
         """按文件名到图床直查原图，返回 (名称, 直链, 失败提示)。
 
+        **查询顺序：先向量库按名反查，再退回裸名拼 URL + 探测。** 反查在前是
+        必须的，不是优化：图床的 `/file/{path}` 只认**完整对象键**（含各级目录），
+        裸文件名拼上去**必然 404**。线上报的
+
+            图床里没有找到「【微博@潮流合伙人】20200207-04：赵今麦海报.jpg」
+
+        就是这个：原图实际在 `/file/7、综艺节目/爱奇艺《潮流合伙人》/《潮流合伙人》
+        图集/` 下面，而插件拼的是 `/file/【微博@潮流合伙人】…jpg`。实测 A/B：
+        裸名 404 / 带目录 200（内网与公网域名结果一致）。Qdrant 的 payload
+        `image_url` 正是入库时登记的**带完整目录**的权威直链，拿名字反查它即可。
+
+        反查非「恰好 1 命中」时（同名文件在多目录下有副本、或该图未进索引）不硬猜，
+        退回原有的裸名拼 URL + 探测逻辑：那一步虽然对多级目录无能为力，但对
+        「图床根目录下的文件」以及**用户直接给完整相对路径**的情形仍然有效，
+        且探测结果能给出可读提示。
+
         探测为「确定不存在」（4xx）时返回空直链并给出提示，同时附上尝试过的
         完整直链，便于用户核对图床里的目录层级；探测结果未知（网络异常）不拦，
         仍把直链交给回传——网络抖动不该被当成「图床没有这张图」。
@@ -2359,6 +2377,20 @@ class ImageTracePlugin(Star):
                 f"「{name}」是图床里的缩略图，且查不到它对应的原图；"
                 "请改用原图文件名，或先 /溯源 命中该图后再发 /原图。",
             )
+        # ① 先按文件名反查：拿回入库时登记的、**带完整目录**的权威直链。
+        #    这一步解决「裸名拼 URL 必然 404」——图床 /file/ 只认完整对象键。
+        #    注意判据是 `found[1]` 而**不是** `if found:`：`_original_by_name`
+        #    以 `("", "")` 表示落空，而**非空元组恒为真**——写成 `if found:`
+        #    会在落空时也走进来，直接返回空直链（调用方拿到空 url 会当成
+        #    「查不到」），恰好把兜底路径②整个跳过。这是个静默错误：
+        #    没有异常、没有日志，只是所有直查都失效。
+        found = await self._original_by_name(name)
+        if found[1]:
+            original_name, original_url = found
+            logger.info(f"/原图 按名反查命中原图: {name} -> {original_url}")
+            return original_name, original_url, ""
+        # ② 反查未命中（未进索引 / 同名多份 / 向量检索关闭）→ 退回裸名拼 URL + 探测，
+        #    对根目录文件与「用户直接给完整相对路径」两种情形仍然管用
         candidate = build_imgbed_file_url(base, name)
         if not candidate:
             return (
@@ -2371,6 +2403,37 @@ class ImageTracePlugin(Star):
         if exists is False:
             return "", "", f"图床里没有找到「{name}」，已尝试：{candidate}"
         return name, candidate, ""
+
+    async def _original_by_name(self, name: str) -> tuple[str, str]:
+        """按裸文件名到向量库反查原图 (名称, 直链)；查不到返回 ("", "")。
+
+        与 `_original_from_thumbnail` 的区别：那个按**缩略图直链**反查（用于拦
+        「引用随机图发出来的图」），这个按**文件名**反查（用于 `/原图 文件名`
+        这条「没有历史、只有名字」的路径）。
+
+        名字里可能只有裸文件名，而图床里它在多级目录下——payload.image_url 存的
+        是入库时的完整直链，故必须由库来告诉我们目录，不能靠猜。
+
+        跳过 name 自带目录（含 `/`）的情形：那说明调用方已经拿到了相对路径，
+        直接交给图床按路径取更准，不必多此一举反查（反查只匹配裸 file_name，
+        带目录的名字在这一步本来就命中不了）。
+
+        展示名用 payload.file_name（图床登记真名，`@` 完好），比入参更可信。
+        本方法**永不抛错**：反查只是获取目录层级的捷径，失败由调用方走兜底。
+        """
+        query = str(name or "").strip()
+        if not query or "/" in query or not self.vector.enabled:
+            return "", ""
+        try:
+            info = await self.vector.original_by_file_name(query)
+        except Exception as exc:  # original_by_file_name 已兜错，这里再保一层
+            logger.warning(f"按文件名反查原图失败: {exc}")
+            return "", ""
+        if not info or not info.get("url"):
+            return "", ""
+        display = str(info.get("file_name") or "").strip() or query
+        # 反查到的直链可能带图床处理参数，按原图口径还原（剥离 width/height 等）
+        return display, build_original_url(info["url"])
 
     @filter.command("原图修复")
     async def original_repair(self, event: AstrMessageEvent):
@@ -2444,14 +2507,17 @@ class ImageTracePlugin(Star):
             if status == "found":
                 name, url = payload
             else:
-                # 历史没命中时 query 会退化成**直查图床的文件名**，此时它可能
-                # 自带装饰前缀——最常见的是用户从配文里复制粘贴（配文是
+                # 历史没命中时 query 会退化成**直查图床的文件名/相对路径**，此时它
+                # 可能自带装饰前缀——最常见的是用户从配文里复制粘贴（配文是
                 # `🖼️ 名字`，复制过来就带了 `🖼️ `）。不清洗就会拼出
                 # `/file/🖼️%20名字` 而必然 404。命中历史的分支无需清洗：
                 # 历史键本就是干净文件名（1.6.1 起写入时即已清洗）。
-                cleaned = clean_display_name(query)
-                if cleaned:
-                    query = cleaned
+                #
+                # 这里用 strip_leading_decoration 而**不是** clean_display_name：
+                # 后者靠 media_filename 取末段，会把用户手写的多级相对路径
+                # （`7、综艺节目/…/海报.jpg`）削成裸文件名——图床按裸名取不到，
+                # 于是「用户给足了信息反而查不到」。前者原地剥前缀、保住目录。
+                query = strip_leading_decoration(query) or query
         else:
             latest = self.history.latest(session)
             if latest is not None:

@@ -644,6 +644,48 @@ class VectorEngine:
             "file_name": str(payload.get("file_name") or "").strip(),
         }
 
+    async def original_by_file_name(self, file_name: str) -> dict | None:
+        """按**裸文件名**反查原图：{"url": 带目录的权威直链, "file_name": 真名}。
+
+        为什么必须有这个方法：图床的 `/file/{path}` **只认完整对象键**（含各级
+        目录），把裸文件名拼上去**必然 404**。而 `/原图 <文件名>` 这条路径手上
+        只有名字，拼出来的就是 `/file/【微博@…】20200207-04：赵今麦海报.jpg`——
+        图床里根本不存在这个对象，原图明明在
+        `/file/7、综艺节目/爱奇艺《潮流合伙人》/《潮流合伙人》图集/` 下面。
+        实测同一文件的 A/B 对照（线上 http://192.9.240.227:7658 与公网
+        https://img.dixc.de 结果一致）：
+
+            裸文件名   /file/{裸名}            → HTTP 404
+            带完整目录 /file/7、综艺节目/…/{裸名} → HTTP 200
+
+        所以正确做法是拿名字去 Qdrant 反查那条**入库时登记的权威直链**
+        （payload.image_url 里带完整目录），而不是凭名字去猜目录。
+
+        **按值精确匹配**（`match.value`，不是 `match.text`）：`file_name` 是图床
+        登记的真名，含 `@`、中文冒号等字符，用 text 匹配会被切成词而误命中。
+        实测该字段可以直接整串精确命中。
+
+        命中数必须**恰好为 1**才返回：0 表示库里没有这个名字（或压根没进索引），
+        >1 表示同名文件在不同目录下有多份，此时**不能赌**哪一份是用户想要的——
+        交给调用方退回「原样拼 URL + 探测」的老逻辑，让图床自己裁决。
+
+        本方法**永不抛错**，失败一律返回 None。
+        """
+        target = str(file_name or "").strip()
+        if not target or not self.enabled:
+            return None
+        query_filter = {"must": [{"key": "file_name", "match": {"value": target}}]}
+        payload = await self._unique_payload(query_filter, f"文件名 {target}")
+        if payload is None:
+            return None
+        original = str(payload.get("image_url") or "").strip()
+        if not original:
+            return None
+        return {
+            "url": original,
+            "file_name": str(payload.get("file_name") or "").strip() or target,
+        }
+
     async def _payload_by_thumb(self, thumb_url: str) -> dict | None:
         """按 thumb_url 取回**唯一**命中点的 payload；非唯一/失败返回 None。
 
