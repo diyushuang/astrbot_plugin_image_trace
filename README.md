@@ -5,7 +5,7 @@
 
 **群聊里随手转发的一张图，一键找回它的原图。**
 
-[![version](https://img.shields.io/badge/version-1.5.9-blue?style=flat-square)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.6.0-blue?style=flat-square)](./CHANGELOG.md)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4?style=flat-square)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat-square)](./LICENSE)
@@ -513,16 +513,21 @@ v1.5.7 起改为「文字集中 → 图片集中」：标题与全部配文合�
 <details>
 <summary><b>执行 <code>/原图</code> 拿回来的还是小图？</b></summary>
 
-v1.5.9 已修复。此前的原因是**引用图按名直查**这一步错位：引用上一条 `/随机图` 消息时，引用直链本身就指向 `thumbnails/…`，插件直接拿它当原图名拼直链，于是「查原图」查回来的正是那张替身。
+v1.6.0 已修复。这里前后有两层原因：
 
-现在的处理：命中 `thumbnails/` 的直链会先按 `thumb_url` 到 Qdrant **精确反查**它所属的原图点（`count(exact)` 命中数必须恰好为 1），换成真正的原图直链再交付。
+1. **v1.5.9 修的**——**引用图按名直查**这一步错位：引用上一条 `/随机图` 消息时，引用直链本身就指向 `thumbnails/…`，插件直接拿它当原图名拼直链，于是「查原图」查回来的正是那张替身；
+2. **v1.6.0 修的**——反查的匹配判据**混进了 host**：Qdrant 里 `thumb_url` 存的是入库当时的地址（本部署实测全是内网 `192.9.240.227:7658`），而插件运行期手上的直链可能来自公网反代 `img.dixc.de`（同一个图床）。host 不同、路径相同，整串精确匹配必然 0 命中，于是反查全部落空。
+
+现在的处理分两轮：先按整串精确匹配，落空后改用 `/file/` 之后的**对象键**（与 host 无关）再匹配一轮；两轮都要求 `count(exact)` 命中数**恰好为 1**，命中即换成真正的原图直链交付。
 
 需要留意两点：
 
 1. **反查依赖向量引擎**：`/原图` 对缩略图引用的还原需要 Qdrant 可用。向量引擎未配置或不可达时无法反查，此时会明确提示找不到，而不是退回替身——宁可说「找不到」，也不把缩略图当原图交付；
-2. **文件名不参与反查**：图床给缩略图改过名（前置毫秒时间戳、`@` 换成 `_`），改名**不可逆**，所以无法由缩略图名倒推出原图名或点 id，只能按 `thumb_url` 值匹配。
+2. **文件名不参与反查**：图床给缩略图改过名（前置毫秒时间戳、`@` 换成 `_`），改名**不可逆**，所以无法由缩略图名倒推出原图名或点 id，只能按 `thumb_url` 匹配。
 
-若升级后仍见 `/原图` 返回小图，请先用 `/溯源状态` 确认运行版本为 `1.5.9` 及以上，并检查向量引擎连通性。
+> **如果你的图床也走多域名/反代**：本修复对 host 差异免疫，前提是「同一个文件在不同 host 下路径一致」。若你的反代改写了路径（例如加了前缀），反查仍可能落空——此时请让 `random_media.base_url` 与入库时的地址保持一致。
+
+若升级后仍见 `/原图` 返回小图，请先用 `/溯源状态` 确认运行版本为 `1.6.0` 及以上，并检查向量引擎连通性。
 
 </details>
 

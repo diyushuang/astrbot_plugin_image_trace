@@ -25,7 +25,7 @@ import os
 import time
 import uuid
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse, urlsplit
 
 import aiohttp
 
@@ -120,6 +120,32 @@ def _mime_for(path: str) -> str:
 def _read_bytes(path: str) -> bytes:
     with open(path, "rb") as f:
         return f.read()
+
+
+def thumb_path_key(url) -> str:
+    """取直链里 `/file/` 之后的对象键（相对路径），用作反查的 host 无关判据。
+
+    图床把「同一张图」以两种 host 暴露：内网 `192.9.240.227:7658` 与公网反代
+    `img.dixc.de`（OpenResty → `172.19.0.2:8080`）。`payload.thumb_url` 里存的是
+    **入库当时**的那一种（实测本部署全是内网 IP），而插件运行期手上的直链可能是
+    另一种，于是整串精确匹配永远 0 命中。对象键与 host 无关，只按它匹配即可。
+
+    编码差异同样要吸收：库里 `thumb_url` 存**原始未编码**形态（含中文），插件手上
+    的直链通常已 percent-encode，故先 `unquote` 再取路径。取不到 `/file/` 段时
+    退回整条路径（去掉前导 `/`），保证本函数对非常规直链也可用。
+    """
+    try:
+        path = unquote(urlsplit(str(url or "")).path)
+    except Exception:
+        return ""
+    if not path:
+        return ""
+    segments = [segment for segment in path.split("/") if segment]
+    if not segments:
+        return ""
+    if "file" in segments:
+        segments = segments[segments.index("file") + 1 :]
+    return "/".join(segments)
 
 
 class VectorEngine:
@@ -564,13 +590,10 @@ class VectorEngine:
         与 thumb_url_for 互为逆操作。这里**不能**用 point_id_for 反推点 id：
         缩略图上传时被图床改过名（加时间戳前缀、`@` 换 `_` 并移入 thumbnails/），
         从缩略图 URL 无论如何算不出原图 id，UUID5 那条路是死的。唯一可行的办法
-        是按 payload 精确匹配 `thumb_url` 找到那个点，再取同点的 `image_url`。
+        是按 payload 找到那个点，再取同点的 `image_url`。
 
-        匹配的是 payload 里**原样存储**的完整 URL（图床回传的 src 经上传方拼成
-        绝对地址后直接写入，未做二次规范化），故这里只做「原始串」与「去尾斜杠」
-        两种形态尝试，不做 URL 归一化——多改一个字符就多一次匹配不上的风险。
-        调用方若只有文件名，可用 bed_file_id() 从引用消息里取出对象键，再自行
-        拼成与 payload 同形的 URL 传入。
+        匹配先按整串精确比对，再退回按路径比对（见 `_payload_by_thumb`）——后者
+        用来吸收「入库记内网 IP、运行期持公网域名」这类 host 差异。
 
         命中数必须**恰好为 1**才返回：0 表示这个点没有缩略图（正常，属预期内），
         >1 表示数据异常（同一缩略图挂在多个点上），此时宁可返回 None 交调用方
@@ -582,14 +605,11 @@ class VectorEngine:
         target = str(thumb_url or "").strip()
         if not target or not self.enabled:
             return None
-        for candidate in (target, target.rstrip("/")):
-            payload = await self._payload_by_thumb(candidate)
-            if payload is None:
-                continue
-            original = str(payload.get("image_url") or "").strip()
-            if original:
-                return original
-        return None
+        payload = await self._payload_by_thumb(target)
+        if payload is None:
+            return None
+        original = str(payload.get("image_url") or "").strip()
+        return original or None
 
     async def original_info_for_thumb(self, thumb_url: str) -> dict | None:
         """按缩略图直链取回**整个原图点**的信息：{"url": …, "file_name": …}。
@@ -605,31 +625,82 @@ class VectorEngine:
         file_name 可能缺失（图床侧 payload 约定不同），此时只返回 url，由调用方
         退回「按缩略图名清洗」的兜底展示。
 
+        入参的 host 不必与库里存的一致：`_payload_by_thumb` 会先试整串精确匹配，
+        再退回按路径匹配，故公网域名与内网 IP 两种写法都能反查到同一点。
+
         与 original_url_for_thumb 同样：命中数非 1 一律放弃，永不抛错。
         """
         target = str(thumb_url or "").strip()
         if not target or not self.enabled:
             return None
-        for candidate in (target, target.rstrip("/")):
-            payload = await self._payload_by_thumb(candidate)
-            if payload is None:
-                continue
-            original = str(payload.get("image_url") or "").strip()
-            if not original:
-                continue
-            return {
-                "url": original,
-                "file_name": str(payload.get("file_name") or "").strip(),
-            }
-        return None
+        payload = await self._payload_by_thumb(target)
+        if payload is None:
+            return None
+        original = str(payload.get("image_url") or "").strip()
+        if not original:
+            return None
+        return {
+            "url": original,
+            "file_name": str(payload.get("file_name") or "").strip(),
+        }
 
     async def _payload_by_thumb(self, thumb_url: str) -> dict | None:
-        """按 thumb_url 精确匹配取回**唯一**命中点的 payload；非唯一/失败返回 None。
+        """按 thumb_url 取回**唯一**命中点的 payload；非唯一/失败返回 None。
 
-        先 count(exact) 再 scroll：count 便宜且能直接区分「没有」与「有多个」，
-        避免拿到一页结果后还要自己判断是否唯一。两步共用同一个 filter，语义一致。
+        匹配分两轮，先严后宽：
+
+        1. **整串精确匹配**（原行为）——入参与库中值逐字节相同时最快也最准；
+        2. **按路径匹配**——只用 `/file/` 之后的**相对路径**（含 `thumbnails/` 段）
+           去匹配。
+
+        第二轮是必需的，不是冗余：`thumb_url` 里存的是**入库当时**的 host
+        （实测本部署 6000/6000 全是内网 `192.9.240.227:7658`），而插件运行期
+        手上的直链可能来自公网域名（同一图床的 OpenResty 反代，`img.dixc.de`
+        → `172.19.0.2:8080`）。同一个文件的两种写法 host 不同、路径逐字节相同，
+        整串精确匹配必然 0 命中——v1.5.9 的 `/原图` 反查正是死在这里。按路径匹配
+        把 host 排除在判据之外，两种写法都能命中。
+
+        之所以**可以**只按路径匹配：图床对象键（`/file/` 之后的路径）是全局唯一的，
+        实测采样 300 点，完整相对路径与去 `thumbnails/` 后的相对路径**均 300/300
+        唯一命中、无多命中**。
+
+        命中数必须**恰好为 1**：0 表示没有这个缩略图（正常），>1 表示数据异常
+        （同一路径挂在多个点上），此时宁可返回 None 交调用方走原逻辑，也不赌一个。
         """
+        target = str(thumb_url or "").strip()
+        if not target:
+            return None
+        for candidate in (target, target.rstrip("/")):
+            payload = await self._payload_by_thumb_exact(candidate)
+            if payload is not None:
+                return payload
+        key = thumb_path_key(target)
+        if not key:
+            return None
+        return await self._payload_by_thumb_path(key)
+
+    async def _payload_by_thumb_exact(self, thumb_url: str) -> dict | None:
+        """按 thumb_url 整串精确匹配（逐字节相同才命中）。"""
         query_filter = {"must": [{"key": "thumb_url", "match": {"value": thumb_url}}]}
+        return await self._unique_payload(query_filter, f"整串 {thumb_url}")
+
+    async def _payload_by_thumb_path(self, path_key: str) -> dict | None:
+        """按 `/file/` 之后的相对路径匹配，绕开 host 差异。
+
+        Qdrant 的 `match.text` 对 text 字段按词切分、区分大小写，路径里的 `/` 与
+        中文标点会被当作分隔符；这里传入的是完整相对路径（如
+        `thumbnails/1789660677557_【微博_兰蔻LANCOME】20230507-04：郑州线下活动.jpg`），
+        实测对真实数据可整串命中且唯一。仍以 count 唯一性为准，不唯一即放弃。
+        """
+        query_filter = {"must": [{"key": "thumb_url", "match": {"text": path_key}}]}
+        return await self._unique_payload(query_filter, f"路径 {path_key}")
+
+    async def _unique_payload(self, query_filter: dict, label: str) -> dict | None:
+        """先 count(exact) 确认命中数恰为 1，再 scroll 取回该点 payload。
+
+        count 便宜且能直接区分「没有」与「有多个」，避免拿到一页结果后还要自己
+        判断是否唯一。两步共用同一个 filter，语义一致。
+        """
         try:
             count_obj = await self._request_json(
                 "POST",
@@ -639,11 +710,11 @@ class VectorEngine:
             )
             hits = int((count_obj.get("result") or {}).get("count") or 0)
         except Exception as exc:  # 网络/鉴权/集合缺失一律视为「查不到」
-            logger.debug(f"缩略图反查计数失败（按查不到处理）{thumb_url}: {exc}")
+            logger.debug(f"缩略图反查计数失败（按查不到处理）{label}: {exc}")
             return None
         if hits != 1:
             # 0=该点没有缩略图（正常）；>1=数据异常，宁可不反查也不赌一个
-            logger.debug(f"缩略图反查命中 {hits} 条，放弃反查: {thumb_url}")
+            logger.debug(f"缩略图反查命中 {hits} 条，放弃反查: {label}")
             return None
         try:
             obj = await self._request_json(
@@ -658,7 +729,7 @@ class VectorEngine:
                 headers=self._qd_headers(),
             )
         except Exception as exc:
-            logger.debug(f"缩略图反查取点失败（按查不到处理）{thumb_url}: {exc}")
+            logger.debug(f"缩略图反查取点失败（按查不到处理）{label}: {exc}")
             return None
         points = (obj.get("result") or {}).get("points")
         if not isinstance(points, list) or not points:
