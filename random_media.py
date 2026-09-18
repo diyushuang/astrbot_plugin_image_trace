@@ -55,6 +55,19 @@ VIDEO_EXTENSIONS = frozenset(
 # 预先拼好避免每次调用都重建元组
 MEDIA_EXTENSIONS = tuple(IMAGE_EXTENSIONS) + tuple(VIDEO_EXTENSIONS)
 
+# 图床存放缩略图的目录名（ImgBed 上传时由上传方的 uploadFolder 指定，值为
+# "thumbnails/"）。凡路径里带这一段的直链都**不是原图**，禁止当原图回传或展示。
+THUMBNAIL_DIR = "thumbnails"
+
+# 缩略图被图床改名后，文件名上带的时间戳前缀形如 `1789658616018_`。
+# 实测依据（图床 DB 的 id 与 file_name 两列逐条比对，23,932 条缩略图）：
+#   id 末段      : 1789658622627_【微博_赵今麦angel】20200228-01：《重生》剧照.jpg
+#   file_name 列 : 【微博@赵今麦angel】20200228-01：《重生》剧照.jpg
+# 即图床改名规则 = 前置 `{毫秒时间戳}_` + 把文件名里的 `@` 换成 `_`。
+# 这是唯一可靠的特征：`@`→`_` 的替换**不可逆**（无法从改名后的串还原出 `@`），
+# 所以清洗只能做「去掉时间戳前缀」这一步，`@` 只能靠 URL 里的原图直链取回。
+THUMBNAIL_PREFIX_PATTERN = re.compile(r"^\d{10,}_")
+
 HttpGetter = Callable[[], Awaitable[GuardedHttpClient]]
 
 
@@ -244,6 +257,52 @@ def media_filename(url) -> str | None:
     if segments and "." in segments[-1]:
         return segments[-1]
     return None
+
+
+def is_thumbnail_url(url) -> bool:
+    """该直链是否指向图床的缩略图目录（thumbnails/）。
+
+    判据是 URL 路径里存在 `thumbnails` 这一整段，而不是子串包含：
+    `mythumbnails/`、`thumbnails-old/` 这类目录名不得被误判成缩略图。
+    """
+    try:
+        path = unquote(urlsplit(str(url or "")).path)
+    except Exception:
+        return False
+    return THUMBNAIL_DIR in [segment for segment in path.split("/") if segment]
+
+
+def strip_thumbnail_prefix(name) -> str:
+    """去掉缩略图文件名前被图床加上的毫秒时间戳前缀。
+
+    只剥「起始处的 `数字_`」这一种形态（见 THUMBNAIL_PREFIX_PATTERN 的实测依据），
+    不做任何其他猜测性改写：既不改扩展名，也不尝试还原 `@`（那个替换不可逆）。
+    非缩略图名原样返回，因此对普通原图文件名调用是安全的空操作。
+    """
+    text = str(name or "")
+    return THUMBNAIL_PREFIX_PATTERN.sub("", text)
+
+
+def clean_display_name(url_or_name) -> str | None:
+    """把缩略图直链/改名后的文件名，转成适合展示给用户的干净文件名。
+
+    缩略图名形如 `1789658616018_【微博_赵今麦工作室official】….jpg`——前缀是无意义
+    的毫秒时间戳，展示给用户纯属噪声；`@` 还被换成了 `_`。本函数只做「去时间戳
+    前缀」这一步确定的清洗，返回可供展示的名字。
+
+    传入普通原图文件名/直链时**不改变内容**（无前缀可剥），因此可以无条件对任何
+    名字调用。取不到合法文件名时返回 None，由调用方决定回退文案。
+    """
+    if not url_or_name:
+        return None
+    name = media_filename(url_or_name)
+    if name is None:
+        # 传入的可能已是裸文件名（不含 URL 结构），再按文件名直接处理
+        raw = str(url_or_name).strip()
+        name = raw if "." in raw.rsplit("/", 1)[-1] else None
+    if not name:
+        return None
+    return strip_thumbnail_prefix(name) or None
 
 
 def media_kind(url, hint=None) -> str | None:

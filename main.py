@@ -95,7 +95,9 @@ try:
         RANDOM_ENDPOINT_DEFAULT,
         RandomMediaClient,
         RandomMediaError,
+        clean_display_name,
         extract_directory,
+        is_thumbnail_url,
         media_filename,
         media_kind,
         pick_default_directory,
@@ -161,7 +163,9 @@ except ImportError:  # 兼容插件以独立模块方式加载
         RANDOM_ENDPOINT_DEFAULT,
         RandomMediaClient,
         RandomMediaError,
+        clean_display_name,
         extract_directory,
+        is_thumbnail_url,
         media_filename,
         media_kind,
         pick_default_directory,
@@ -828,12 +832,23 @@ class ImageTracePlugin(Star):
         /溯源 的哈希与向量两条路径、以及 /随机图 现在都经 _yield_delivery
         回传（向量命中额外带 mark_compressed=True 生成逐图配文），因此只需在
         这一个入口收口，避免在各命令里分别维护历史而漏记。
+
+        指向缩略图的直链**一律不入历史**：历史是 /原图 的取值来源，一旦记进
+        缩略图，此后 /原图 只能拿回那张 720px 小图。/随机图 的发送路径本就
+        通过 remember_blocks 传入原图（见 _random_media_delivery），这里是
+        第二道闸，保证任何调用点都不会把替身写进历史。
         """
         session = self._session_key(event)
         for block in blocks:
             url = str(block.get("url") or "").strip()
-            if url:
-                self.history.remember(session, url, display_name=block.get("file_name"))
+            if not url:
+                continue
+            if is_thumbnail_url(url):
+                logger.debug(f"跳过缩略图直链，不计入 /原图 历史: {url}")
+                continue
+            self.history.remember(
+                session, url, display_name=clean_display_name(block.get("file_name"))
+            )
 
     def _can_send_via_onebot(self, event: AstrMessageEvent) -> bool:
         try:
@@ -875,7 +890,9 @@ class ImageTracePlugin(Star):
             fields.append("已压缩，可发送 /原图 获取原图")
         elif evidence is CompressionEvidence.UNKNOWN:
             fields.append("可发送 /原图 获取原图")
-        file_name = str(block.get("file_name") or "").strip()
+        file_name = clean_display_name(block.get("file_name")) or str(
+            block.get("file_name") or ""
+        ).strip()
         if file_name:
             fields.append(file_name)
         fields.extend(str(field) for field in block.get("fields", []) if field)
@@ -2206,18 +2223,36 @@ class ImageTracePlugin(Star):
         return base if base.lower().startswith(("http://", "https://")) else ""
 
     @classmethod
-    def _first_image_name(cls, event: AstrMessageEvent) -> str:
-        """从本条消息/被引用消息的图片段里取一个文件名。
+    def _first_image_candidate(cls, event: AstrMessageEvent) -> str:
+        """从本条消息/被引用消息的图片段里取一个**原始**文件名或直链。
 
-        供无参 /原图 在会话历史为空时退化为直查：引用一张图发 /原图，即按
-        该图文件名去图床找原图。
+        与 _first_image_name 的区别：这里**不做任何清洗**，原样返回。这一点是
+        必须的——调用方要先用 is_thumbnail_url 判定它是否指向缩略图，而那个
+        判据依赖路径里的 `thumbnails/` 段；若先清洗成"裸文件名"，路径信息就
+        丢了，判定会失效（实测：清洗后的名字 is_thumbnail_url 返回 False，
+        于是缩略图检查形同虚设）。
+
+        取不到返回空串。
         """
         for seg in cls._extract_images(event):
             for candidate in (getattr(seg, "url", None), getattr(seg, "file", None)):
-                name = media_filename(candidate)
-                if name:
-                    return name
+                raw = str(candidate or "").strip()
+                if raw and media_filename(raw):
+                    return raw
         return ""
+
+    @classmethod
+    def _first_image_name(cls, event: AstrMessageEvent) -> str:
+        """从本条消息/被引用消息的图片段里取一个适合直查图床的**干净文件名**。
+
+        供无参 /原图 在会话历史为空时退化为直查：引用一张图发 /原图，即按
+        该图文件名去图床找原图。
+
+        取到的名字可能是**缩略图改名后的形态**（图床给缩略图前置了毫秒时间戳、
+        把 `@` 换成 `_`），故这里只做**清洗**（去时间戳前缀）供展示与去重；
+        是否指向缩略图由调用方用 _first_image_candidate + is_thumbnail_url 判定。
+        """
+        return clean_display_name(cls._first_image_candidate(event)) or ""
 
     @staticmethod
     def _original_usage() -> str:
@@ -2228,12 +2263,75 @@ class ImageTracePlugin(Star):
             "· 引用一张图发送 /原图 —— 按该图文件名到图床取原图"
         )
 
-    async def _lookup_imgbed_file(self, name: str) -> tuple[str, str, str]:
+    async def _original_from_thumbnail(self, thumb_ref: str) -> tuple[str, str]:
+        """把「指向缩略图的直链或名字」换成它对应的原图 (名称, 直链)。
+
+        为什么必须在这里拦：`/原图` 的直查分支只会拿一个名字去拼
+        `{base}/file/{name}`。当这个名字来自「用户引用了上一条 /随机图 发出的
+        缩略图」时，它指向 `thumbnails/`，拼出来必然命中缩略图，于是
+        `/原图` 忠实地把 720px 小图又发了一遍——线上报的故障就是这个。
+
+        反查走 Qdrant：缩略图与原图落在**同一个点**上（payload 里
+        `thumb_url` 与 `image_url` 并存），按 thumb_url 精确匹配即可取回原图。
+        这里特意**只按 payload 里的缩略图直链匹配**，不从名字倒推点 id——
+        缩略图被图床改过名（前置毫秒时间戳、`@` 换 `_`），倒推是做不到的。
+
+        **匹配形态必须与 Qdrant 里存的逐字节一致**。实测该部署的 payload：
+            thumb_url = .../file/thumbnails/1789658616018_【微博_…】….jpg   ← 未编码
+            image_url = .../file/12%E3%80%81…%E5%89%A7%E7%85%A7.jpg          ← 已编码
+        即缩略图那一侧存的是**原始未编码**形态，所以这里只做 unquote（把传入的
+        编码形态还原成原始形态），**绝不做 quote**——一旦补上编码就再也匹配不上。
+
+        查不到时返回 ("", "")，调用方据此给出可读提示；宁可说「找不到」，也
+        绝不把缩略图当原图发出去。
+        """
+        if not self.vector.enabled:
+            return "", ""
+        reference = str(thumb_ref or "").strip()
+        if not reference:
+            return "", ""
+        base = self._imgbed_base()
+        # 统一成「与 payload 同形」的完整缩略图直链：
+        # 1) 有站点前缀就直接用；2) 只有路径段则补上前缀；3) 两者都无则作罢
+        if reference.lower().startswith(("http://", "https://")):
+            full = reference
+        elif base:
+            full = f"{base}/file/{reference.lstrip('/')}"
+        else:
+            return "", ""
+        # 关键：还原到**原始未编码**形态（payload.thumb_url 就是这么存的），
+        # 同时去掉可能残留的处理参数（width/height/fit/fallback）
+        thumb_url = unquote(build_original_url(full)) if "?" in full else unquote(full)
+        info = None
+        try:
+            info = await self.vector.original_info_for_thumb(thumb_url)
+        except Exception as exc:  # original_info_for_thumb 已兜错，这里再保一层
+            logger.warning(f"缩略图反查原图失败: {exc}")
+            info = None
+        if not info or not info.get("url"):
+            return "", ""
+        # 展示名**必须**取 payload 里的 file_name：缩略图名的 `@`→`_` 不可逆，
+        # 光清洗缩略图名还原不出真名（实测 payload.file_name 才是原始名）
+        display = (
+            str(info.get("file_name") or "").strip()
+            or clean_display_name(info["url"])
+            or clean_display_name(reference)
+            or ""
+        )
+        # 反查到的原图直链可能带处理参数（图床缓存过的形态），按原图口径还原
+        return display, build_original_url(info["url"])
+
+    async def _lookup_imgbed_file(self, name: str, *, quoted: str = "") -> tuple[str, str, str]:
         """按文件名到图床直查原图，返回 (名称, 直链, 失败提示)。
 
         探测为「确定不存在」（4xx）时返回空直链并给出提示，同时附上尝试过的
         完整直链，便于用户核对图床里的目录层级；探测结果未知（网络异常）不拦，
         仍把直链交给回传——网络抖动不该被当成「图床没有这张图」。
+
+        name 指向缩略图时（`thumbnails/...`，典型来自引用上一条随机图消息）先
+        反查真正的原图直链再返回，绝不把缩略图当原图交付。quoted 是引用图里的
+        **原始直链**（保留 `thumbnails/` 段），有它时优先用它反查——name 可能
+        已被清洗掉时间戳前缀，而 strip 之后的形态与 Qdrant 里存的并不完全一致。
         """
         base = self._imgbed_base()
         if not base:
@@ -2242,6 +2340,20 @@ class ImageTracePlugin(Star):
                 "",
                 "未配置图床站点地址：请在「图床设置」（cloudflare_imgbed）或「随机图」里"
                 "填写站点地址后重试，或先 /溯源 命中再发 /原图。",
+            )
+        # 判定要用「原始引用直链」与「名字」两者：任一指明 thumbnails/ 都算命中
+        if is_thumbnail_url(quoted) or is_thumbnail_url(name):
+            original_name, original_url = await self._original_from_thumbnail(quoted or name)
+            if original_url:
+                logger.info(
+                    f"/原图 直查命中缩略图，已反查回原图: {quoted or name} -> {original_url}"
+                )
+                return original_name, original_url, ""
+            return (
+                "",
+                "",
+                f"「{name}」是图床里的缩略图，且查不到它对应的原图；"
+                "请改用原图文件名，或先 /溯源 命中该图后再发 /原图。",
             )
         candidate = build_imgbed_file_url(base, name)
         if not candidate:
@@ -2263,6 +2375,9 @@ class ImageTracePlugin(Star):
         query = self._strip_command(event.message_str or "", ("原图",)).strip(" \t:：,，")
         name = ""
         url = ""
+        # 引用图里的**原始**直链/名字：保留 `thumbnails/` 路径段，供缩略图判定与
+        # 反查使用（反查要拼出与 Qdrant payload 同形的完整缩略图直链）
+        quoted = ""
         if query:
             status, payload = self.history.find(session, query)
             if status == "ambiguous":
@@ -2277,15 +2392,32 @@ class ImageTracePlugin(Star):
                 name, url = latest
             else:
                 # 会话里没有回传记录：退化为「按消息/引用图里的文件名直查图床」
-                query = self._first_image_name(event)
+                quoted = self._first_image_candidate(event)
+                query = clean_display_name(quoted) or ""
 
         if not url:
             if not query:
                 yield event.plain_result(self._original_usage())
                 return
-            name, url, message = await self._lookup_imgbed_file(query)
+            name, url, message = await self._lookup_imgbed_file(query, quoted=quoted)
             if not url:
                 yield event.plain_result(message)
+                return
+        elif is_thumbnail_url(url):
+            # 兜底：历史里若因任何原因（旧版本写入、外部注入）存进了缩略图直链，
+            # 也要在发出前反查回原图。正常路径下历史记的是原图（见 _yield_delivery
+            # 的 remember_blocks），这里是防御，不依赖上游一定正确。
+            original_name, original_url = await self._original_from_thumbnail(
+                self._bed_file_id(url) or name
+            )
+            if original_url:
+                logger.info(f"/原图 历史命中缩略图，已反查回原图: {url} -> {original_url}")
+                name, url = original_name, original_url
+            else:
+                yield event.plain_result(
+                    f"本会话记录的「{name}」是缩略图，且查不到它对应的原图；"
+                    "可先用 /溯源 命中该图后再发 /原图。"
+                )
                 return
         # R6：/原图 只发 URL、不落地字节——剥离 ImgBed 处理参数还原未处理原文件，
         # 并强制 original-url + 禁用本地回退
@@ -2327,16 +2459,45 @@ class ImageTracePlugin(Star):
         if kind == "image":
             # 发送用缩略图替身、历史留原图：QQ 侧下载小图更快，sendMsg 回执超时
             # 概率显著下降；而 /原图 仍能凭历史里的原图直链取回全尺寸文件。
-            send_url = await self._random_send_url(media_url, settings)
-            # 配文用**原图**文件名：缩略图被图床改过名（时间戳前缀 + `@` 换 `_`），
-            # 直接显示会是一串看不出所以然的字符
-            caption = self._random_caption(media_url, "image", settings)
-            blocks = [{"url": send_url}]
+            #
+            # 边界：图床的 /random 若被指到 thumbnails/ 目录（default_dir 配错或
+            # 用户显式传了该目录），media_url 本身就是缩略图。此时别再查替身
+            # （缩略图没有替身），并把「原图」口径定为反查结果，避免历史里记进
+            # 缩略图直链、导致 /原图 之后只能拿回小图。
+            original_url = media_url
+            original_name = ""
+            if is_thumbnail_url(media_url):
+                info = None
+                try:
+                    normalized = unquote(build_original_url(media_url))
+                    info = await self.vector.original_info_for_thumb(normalized)
+                except Exception as exc:  # 反查失败不影响发送，按原样处理
+                    logger.debug(f"随机图反查原图失败（按原样处理）: {exc}")
+                if info and info.get("url"):
+                    original_url = info["url"]
+                    # 真名取自 payload.file_name（图床没改过名的原始名）
+                    original_name = str(info.get("file_name") or "").strip()
+                else:
+                    logger.warning(f"随机图命中的是缩略图且反查不到原图: {media_url}")
+            send_url = await self._random_send_url(original_url, settings)
+            # 配文一律用**原图**名并清洗掉图床改名的前缀（时间戳 + `@` 换 `_`），
+            # 显示缩略图名对用户没有意义
+            caption = self._random_caption(
+                original_url, "image", settings, display_name=original_name
+            )
+            blocks = [
+                {
+                    "url": send_url,
+                    "file_name": original_name or clean_display_name(original_url) or "",
+                }
+            ]
             async for result in self._yield_delivery(
                 event,
                 caption,
                 blocks,
-                remember_blocks=blocks if send_url == media_url else [{"url": media_url}],
+                remember_blocks=(
+                    blocks if send_url == original_url else [{"url": original_url}]
+                ),
             ):
                 yield result
             return
@@ -2385,13 +2546,25 @@ class ImageTracePlugin(Star):
         return thumb
 
     @staticmethod
-    def _random_caption(media_url: str, kind: str, settings: dict) -> str:
-        """随机媒体回传文案；show_file_info 关闭或取不到文件名时用固定文案。"""
+    def _random_caption(
+        media_url: str, kind: str, settings: dict, *, display_name: str = ""
+    ) -> str:
+        """随机媒体回传文案；show_file_info 关闭或取不到文件名时用固定文案。
+
+        文件名一律经 clean_display_name 清洗：图床给缩略图改名时会前置毫秒
+        时间戳（`1789658616018_【微博_…】.jpg`），这个前缀对用户毫无意义，
+        纯属噪声，绝不能出现在配文里。清洗只做「去时间戳前缀」这一步确定的
+        处理，不猜测、不改写其余内容。
+
+        display_name 供调用方传入**更权威**的名字（如反查回原图时取自 Qdrant
+        payload.file_name 的原始名）。它的价值在于缩略图名的 `@`→`_` 是**不可逆**
+        的，光靠清洗缩略图名永远还原不出真名；有 payload 真名时优先用它。
+        """
         label = "图片" if kind == "image" else "视频"
         fallback = f"随机{label}发送成功"
         if not settings.get("show_file_info", True):
             return fallback
-        filename = media_filename(media_url)
+        filename = str(display_name or "").strip() or clean_display_name(media_url)
         if not filename:
             return fallback
         icon = "🖼️" if kind == "image" else "🎬"

@@ -558,6 +558,114 @@ class VectorEngine:
         thumb = str(payload.get("thumb_url") or "").strip()
         return thumb or None
 
+    async def original_url_for_thumb(self, thumb_url: str) -> str | None:
+        """取该缩略图直链所属点上的原图直链（payload.image_url）；没有则为 None。
+
+        与 thumb_url_for 互为逆操作。这里**不能**用 point_id_for 反推点 id：
+        缩略图上传时被图床改过名（加时间戳前缀、`@` 换 `_` 并移入 thumbnails/），
+        从缩略图 URL 无论如何算不出原图 id，UUID5 那条路是死的。唯一可行的办法
+        是按 payload 精确匹配 `thumb_url` 找到那个点，再取同点的 `image_url`。
+
+        匹配的是 payload 里**原样存储**的完整 URL（图床回传的 src 经上传方拼成
+        绝对地址后直接写入，未做二次规范化），故这里只做「原始串」与「去尾斜杠」
+        两种形态尝试，不做 URL 归一化——多改一个字符就多一次匹配不上的风险。
+        调用方若只有文件名，可用 bed_file_id() 从引用消息里取出对象键，再自行
+        拼成与 payload 同形的 URL 传入。
+
+        命中数必须**恰好为 1**才返回：0 表示这个点没有缩略图（正常，属预期内），
+        >1 表示数据异常（同一缩略图挂在多个点上），此时宁可返回 None 交调用方
+        走原逻辑，也不能赌一个。
+
+        本方法**永不抛错**：与 thumb_url_for 同理，反查只是纠正手段，失败时由
+        调用方走原有的「按名直查」逻辑，绝不能让 /原图 因为反查失败而不可用。
+        """
+        target = str(thumb_url or "").strip()
+        if not target or not self.enabled:
+            return None
+        for candidate in (target, target.rstrip("/")):
+            payload = await self._payload_by_thumb(candidate)
+            if payload is None:
+                continue
+            original = str(payload.get("image_url") or "").strip()
+            if original:
+                return original
+        return None
+
+    async def original_info_for_thumb(self, thumb_url: str) -> dict | None:
+        """按缩略图直链取回**整个原图点**的信息：{"url": …, "file_name": …}。
+
+        比 original_url_for_thumb 多带一个 `file_name`，这一点很关键：缩略图名
+        被图床改过（前置毫秒时间戳 + `@` 换 `_`），而 `@`→`_` 是**不可逆**的——
+        光靠清洗缩略图名永远还原不出真正的文件名。同一个点的 payload 里
+        `file_name` 存的正是**未经改名的原始文件名**（实测：
+        file_name = `【微博@赵今麦工作室official】20250716-02：林其乐剧照.jpg`
+        thumb_url = `…/thumbnails/1789658616018_【微博_赵今麦工作室official】….jpg`），
+        所以展示名必须取自这里，而不是清洗缩略图名。
+
+        file_name 可能缺失（图床侧 payload 约定不同），此时只返回 url，由调用方
+        退回「按缩略图名清洗」的兜底展示。
+
+        与 original_url_for_thumb 同样：命中数非 1 一律放弃，永不抛错。
+        """
+        target = str(thumb_url or "").strip()
+        if not target or not self.enabled:
+            return None
+        for candidate in (target, target.rstrip("/")):
+            payload = await self._payload_by_thumb(candidate)
+            if payload is None:
+                continue
+            original = str(payload.get("image_url") or "").strip()
+            if not original:
+                continue
+            return {
+                "url": original,
+                "file_name": str(payload.get("file_name") or "").strip(),
+            }
+        return None
+
+    async def _payload_by_thumb(self, thumb_url: str) -> dict | None:
+        """按 thumb_url 精确匹配取回**唯一**命中点的 payload；非唯一/失败返回 None。
+
+        先 count(exact) 再 scroll：count 便宜且能直接区分「没有」与「有多个」，
+        避免拿到一页结果后还要自己判断是否唯一。两步共用同一个 filter，语义一致。
+        """
+        query_filter = {"must": [{"key": "thumb_url", "match": {"value": thumb_url}}]}
+        try:
+            count_obj = await self._request_json(
+                "POST",
+                self._points_url("count"),
+                json_body={"exact": True, "filter": query_filter},
+                headers=self._qd_headers(),
+            )
+            hits = int((count_obj.get("result") or {}).get("count") or 0)
+        except Exception as exc:  # 网络/鉴权/集合缺失一律视为「查不到」
+            logger.debug(f"缩略图反查计数失败（按查不到处理）{thumb_url}: {exc}")
+            return None
+        if hits != 1:
+            # 0=该点没有缩略图（正常）；>1=数据异常，宁可不反查也不赌一个
+            logger.debug(f"缩略图反查命中 {hits} 条，放弃反查: {thumb_url}")
+            return None
+        try:
+            obj = await self._request_json(
+                "POST",
+                self._points_url("scroll"),
+                json_body={
+                    "filter": query_filter,
+                    "limit": 1,
+                    "with_payload": True,
+                    "with_vector": False,
+                },
+                headers=self._qd_headers(),
+            )
+        except Exception as exc:
+            logger.debug(f"缩略图反查取点失败（按查不到处理）{thumb_url}: {exc}")
+            return None
+        points = (obj.get("result") or {}).get("points")
+        if not isinstance(points, list) or not points:
+            return None
+        payload = points[0].get("payload") if isinstance(points[0], dict) else None
+        return payload if isinstance(payload, dict) else None
+
     # ------------------------------------------------------------------
     # 登记原图时同步入向量库（图床无服务器侧钩子时的兜底通道）
     # ------------------------------------------------------------------

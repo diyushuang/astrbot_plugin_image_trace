@@ -5,7 +5,7 @@
 
 **群聊里随手转发的一张图，一键找回它的原图。**
 
-[![version](https://img.shields.io/badge/version-1.5.8-blue?style=flat-square)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.5.9-blue?style=flat-square)](./CHANGELOG.md)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4?style=flat-square)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat-square)](./LICENSE)
@@ -117,11 +117,12 @@ flowchart LR
 <details>
 <summary><b>`/原图` 的查找顺序与直链口径（点击展开）</b></summary>
 
-1. 先查**本会话回传历史**（`/溯源`、`/随机图` 回传过的图片都会记入）；
+1. 先查**本会话回传历史**（`/溯源`、`/随机图` 回传过的图片都会记入）；历史里若命中缩略图直链，先反查到原图再交付；
 2. 历史未命中时，按文件名拼接 `{图床地址}/file/{文件名}` 并探测存在性后直传。图床地址取 `image_bed.cfi_base_url`（`cloudflare_imgbed` 模式）或 `random_media.base_url`；两者都未配置时会提示补配置；
-3. 文件名允许带上传目录，例如 `/原图 2026/09/abc.jpg`。
+3. 文件名允许带上传目录，例如 `/原图 2026/09/abc.jpg`；
+4. 引用上一条消息时，若其直链落在 `thumbnails/`（典型来源是 `/随机图` 发出的替身），先按该直链到 Qdrant 反查它所属的**原图点**，换成原图直链再交付；反查失败则明确报「找不到」，不退回替身。
 
-直链口径：只按 CloudFlare-ImgBed 的 Read API 剥离 `width` / `height` / `fit` / `fallback`，其他图床的查询串原样保留（改动可能破坏签名或鉴权）。当前 `/原图` 只有「会话回传历史」与「图床直链」两条来源，不查 Qdrant 向量库与本地图库。
+直链口径：只按 CloudFlare-ImgBed 的 Read API 剥离 `width` / `height` / `fit` / `fallback`，其他图床的查询串原样保留（改动可能破坏签名或鉴权）。当前 `/原图` 的来源仍是「会话回传历史」与「图床直链」两条，不查 Qdrant 向量库做**相似检索**与本地图库；Qdrant 只在「缩略图直链 → 原图直链」这一步做**精确反查**（按 `thumb_url` 值匹配，不做向量检索）。
 
 </details>
 
@@ -376,10 +377,10 @@ flowchart LR
 | `library.py` | SQLite 图库 + 内存哈希位矩阵检索 | 写路径持锁，缓存整体替换 + 快照读；重操作需经 `asyncio.to_thread` |
 | `image_bed.py` | 图床与储存桶各模式的上传、直链反解、远端删除 | 上传失败一律回退本地副本，登记流程不中断 |
 | `image_delivery.py` | URL 缩放/原图还原、本地压缩、压缩证据三态、直发结果分类、图床直链拼装、向量命中去重的纯函数 | 不直接访问网络或 AstrBot 事件，便于独立测试 |
-| `random_media.py` | ImgBed 随机图接口客户端与响应解析纯函数 | 出网经共享 HTTP 客户端；403 特判不重试；只取直链、不落地字节 |
+| `random_media.py` | ImgBed 随机图接口客户端与响应解析纯函数；缩略图判定与改名痕迹清洗 | 出网经共享 HTTP 客户端；403 特判不重试；只取直链、不落地字节；前缀清理只认 `^\d{10,}_` 实测形态 |
 | `media_history.py` | 会话级原图历史（LRU + 别名键） | 按会话/会话数封顶；主键与展示名双索引 |
 | `s3_store.py` | 纯标准库 AWS SigV4 签名 + 最小 S3 兼容客户端 | 签名与 URL/方法绑定，被重定向即报错而非复用签名 |
-| `vector_search.py` | Qdrant 检索 + OpenAI 兼容 embeddings 客户端 | embed 三值须与图床入库侧一致；错误统一归为 `VectorEngineError` |
+| `vector_search.py` | Qdrant 检索 + OpenAI 兼容 embeddings 客户端；`thumb_url` → 原图反查 | embed 三值须与图床入库侧一致；错误统一归为 `VectorEngineError`；反查命中数必须恰为 1 且**永不抛错** |
 | `url_guard.py` | SSRF 防护：逐跳校验、IP 钉扎、响应限长 | 所有出网经共享 HTTP 客户端调用，不绕过防护 |
 | `common.py` | 配置解析工具与共享常量 | 真值表/常量只在此维护一份，各模块不得自备 |
 
@@ -503,8 +504,37 @@ v1.5.7 起改为「文字集中 → 图片集中」：标题与全部配文合�
 三点保证：
 
 1. **`/原图` 仍给全尺寸**：随机图发送时走「发替身、记原图」，会话历史里存的是原图直链，所以 `/原图` 拿回的是原图而不是那张 720px 小图；
-2. **查不到替身就发原图**：点没有 `thumb_url`（如尚未生成缩略图的旧图）、或向量引擎未配置/不可达时，自动退回原图，不影响可用性；
-3. **可关闭**：把 `random_media.send_thumbnail` 设为 `false`，`/随机图` 就始终发原图。
+2. **引用缩略图也能换回原图**：v1.5.9 起，即便引用的是某条已经发出替身的消息（引用直链指向 `thumbnails/`），`/原图` 也会按该直链反查到原图再交付；反查不到时明确报「找不到」，**不会把替身当原图发出去**；
+3. **查不到替身就发原图**：点没有 `thumb_url`（如尚未生成缩略图的旧图）、或向量引擎未配置/不可达时，自动退回原图，不影响可用性；
+4. **可关闭**：把 `random_media.send_thumbnail` 设为 `false`，`/随机图` 就始终发原图。
+
+</details>
+
+<details>
+<summary><b>执行 <code>/原图</code> 拿回来的还是小图？</b></summary>
+
+v1.5.9 已修复。此前的原因是**引用图按名直查**这一步错位：引用上一条 `/随机图` 消息时，引用直链本身就指向 `thumbnails/…`，插件直接拿它当原图名拼直链，于是「查原图」查回来的正是那张替身。
+
+现在的处理：命中 `thumbnails/` 的直链会先按 `thumb_url` 到 Qdrant **精确反查**它所属的原图点（`count(exact)` 命中数必须恰好为 1），换成真正的原图直链再交付。
+
+需要留意两点：
+
+1. **反查依赖向量引擎**：`/原图` 对缩略图引用的还原需要 Qdrant 可用。向量引擎未配置或不可达时无法反查，此时会明确提示找不到，而不是退回替身——宁可说「找不到」，也不把缩略图当原图交付；
+2. **文件名不参与反查**：图床给缩略图改过名（前置毫秒时间戳、`@` 换成 `_`），改名**不可逆**，所以无法由缩略图名倒推出原图名或点 id，只能按 `thumb_url` 值匹配。
+
+若升级后仍见 `/原图` 返回小图，请先用 `/溯源状态` 确认运行版本为 `1.5.9` 及以上，并检查向量引擎连通性。
+
+</details>
+
+<details>
+<summary><b>配文里的文件名为什么有时带一串数字，或者 <code>@</code> 变成了 <code>_</code>？</b></summary>
+
+v1.5.9 起已清理。图床在生成缩略图时会改名：前置毫秒时间戳，并把文件名里的 `@` 替换成 `_`（例如 `【微博@赵今麦工作室official】xxx.jpg` → `1789658616018_【微博_赵今麦工作室official】xxx.jpg`）。
+
+插件对配文做两层处理：
+
+1. **剥掉时间戳前缀**：只匹配 `^\d{10,}_` 这一实测形态，不做更宽泛的剥离，避免误删文件名里本来就有的编号；
+2. **展示名优先取图床登记的真名**：`@`→`_` 不可逆，仅靠清洗还原不出原名，故反查时一并取 Qdrant `payload.file_name`（图床登记的真实文件名，`@` 完好）作为展示名。
 
 </details>
 
