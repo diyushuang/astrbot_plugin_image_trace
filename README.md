@@ -5,7 +5,7 @@
 
 **群聊里随手转发的一张图，一键找回它的原图。**
 
-[![version](https://img.shields.io/badge/version-1.6.2-blue?style=flat-square)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.7.0-blue?style=flat-square)](./CHANGELOG.md)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4?style=flat-square)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat-square)](./LICENSE)
@@ -40,7 +40,7 @@ _An AstrBot plugin that traces a reposted, compressed or cropped image back to i
 | --- | --- |
 | 🔍 **发图溯源** | 与图片同条消息（或引用图片）发送 `/溯源`，按当前引擎检索最相似的原图，相似度达标即回传 |
 | 🧠 **向量引擎**（可选） | 多模态向量 AI（OpenAI 兼容 `/v1/embeddings`）+ Qdrant 检索，对压缩、缩放、裁剪、水印比哈希更鲁棒 |
-| 🧮 **哈希引擎**（可离线） | pHash / dHash / aHash，纯 Pillow + numpy 实现，无需 GPU，数万张图毫秒级比对 |
+| 🧮 **哈希引擎**（可离线） | pHash / dHash / aHash，纯 Pillow + numpy 实现，无需 GPU，数万张图毫秒级比对。开启「图床哈希索引」后，**图床里的原图也能被哈希直接反查**（不必等向量推理） |
 | ⚡ **URL 直传** | QQ `aiocqhttp` 经 OneBot 原生接口直传图床 URL（避免适配器转 base64），失败自动回退本地压缩 |
 | 🧩 **一次一条** | 向量命中的多张相似图合并为**一条**消息，配文集中在开头（带 `1.`/`2.` 序号）、图片连续排在末尾，避免 QQ 把图片裁成正方形缩略图 |
 | 🗂️ **多种存储** | 图床副本 / 通用 HTTP 图床（Lsky Pro、EasyImages、Chevereto…）/ CloudFlare-ImgBed / Cloudflare R2 / 甲骨文 OCI |
@@ -50,7 +50,7 @@ _An AstrBot plugin that traces a reposted, compressed or cropped image back to i
 | 🛡️ **安全加固** | 全部出网经 SSRF 防护（逐跳校验 + IP 钉扎 + 响应限长）；密钥字段在配置面板标记为 secret |
 
 > [!NOTE]
-> `/溯源` 日常查询只依赖配置好的向量 AI 与 Qdrant；哈希引擎可全程本地运行，不依赖任何外部服务。
+> `/溯源` 日常查询只依赖配置好的向量 AI 与 Qdrant；哈希引擎可全程本地运行，不依赖任何外部服务。图床哈希索引的**拉取**需要 Qdrant 可达，但拉下来之后检索全程离线。
 
 ## 快速开始
 
@@ -163,6 +163,9 @@ flowchart LR
 | `top_n` | `3` | 未命中时提示的最接近候选数，`0` 表示不提示 |
 | `max_images_per_query` | `3` | 单次溯源最大处理图片数 |
 | `max_download_mb` | `20` | 单张图片大小上限（MB） |
+| `remote_hash_enabled` | `true` | 图床哈希索引：把图床侧（img-indexer）预置的感知哈希整体拉到本地，使**哈希检索也能反查图床原图**（不依赖向量推理）。需已配置 `vector_search`；关闭后哈希检索只覆盖本地 `scan_dirs` |
+| `remote_hash_ttl` | `21600` | 图床哈希缓存有效期（秒）。超期后启动时自动重拉全量 |
+| `remote_hash_max_points` | `0` | 图床哈希拉取上限，`0`=不限。调试时可设小值（如 `50`）先验证链路，再放开全量 |
 | `image_delivery.target_kb` | `0` | 本地压缩的目标体积上限（KB，0=不限制）。非 0 时启用质量阶梯 |
 | `image_delivery.webp` | `false` | 本地压缩改用 WebP 输出（体积更小，编码更慢；噪声极多的图可能反而更大，此时自动回退原字节） |
 | `image_delivery.onebot_image_timeout` | `60` | OneBot 图片段的 `timeout`（秒），即协议端下载网络图片的窗口。日志报 `sendMsg` 超时（retcode 1200）时可调大；范围 10~300 |
@@ -368,7 +371,7 @@ flowchart LR
 ## 项目结构与开发
 
 <details>
-<summary><b>模块职责与关键约束（12 个模块，点击展开）</b></summary>
+<summary><b>模块职责与关键约束（13 个模块，点击展开）</b></summary>
 
 依赖方向单向：`main` → 各子模块；子模块 → `common` / `http_client` / `url_guard`。
 
@@ -378,6 +381,7 @@ flowchart LR
 | `http_client.py` | 共享受管 HTTP 客户端 | 统一持有启用 IP pinning 的 `aiohttp` 会话 |
 | `features.py` | pHash / dHash / aHash 感知特征计算（Pillow + numpy + pillow-heif） | pHash 十六进制长度统一由 `phash_hex_len()` 提供，任何处不得自行推导；HEIF/HEIC 解码器在此防御式注册；支持格式表只维护一份，`image_file_ok(path)` 与 `image_bytes_ok(data)` 判据必须一致 |
 | `library.py` | SQLite 图库 + 内存哈希位矩阵检索 | 写路径持锁，缓存整体替换 + 快照读；重操作需经 `asyncio.to_thread` |
+| `hash_index.py` | 图床预置 pHash 的本地镜像索引（从 Qdrant 拉取、编译位矩阵、磁盘缓存） | 必须复用 `library` 的 `_POPCOUNT[xor]` 内核与 `1-dist/bits` 相似度口径——两套算法会在边界位分叉；退化哨兵 `-`、非 64 hex、缺直链的点一律跳过且**不能留在矩阵里**（否则行序错位）；缓存损坏须丢弃重建 |
 | `image_bed.py` | 图床与储存桶各模式的上传、直链反解、远端删除 | 上传失败一律回退本地副本，登记流程不中断 |
 | `image_delivery.py` | URL 缩放/原图还原、本地压缩、压缩证据三态、直发结果分类、图床直链拼装、向量命中去重的纯函数 | 不直接访问网络或 AstrBot 事件，便于独立测试 |
 | `random_media.py` | ImgBed 随机图接口客户端与响应解析纯函数；缩略图判定与改名痕迹清洗 | 出网经共享 HTTP 客户端；403 特判不重试；只取直链、不落地字节；前缀清理只认 `^\d{10,}_` 实测形态 |
@@ -399,7 +403,8 @@ flowchart LR
 /溯源：
   图片段 → _resolve_local_file
         → 向量引擎：embed_file → Qdrant points/query（旧版回退 points/search）→ 阈值过滤与同图去重
-        或 哈希引擎：library.search（汉明距离）→ 阈值过滤 → 可选 AI 复核
+        或 哈希引擎：本地图库 search + 图床索引 search（两腿按相似度合并，同分本地优先）
+                     → 阈值过滤 → 可选 AI 复核
         → 统一回传入口（OneBot URL 直传优先，失败本地压缩，最后标准消息链）
 ```
 
@@ -409,7 +414,7 @@ flowchart LR
 - 配置解析使用 `common.as_int` / `as_float` / `truthy` / `is_blank`，不要写 `value or default`（会把合法的 0 / False 吞掉）；
 - 涉及 SQLite 或大文件复制的调用若出现在 async 上下文，应包 `asyncio.to_thread`；
 - 群聊回复文案保持脱敏：含内网地址 / Key 的错误细节只进日志，不进群聊；
-- 发布包按白名单打包 **19 个文件**（12 个 `.py` + `README.md` / `CHANGELOG.md` / `metadata.yaml` / `requirements.txt` / `_conf_schema.json` / `LICENSE` / `logo.png`），不含 `.git`、`data/` 与会话状态目录；
+- 发布包按白名单打包 **20 个文件**（13 个 `.py` + `README.md` / `CHANGELOG.md` / `metadata.yaml` / `requirements.txt` / `_conf_schema.json` / `LICENSE` / `logo.png`），不含 `.git`、`data/` 与会话状态目录；**新增模块必须登记进 `scripts/build_release.py` 的 `PLUGIN_FILES`**，否则安装后会 `ImportError`；
 - 提交前确认 `metadata.yaml` 的 `version` 使用无 `v` 前缀的 SemVer，并与 `CHANGELOG.md`、README 徽章一致。
 
 </details>
@@ -430,6 +435,17 @@ flowchart LR
 - 用图床直链时，确认直链**公网可读**且协议端 / QQ 服务器能访问；
 - 用本地文件时，确认协议端能访问该路径（容器部署常见坑：宿主机路径在协议端容器内不可见）；
 - 图床开启了防盗链时，协议端取图可能被拦，改用 `local-compress` 模式可绕开。
+
+</details>
+
+<details>
+<summary><b>图床哈希索引是什么？不开启会怎样？</b></summary>
+
+- 图床里的图不在机器人磁盘上，`scan_dirs` 扫不到。开启后插件会把图床侧（img-indexer）入库时算好的感知哈希**整体拉到本地**，于是哈希引擎也能反查图床原图——不必等向量的多模态推理，毫秒级出结果。
+- 关闭只影响哈希引擎的覆盖面（退化为仅本地 `scan_dirs`），不影响向量引擎与其它功能。
+- 拉取需要 Qdrant 可达，缓存到 `remote_phash.json` 后检索全程离线；默认每 6 小时（`remote_hash_ttl`）在启动时自动刷新一次。
+- **索引依赖两侧哈希口径逐位一致**：插件 `features.py` 与 img-indexer 的 `src/lib/phash.mjs` 必须给出同一个码。若只改一侧，检索相似度会集体塌到 0.5 附近、表现为「什么都查不到」且**不报错**。改任一侧后请用 img-indexer 的 `tools/verify_phash.mjs` 做双向比对。
+- 想先验证链路（尤其容器内 HEIC 解码）可把 `remote_hash_max_points` 设为 `50`，只拉少量点位试跑。
 
 </details>
 
@@ -641,6 +657,7 @@ OneBot 图片直发（send_group_msg，4 张）：发送未确认：协议端 se
 | 项 | 位置 / 要求 |
 | --- | --- |
 | 图库索引 | `data/plugin_data/astrbot_plugin_image_trace/library.db`（SQLite） |
+| 图床哈希缓存 | `data/plugin_data/astrbot_plugin_image_trace/remote_phash.json`（约 2.4 万条 ≈ 4MB，可安全删除，下次启动自动重拉） |
 | 本地图床副本 | `data/plugin_data/astrbot_plugin_image_trace/images/` |
 | 临时文件 | `data/plugin_data/astrbot_plugin_image_trace/tmp/`（自动清理） |
 | AstrBot | `>= 4.0.0` |

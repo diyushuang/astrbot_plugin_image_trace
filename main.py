@@ -64,6 +64,7 @@ try:
         image_file_ok,
         phash_hex_len,
     )
+    from .hash_index import HashIndex
     from .http_client import GuardedHttpClient
     from .image_bed import MODE_CFB, ImageBedClient
     from .image_delivery import (
@@ -133,6 +134,7 @@ except ImportError:  # 兼容插件以独立模块方式加载
         image_file_ok,
         phash_hex_len,
     )
+    from hash_index import HashIndex  # type: ignore[no-redef]
     from http_client import GuardedHttpClient  # type: ignore[no-redef]
     from image_bed import MODE_CFB, ImageBedClient  # type: ignore[no-redef]
     from image_delivery import (  # type: ignore[no-redef]
@@ -269,6 +271,13 @@ class ImageTracePlugin(Star):
         self._http: GuardedHttpClient | None = None
         self.bed = ImageBedClient(self.data_dir, self._bed_cfg, self._get_http)
         self.vector = VectorEngine(config, self._get_http)
+        # 图床感知哈希索引：把 img-indexer 入库时预置的 pHash 拉到本地，
+        # 让哈希引擎也能反查图床里的图（scan_dirs 只能扫本地目录，覆盖不到）
+        self.remote_hash = HashIndex(
+            os.path.join(self.data_dir, "remote_phash.json"),
+            expected_phash_hex_len=phash_hex_len(hash_size),
+        )
+        self._remote_hash_task: asyncio.Task | None = None
         # 回传过的原图直链的历史（供 /原图 找回）；随机图客户端惰性构造
         self.history = MediaHistory()
         self._random_media_client: RandomMediaClient | None = None
@@ -276,6 +285,11 @@ class ImageTracePlugin(Star):
         # 探测到 API 级拒绝（405/501 等）后的一段时间内不再探测缩放版。
         self._scaled_verify_unsupported_until = 0.0
         self._cleanup_tmp()
+        # 先吃磁盘缓存（同步、瞬时），网络刷新交给生命周期钩子里的后台任务——
+        # __init__ 里不能建 Task（此时还没有运行中的事件循环）
+        cache_note = ""
+        if self.remote_hash_on() and self.remote_hash.load_cache():
+            cache_note = f"（图床哈希缓存 {self.remote_hash.count} 条）"
         engine = self._engine_choice()
         vector_note = "（向量引擎已启用）" if self.vector.enabled and engine != "hash" else ""
         bucket_note = (
@@ -283,8 +297,56 @@ class ImageTracePlugin(Star):
         )
         logger.info(
             f"图片溯源插件已加载，当前图库共 {self.library.count()} 条，"
-            f"引擎={engine} {vector_note}{bucket_note}"
+            f"引擎={engine} {vector_note}{bucket_note}{cache_note}"
         )
+
+    # ------------------------------------------------------------------
+    # 图床哈希索引（后台刷新）
+    # ------------------------------------------------------------------
+
+    def remote_hash_on(self) -> bool:
+        """图床哈希索引开关（默认开；需向量引擎已配置才能拉到数据）。"""
+        return self._bool_cfg("remote_hash_enabled", True) and self.vector.enabled
+
+    def _remote_hash_ttl(self) -> int:
+        """缓存最长有效期（秒）。超过后启动时无条件重建，避免长期吃旧快照。"""
+        return max(300, self._int_cfg("remote_hash_ttl", 21600))
+
+    def _remote_hash_max_points(self) -> int:
+        """拉取上限（0 = 不限）。用于先小样本验证链路，再放开全量。"""
+        return max(0, self._int_cfg("remote_hash_max_points", 0))
+
+    async def _refresh_remote_hash(self) -> None:
+        """从 Qdrant 拉全量 pHash 重建本地索引。异常不出后台任务。"""
+        try:
+            points = await self.vector.scroll_payloads(
+                key="phash",
+                page_size=512,
+                max_points=self._remote_hash_max_points(),
+            )
+            count = await asyncio.to_thread(self.remote_hash.build, points)
+            logger.info(
+                f"图床哈希索引已刷新：{count} 条可用"
+                f"（远端点位 {len(points) if isinstance(points, list) else 0}），"
+                f"缓存于 {self.remote_hash.cache_path}"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"图床哈希索引刷新失败（沿用已有缓存）: {exc}")
+
+    def start_remote_hash_refresh(self) -> None:
+        """启动后台刷新任务（幂等）：已有一个在跑就不再起第二个。
+
+        启动即刷新 vs 按需刷新：刷新要翻 ~47 页（2.4 万点），耗时数秒到数十秒。
+        放在启动后台跑，首次 /溯源 就能命中；若拖到首次查询再拉，用户会先吃到
+        一次「未命中」——而「未命中」是个确定结论，比查不到更误导人。
+        """
+        if not self.remote_hash_on():
+            return
+        if self._remote_hash_task is not None and not self._remote_hash_task.done():
+            return
+        self._remote_hash_task = asyncio.create_task(self._refresh_remote_hash())
 
     # ------------------------------------------------------------------
     # 配置读取
@@ -1439,6 +1501,7 @@ class ImageTracePlugin(Star):
     @filter.command("溯源", alias={"找原图"})
     async def trace(self, event: AstrMessageEvent):
         """发送或引用一张图片，按当前引擎（hash/vector/auto）找出相似的原图并回传"""
+        self.start_remote_hash_refresh()  # 兜底周期刷新（幂等）
         images = self._extract_images(event)
         if not images:
             yield event.plain_result(self._usage())
@@ -1459,7 +1522,7 @@ class ImageTracePlugin(Star):
                     yield item
             return
         # hash（或 auto 但向量引擎未配置）
-        if self.library.count() == 0:
+        if self._hash_pool_size() == 0:
             empty_note = (
                 "（向量引擎未启用：若图床侧已部署向量库，请检查 vector_search 配置）"
                 if not self.vector.enabled
@@ -1478,6 +1541,14 @@ class ImageTracePlugin(Star):
     # 哈希引擎（原有 pHash 比对逻辑，行为保持不变）
     # ------------------------------------------------------------------
 
+    def _hash_pool_size(self) -> int:
+        """两条哈希腿的可用条数之和：本地图库 + 图床镜像索引。
+
+        空库提示必须按这个和判定。只看本地图库会在「本地空、图床有」时误报
+        「图库还是空的」，而实际上哈希腿完全可用——用户会被误导去配 scan_dirs。
+        """
+        return self.library.count() + self.remote_hash.count
+
     @staticmethod
     def _miss_message(fail_line: str, candidates: list, empty_note: str = "") -> str:
         """未命中回复的统一拼装：阈值提示 + 可选的“最接近候选”或空库说明。"""
@@ -1486,6 +1557,52 @@ class ImageTracePlugin(Star):
         if empty_note:
             return f"{fail_line}\n{empty_note}"
         return fail_line
+
+    def _merged_hash_candidates(self, phash: str, want: int) -> tuple:
+        """把本地图库与图床镜像两条腿的候选**按相似度合并**后返回。
+
+        为什么要合并而不是「本地先查、没中再查图床」：两条腿各有偏科。本地图库
+        是扫描来的、可能只有几百张，但能拿到本地路径参与后续压缩/回传；图床镜像
+        有两万多张、覆盖面大，却只有直链。若按顺序短路，会出现「本地有一条 0.86
+        的低质命中、图床有一条 0.99 的完美命中，却只报前者」——用户看到的是
+        「溯源命中了」但拿到的不是最像的那张。
+
+        返回 (hits, cand_lines)：hits 是达阈值且已按相似度降序的候选（本地优先
+        同分），cand_lines 是未命中时展示的「最接近候选」文本行。
+
+        两条腿各自独立 try：图床那条是纯本地矩阵运算、本地那条要碰 SQLite，
+        任一腿出错都不该让整条检索失败。
+        """
+        merged: list = []
+        try:
+            for m in self.library.search(phash, want):
+                merged.append((float(m.similarity), "local", m))
+        except Exception as exc:
+            logger.warning(f"本地图库哈希检索失败（继续用图床索引）: {exc}")
+        if self.remote_hash_on() and not self.remote_hash.is_empty:
+            try:
+                for m in self.remote_hash.search(phash, want):
+                    merged.append((float(m.similarity), "remote", m))
+            except Exception as exc:
+                logger.warning(f"图床哈希索引检索失败（继续用本地图库）: {exc}")
+        # 相似度降序；同分时本地靠前（本地能给出路径，回传链路更短）
+        merged.sort(key=lambda item: (-item[0], 0 if item[1] == "local" else 1))
+        hits = [m for sim, _src, m in merged if sim >= self.hash_threshold]
+        cand_lines = []
+        if self.top_n > 0:
+            for sim, _src, m in merged[: self.top_n]:
+                note = self._candidate_note(m)
+                cand_lines.append(
+                    f"· #{m.id} 相似度 {sim * 100:.1f}%{f'（{note}）' if note else ''}"
+                )
+        return hits, cand_lines
+
+    def _candidate_note(self, match) -> str:
+        """候选行的括注：本地腿用 note，图床腿用文件名（note 恒为空）。"""
+        note = (getattr(match, "note", "") or "").strip()
+        if note:
+            return note
+        return (getattr(match, "file_name", "") or "").strip()
 
     async def _trace_hash(self, event: AstrMessageEvent, seg) -> AsyncGenerator:
         threshold = self.hash_threshold
@@ -1503,50 +1620,17 @@ class ImageTracePlugin(Star):
             )
             # 至少取回 5 条候选：即便 top_n 配置为 0/较小值，AI 复核也需要
             # 足够的候选池才能剔除误报
-            candidates = await asyncio.to_thread(self.library.search, feats.phash, max(5, top_n))
-            hits = [m for m in candidates if m.similarity >= threshold]
+            hits, candidate_lines = await asyncio.to_thread(
+                self._merged_hash_candidates, feats.phash, max(5, top_n)
+            )
             if hits and self._bool_cfg("ai_verify", False):
                 hits = await self._ai_verify(local_path, hits)
 
             if hits:
-                best = hits[0]
-                lines = [f"✅ 溯源命中（相似度 {best.similarity * 100:.1f}%）#{best.id}"]
-                if best.note:
-                    lines.append(f"备注：{best.note}")
-                if best.width and best.height:
-                    lines.append(f"尺寸：{best.width}x{best.height}")
-                if best.created_at:
-                    lines.append(f"入库时间：{best.created_at}")
-                block = {"text": " · ".join(lines[1:])}
-                if best.width and best.height:
-                    # 供回传计划判断是否需要图床缩放，以及压缩标识是否成立
-                    block["width"] = best.width
-                    block["height"] = best.height
-                if best.file_size and best.file_size > 0:
-                    # 入库时记录的原图体积：回传计划据此免探测原图体积
-                    block["size_bytes"] = int(best.file_size)
-                if best.image_url:
-                    block["url"] = best.image_url
-                elif best.file_path and os.path.isfile(best.file_path):
-                    block["path"] = best.file_path
-                if "url" in block or "path" in block:
-                    async for result in self._yield_delivery(event, lines[0], [block]):
-                        yield result
-                else:
-                    yield event.plain_result(
-                        f"✅ 溯源命中（相似度 {best.similarity * 100:.1f}%）#{best.id}，"
-                        f"但原图文件已不存在：{best.file_path or best.image_url or '未知路径'}"
-                    )
+                async for result in self._hash_hit_result(event, hits[0]):
+                    yield result
                 return
 
-            candidate_lines = (
-                [
-                    f"· #{m.id} 相似度 {m.similarity * 100:.1f}%{f'（{m.note}）' if m.note else ''}"
-                    for m in candidates[:top_n]
-                ]
-                if top_n > 0
-                else []
-            )
             yield event.plain_result(
                 self._miss_message(
                     f"❌ 图库中未找到相似度达标的原图（阈值 {threshold * 100:.0f}%）。",
@@ -1559,6 +1643,43 @@ class ImageTracePlugin(Star):
         finally:
             if is_tmp:
                 self._remove_quiet(local_path)
+
+    async def _hash_hit_result(self, event: AstrMessageEvent, best) -> AsyncGenerator:
+        """把一条哈希命中渲染成回复（本地腿与图床腿共用）。
+
+        两腿的差异只有两处：展示名（本地用备注、图床用文件名）与路径来源
+        （本地文件 vs 远端直链）。其余展示与回传逻辑完全一致，故合并到一处，
+        免得日后改一处漏一处。
+        """
+        title = f"✅ 溯源命中（相似度 {best.similarity * 100:.1f}%）#{best.id}"
+        label = self._candidate_note(best)
+        if label:
+            title += f" · {label}"
+        lines = []
+        if best.width and best.height:
+            lines.append(f"尺寸：{best.width}x{best.height}")
+        if best.created_at:
+            lines.append(f"入库时间：{best.created_at}")
+        block = {"text": " · ".join(lines)}
+        if best.width and best.height:
+            # 供回传计划判断是否需要图床缩放，以及压缩标识是否成立
+            block["width"] = best.width
+            block["height"] = best.height
+        if best.file_size and best.file_size > 0:
+            # 入库时记录的原图体积：回传计划据此免探测原图体积
+            block["size_bytes"] = int(best.file_size)
+        if best.image_url:
+            block["url"] = best.image_url
+        elif best.file_path and os.path.isfile(best.file_path):
+            block["path"] = best.file_path
+        if "url" in block or "path" in block:
+            async for result in self._yield_delivery(event, title, [block]):
+                yield result
+        else:
+            yield event.plain_result(
+                f"{title}，但原图文件已不存在："
+                f"{best.file_path or best.image_url or '未知路径'}"
+            )
 
     # ------------------------------------------------------------------
     # 向量引擎
@@ -1634,7 +1755,7 @@ class ImageTracePlugin(Star):
         if kind == "nofile":
             yield item
             return
-        hash_empty = self.library.count() == 0
+        hash_empty = self._hash_pool_size() == 0
         if kind == "miss":
             yield item
             if hash_empty:
@@ -1968,8 +2089,29 @@ class ImageTracePlugin(Star):
             lines.append(f"· 向量库：{self.vector.collection}，{count_text}")
             lines.append(f"· Embed：{self.vector.embed_model} / {self.vector.image_input}")
         lines.append(f"· 扫描目录：{len(scan_dirs)} 个")
+        lines.append(self._remote_hash_line())
         lines.append(f"· AI 复核：{'开' if self._bool_cfg('ai_verify', False) else '关'}")
         yield event.plain_result("\n".join(lines))
+
+    def _remote_hash_line(self) -> str:
+        """/溯源状态 的图床哈希索引一行。
+
+        排查「为什么图床的图哈希查不到」时，这一行就能区分三种成因：
+        开关没开 / 拉取失败（条数 0）/ 拉到了但被大量跳过（skipped 偏高）。
+        """
+        if not self.remote_hash_on():
+            reason = "未配置向量引擎" if not self.vector.enabled else "已关闭"
+            return f"· 图床哈希索引：{reason}"
+        info = self.remote_hash.stats()
+        if not info["count"]:
+            return "· 图床哈希索引：空（拉取中或拉取失败，详情见机器人日志）"
+        text = f"· 图床哈希索引：{info['count']} 条可用"
+        if info["skipped"]:
+            text += f"，跳过 {info['skipped']} 条（格式错误/退化图/无直链）"
+        if info["built_at"]:
+            stamp = time.strftime("%m-%d %H:%M", time.localtime(info["built_at"]))
+            text += f"（建于 {stamp}）"
+        return text
 
     @staticmethod
     def _collect_image_files(dirs: list) -> tuple:
@@ -2732,8 +2874,37 @@ class ImageTracePlugin(Star):
     # 生命周期
     # ------------------------------------------------------------------
 
+    async def _stop_remote_hash_refresh(self, errors: list) -> None:
+        """停掉后台刷新任务，避免卸载后任务还在写缓存文件。
+
+        取消防抖：后台任务可能正卡在 47 页翻页中间，直接 await 会拖慢卸载；
+        给 5 秒宽限，超时就放弃等待（任务自身会在下一轮 await 点收到取消）。
+        """
+        task = self._remote_hash_task
+        self._remote_hash_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=5)
+        except (asyncio.CancelledError, TimeoutError):
+            pass
+        except Exception as e:
+            errors.append(f"图床哈希刷新任务: {e}")
+
+    async def initialize(self) -> None:
+        """AstrBot 在事件循环起来后调用；此时才可以安全创建后台任务。
+
+        图床哈希索引的刷新必须在这里启动，不能在 __init__：那会儿还没有运行中
+        的事件循环，asyncio.create_task 会直接抛错。缓存为空时也照常刷新——
+        首次启动后第一次 /溯源 不该因为「索引还没拉」而报未命中。
+        """
+        if self.remote_hash_on():
+            self.start_remote_hash_refresh()
+
     async def terminate(self):
         errors: list[str] = []
+        await self._stop_remote_hash_refresh(errors)
         if self._http is not None:
             try:
                 await self._http.close()

@@ -531,6 +531,67 @@ class VectorEngine:
             )
         return hits
 
+    async def scroll_payloads(
+        self,
+        *,
+        key: str,
+        page_size: int = 512,
+        max_points: int = 0,
+        with_payload_keys: list | None = None,
+    ) -> list:
+        """遍历全集合，收集**存在 payload[key] 的点**，返回 [{id, payload}]。
+
+        专为「把服务端预置的感知哈希整体拉到本地建索引」而设：Qdrant 不支持
+        「按键非空」服务端过滤（`is_not_empty` 会 400），只能整集合翻页后
+        在本地筛。翻页用 `next_page_offset`，直到为空或达到 max_points。
+
+        只取需要的 payload 键（with_payload_keys），2 万级点位下能把响应体
+        从数十 MB 压到几 MB。`key` 传入的键只要不是非空字符串就跳过该点——
+        服务端把退化图写成哨兵串（'-'）而非空值，正是为了让这类点能被本地
+        判据识别出来，所以这里不做真值判断，只要求「非空字符串」。
+
+        出错时抛出 VectorEngineError（由调用方决定降级），不做静默吞错：
+        半截索引比没有索引更危险——它会给出「未命中」的确定结论。
+        """
+        if not key:
+            return []
+        wanted = [str(k) for k in (with_payload_keys or [key]) if str(k)]
+        collected: list = []
+        offset = None
+        while True:
+            body = {
+                "limit": max(1, int(page_size)),
+                "with_payload": wanted,
+                "with_vector": False,
+            }
+            if offset is not None:
+                body["offset"] = offset
+            obj = await self._request_json(
+                "POST", self._points_url("scroll"), json_body=body, headers=self._qd_headers()
+            )
+            result = obj.get("result") or {}
+            points = result.get("points") if isinstance(result, dict) else None
+            if not isinstance(points, list) or not points:
+                break
+            for point in points:
+                if not isinstance(point, dict):
+                    continue
+                payload = point.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                value = payload.get(key)
+                if not isinstance(value, str) or not value.strip():
+                    continue
+                collected.append({"id": str(point.get("id")), "payload": payload})
+                # 上限在页内也要生效：只在页间判定的话，一页 512 条会整页照收，
+                # --limit 50 的试跑实际拿到 512 条，「先小样本验证」就失去意义
+                if max_points > 0 and len(collected) >= max_points:
+                    return collected
+            offset = result.get("next_page_offset")
+            if not offset:
+                break
+        return collected
+
     async def count(self) -> int:
         """返回集合点数；集合不存在按 0；连接/鉴权失败抛 VectorEngineError。"""
         url = self._points_url("count")

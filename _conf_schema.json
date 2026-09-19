@@ -613,5 +613,29 @@
       "advanced_settings": true
     },
     "hint": "超过该大小的图片拒绝处理，防止异常大图拖垮机器人。"
+  },
+  "remote_hash_enabled": {
+    "description": "【选填】图床哈希索引",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，插件会把图床侧（img-indexer）入库时算好的感知哈希整体拉到本地，使哈希检索也能反查图床里的图片（不依赖向量检索、无需联网推理）。需要图床已部署 img-indexer 并配置了 vector_search。关闭后哈希检索只覆盖本地 scan_dirs 扫描到的图。"
+  },
+  "remote_hash_ttl": {
+    "description": "【选填】图床哈希缓存有效期（秒）",
+    "type": "int",
+    "default": 21600,
+    "condition": {
+      "advanced_settings": true
+    },
+    "hint": "缓存超过该时长后，插件启动时会自动重新拉取全量哈希。默认 21600（6 小时）。调小可更快感知图床新增图片，但会增加启动时的拉取流量。"
+  },
+  "remote_hash_max_points": {
+    "description": "【选填】图床哈希拉取上限",
+    "type": "int",
+    "default": 0,
+    "condition": {
+      "advanced_settings": true
+    },
+    "hint": "0 表示不限制（拉取全部）。调试时设为小数值（如 50）可只拉少量记录，用于先验证链路是否通畅、容器内 HEIC 能否正常解码，再放开全量。"
   }
 }

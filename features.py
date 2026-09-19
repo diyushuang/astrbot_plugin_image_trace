@@ -104,12 +104,30 @@ def _bits_to_hex(bits: np.ndarray) -> str:
     return np.packbits(bits.astype(np.uint8)).tobytes().hex()
 
 
+# 退化判定阈值：中位数绝对值 / 低频块绝对值均值 低于此值即认为落在浮点噪声里。
+#
+# 纯色、纯渐变、大面积平坦图会让中位数落到浮点噪声量级（1e-15~1e-29），而
+# hash_size² 个低频系数里有一半恰好是精确的 0.0。此时 `0.0 > 噪声` 的真假完全
+# 由求和顺序决定，同一份算法在不同 BLAS/求和序下都会分叉——数学上不可消除。
+# 更关键的是：img-indexer（Node 侧，见其 src/lib/phash.mjs）会为同一张图算 pHash
+# 入库，两侧必须给出**同一个**码，否则哈希检索会静默全量落空。
+# 处理方式：检出后退化为全零约定码。全零码与任何真实图的相似度都在 0.5 上下，
+# 不会造成误报；这类图本就不适合做感知哈希检索。
+_DEGENERATE_MEDIAN_RATIO = 1e-12
+
+
 def _phash(gray: Image.Image, hash_size: int) -> str:
     size = hash_size * 4
     pixels = np.asarray(gray.resize((size, size), _RESAMPLE), dtype=np.float64)
     mat = _dct_matrix(size)
     dct = mat @ pixels @ mat.T
     low = dct[:hash_size, :hash_size]
+    flat = low.flatten()
+    med = float(np.median(low))
+    scale = float(np.abs(flat).mean())
+    if not scale > 0 or abs(med) <= scale * _DEGENERATE_MEDIAN_RATIO:
+        # 退化输入：中位数落在浮点噪声里，二值化无意义 → 全零约定码
+        return "0" * phash_hex_len(hash_size)
     return _bits_to_hex((low > np.median(low)).flatten())
 
 
