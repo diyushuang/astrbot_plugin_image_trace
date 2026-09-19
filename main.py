@@ -2543,8 +2543,34 @@ class ImageTracePlugin(Star):
             )
         exists, _length = await self._probe_url(candidate)
         if exists is False:
+            # 落空原因不同，提示必须不同：库里压根没这个名字（未进索引）时让用户
+            # 去 /溯源；而同名多份且内容不同时图是**确实存在**的，报「图床里没有
+            # 找到」只会让人白核对一遍。命中数只在失败路径上多查一次。
+            matches = await self._file_name_matches(name)
+            if matches and matches > 1:
+                return (
+                    "",
+                    "",
+                    f"「{name}」在图库里有 {matches} 份同名文件且内容不同，"
+                    "无法确定你要哪一张。请带上目录再试（如："
+                    f"/原图 目录名/{name}）。",
+                )
             return "", "", f"图床里没有找到「{name}」，已尝试：{candidate}"
         return name, candidate, ""
+
+    async def _file_name_matches(self, name: str) -> int | None:
+        """问向量库「这个名字有几个点」；用于失败文案的诊断，查不到返回 None。
+
+        对齐库内 `VectorEngine.file_name_matches`——本方法存在的意义只是把
+        「引擎未启用 / 异常」收敛成 None，让调用方不必到处判 self.vector。
+        """
+        if not self.vector.enabled:
+            return None
+        try:
+            return await self.vector.file_name_matches(name)
+        except Exception as exc:  # 诊断失败不能影响原本的失败提示
+            logger.debug(f"同名命中数诊断失败: {exc}")
+            return None
 
     async def _original_by_name(self, name: str) -> tuple[str, str]:
         """按裸文件名到向量库反查原图 (名称, 直链)；查不到返回 ("", "")。

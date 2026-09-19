@@ -58,6 +58,11 @@ except ImportError:  # 兼容插件以独立模块方式加载
 
 IMAGE_INPUTS = ("qwen-vl", "nemotron-vl", "dataurl", "jina-image")
 
+# 同名多份时，最多取回多少个候选做「是否同一张图」的判定。
+# 实测本部署重名组最多 4 份，50 有足够余量；设上限是为了防止极端脏数据
+# （某个名字挂着成百上千个点）把一次反查拖成大批量拉取。
+DUPLICATE_SCAN_CAP = 50
+
 
 class VectorEngineError(Exception):
     """向量引擎可展示给用户的错误。"""
@@ -726,9 +731,16 @@ class VectorEngine:
         登记的真名，含 `@`、中文冒号等字符，用 text 匹配会被切成词而误命中。
         实测该字段可以直接整串精确命中。
 
-        命中数必须**恰好为 1**才返回：0 表示库里没有这个名字（或压根没进索引），
-        >1 表示同名文件在不同目录下有多份，此时**不能赌**哪一份是用户想要的——
-        交给调用方退回「原样拼 URL + 探测」的老逻辑，让图床自己裁决。
+        命中数为 0（库里没有这个名字，或压根没进索引）时返回 None，交给调用方
+        退回「原样拼 URL + 探测」的老逻辑。
+
+        **命中数 >1（同名文件在不同目录下有多份）时不再一律放弃**——这是 v1.7.1
+        的行为变更，理由见 `_duplicate_equivalent`。实测本部署 23,932 点里
+        **6,127 个文件名（37.3%）是重名的**，若一律放弃，这些名字发
+        `/原图 <文件名>` 会 100% 报「图床里没有找到」，而它们的原图明明就在
+        索引里。改为：先判定这些同名点是否**指向同一张图**，是则确定性地选一份
+        返回；只有确认「同名但内容不同」才放弃（那种情况下赌错会把别的图当原图
+        发出去，比说「找不到」更糟）。
 
         本方法**永不抛错**，失败一律返回 None。
         """
@@ -736,8 +748,38 @@ class VectorEngine:
         if not target or not self.enabled:
             return None
         query_filter = {"must": [{"key": "file_name", "match": {"value": target}}]}
-        payload = await self._unique_payload(query_filter, f"文件名 {target}")
-        if payload is None:
+        label = f"文件名 {target}"
+        hits = await self._count_filter(query_filter, label)
+        if hits is None or hits == 0:
+            return None
+        if hits == 1:
+            payloads = await self._scroll_filter(query_filter, label, 1)
+            return self._original_info_from_payload(payloads[0] if payloads else None, target)
+        # ---- 同名多份：先证明「是同一张图」，再确定性地选一份 ----
+        payloads = await self._scroll_filter(query_filter, label, min(hits, DUPLICATE_SCAN_CAP))
+        if not self._duplicate_equivalent(payloads):
+            logger.debug(f"同名 {hits} 份且内容不同，放弃反查（需用户指明目录）: {label}")
+            return None
+        chosen = self._pick_duplicate(payloads)
+        if chosen is None:
+            return None
+        info = self._original_info_from_payload(chosen, target)
+        if info is not None:
+            logger.info(
+                f"同名 {hits} 份且内容一致，已确定性地取其一: {label} -> "
+                f"{str(chosen.get('src') or chosen.get('image_url') or '')[:120]}"
+            )
+        return info
+
+    @staticmethod
+    def _original_info_from_payload(payload: dict | None, target: str) -> dict | None:
+        """把 Qdrant payload 收敛成 {"url", "file_name"}；缺 image_url 时返回 None。
+
+        缺 image_url 必须返回 None 而不是空直链：调用方拿空 url 会当成「查不到」
+        走兜底，但若这里返 `{"url": ""}`，语义就变成了「命中了但直链是空的」，
+        更容易在下游被误当作成功。
+        """
+        if not isinstance(payload, dict):
             return None
         original = str(payload.get("image_url") or "").strip()
         if not original:
@@ -746,6 +788,78 @@ class VectorEngine:
             "url": original,
             "file_name": str(payload.get("file_name") or "").strip() or target,
         }
+
+    @staticmethod
+    def _duplicate_equivalent(payloads: list[dict]) -> bool:
+        """判定「同名多份」的这些点是否**指向同一张图**。
+
+        为什么可以有这个判定：图床里同一个文件被放进多个相册目录是常见操作，
+        入库时每份各建一个点，于是同名点内容完全相同、只是目录不同。实测本部署
+        6,127 个重名组**全部**满足：组内 `size_bytes` 逐组一致；随机抽 13 组下载
+        全部副本算 sha256，**逐组字节完全相同**。故「同名 + 同大小」在本部署等价
+        于「同一张图」，任选一份发给用户拿到的都是同一张图。
+
+        判据（全部满足才算等价，任一不满足即判「不敢选」）：
+        - 至少 2 个点；
+        - 每个点的 `size_bytes` 都是**正数**且**组内完全一致**——缺大小就无从
+          判定，一律当作不等价，宁可退回「找不到」也不赌；
+        - `mime`（凡有值者）组内一致——防同名不同格式；
+        - `phash`（凡有值者）组内一致——回填过的点能用时，它是比大小更硬的
+          逐位证据，可**否决**「大小相同但内容不同」的巧合。
+
+        注意 phash 只作否决、不作必要条件：本部署回填刚起步（实测仅 25 个点有
+        值），要求 phash 存在会让这条修复对绝大多数名字失效。
+        """
+        if len(payloads) < 2:
+            return False
+        sizes: set = set()
+        mimes: set = set()
+        hashes: set = set()
+        for payload in payloads:
+            size = payload.get("size_bytes")
+            if not isinstance(size, (int, float)) or isinstance(size, bool) or size <= 0:
+                return False
+            sizes.add(size)
+            mime = str(payload.get("mime") or "").strip()
+            if mime:
+                mimes.add(mime)
+            phash = str(payload.get("phash") or "").strip()
+            if phash:
+                hashes.add(phash)
+        return len(sizes) == 1 and len(mimes) <= 1 and len(hashes) <= 1
+
+    @staticmethod
+    def _pick_duplicate(payloads: list[dict]) -> dict | None:
+        """在已判定等价的同名候选里**确定性地**选一份。
+
+        排序键取 `src`（图床相对路径），退化用 `image_url`。之所以要确定性而不是
+        随便取第一个：Qdrant scroll 的返回顺序不保证稳定，同一个名字两次调用可能
+        给出不同目录的直链，让用户看到「同一条命令发出的是不同链接」而怀疑数据在
+        变。按路径字典序取最小，至少保证同名请求的结果可复现。
+        """
+        usable = [p for p in payloads if str(p.get("image_url") or "").strip()]
+        if not usable:
+            return None
+        return min(usable, key=lambda p: str(p.get("src") or p.get("image_url") or ""))
+
+    async def file_name_matches(self, file_name: str) -> int | None:
+        """该文件名在库里的命中数；查询失败返回 None（区别于「确实是 0 条」）。
+
+        只服务于 `/原图` **失败路径的文案诊断**，不参与取值决策。原因：反查落空
+        后调用方会退回「裸名拼 URL + 探测」，而裸名必然 404，于是无论哪种落空原因
+        都会报成「图床里没有找到」——对「同名多份但内容不同」这一种，图其实**确实
+        存在**，用户照着提示去核对只会白跑。靠命中数把两种情况分开，才能给出可操作
+        的提示（让用户补目录）。
+
+        之所以单独发一次 count、而不是让 `original_by_file_name` 把原因带出来：
+        后者要保持「返回 dict 或 None」的简单契约，而这条诊断只在失败时才需要，
+        放在失败路径上按需付费，成功路径一次请求都不多发。
+        """
+        target = str(file_name or "").strip()
+        if not target or not self.enabled:
+            return None
+        query_filter = {"must": [{"key": "file_name", "match": {"value": target}}]}
+        return await self._count_filter(query_filter, f"文件名诊断 {target}")
 
     async def _payload_by_thumb(self, thumb_url: str) -> dict | None:
         """按 thumb_url 取回**唯一**命中点的 payload；非唯一/失败返回 None。
@@ -798,11 +912,11 @@ class VectorEngine:
         query_filter = {"must": [{"key": "thumb_url", "match": {"text": path_key}}]}
         return await self._unique_payload(query_filter, f"路径 {path_key}")
 
-    async def _unique_payload(self, query_filter: dict, label: str) -> dict | None:
-        """先 count(exact) 确认命中数恰为 1，再 scroll 取回该点 payload。
+    async def _count_filter(self, query_filter: dict, label: str) -> int | None:
+        """count(exact) 取命中数；网络/鉴权/集合缺失一律返回 None（调用方按「查不到」处理）。
 
-        count 便宜且能直接区分「没有」与「有多个」，避免拿到一页结果后还要自己
-        判断是否唯一。两步共用同一个 filter，语义一致。
+        单独抽出来是因为它现在有两个调用方（唯一性命中判定、同名多份判定），
+        而两者对「查询失败」的语义完全一致——都必须是「查不到」而不是「0 条」。
         """
         try:
             count_obj = await self._request_json(
@@ -811,34 +925,56 @@ class VectorEngine:
                 json_body={"exact": True, "filter": query_filter},
                 headers=self._qd_headers(),
             )
-            hits = int((count_obj.get("result") or {}).get("count") or 0)
+            return int((count_obj.get("result") or {}).get("count") or 0)
         except Exception as exc:  # 网络/鉴权/集合缺失一律视为「查不到」
-            logger.debug(f"缩略图反查计数失败（按查不到处理）{label}: {exc}")
+            logger.debug(f"反查计数失败（按查不到处理）{label}: {exc}")
             return None
-        if hits != 1:
-            # 0=该点没有缩略图（正常）；>1=数据异常，宁可不反查也不赌一个
-            logger.debug(f"缩略图反查命中 {hits} 条，放弃反查: {label}")
-            return None
+
+    async def _scroll_filter(self, query_filter: dict, label: str, limit: int = 1) -> list:
+        """按 filter scroll 取回 payload 列表；失败返回空列表。
+
+        只回 payload（调用方要的是 image_url/file_name/size_bytes 这些字段），
+        不取向量——2 万级点位上带向量会把响应体放大一到两个数量级。
+        """
         try:
             obj = await self._request_json(
                 "POST",
                 self._points_url("scroll"),
                 json_body={
                     "filter": query_filter,
-                    "limit": 1,
+                    "limit": max(1, int(limit)),
                     "with_payload": True,
                     "with_vector": False,
                 },
                 headers=self._qd_headers(),
             )
         except Exception as exc:
-            logger.debug(f"缩略图反查取点失败（按查不到处理）{label}: {exc}")
-            return None
+            logger.debug(f"反查取点失败（按查不到处理）{label}: {exc}")
+            return []
         points = (obj.get("result") or {}).get("points")
-        if not isinstance(points, list) or not points:
+        if not isinstance(points, list):
+            return []
+        payloads: list = []
+        for point in points:
+            payload = point.get("payload") if isinstance(point, dict) else None
+            if isinstance(payload, dict):
+                payloads.append(payload)
+        return payloads
+
+    async def _unique_payload(self, query_filter: dict, label: str) -> dict | None:
+        """先 count(exact) 确认命中数恰为 1，再 scroll 取回该点 payload。
+
+        count 便宜且能直接区分「没有」与「有多个」，避免拿到一页结果后还要自己
+        判断是否唯一。两步共用同一个 filter，语义一致。
+        """
+        hits = await self._count_filter(query_filter, label)
+        if hits != 1:
+            # 0=没有这个缩略图（正常）；>1=数据异常，宁可不反查也不赌一个
+            if hits is not None:
+                logger.debug(f"缩略图反查命中 {hits} 条，放弃反查: {label}")
             return None
-        payload = points[0].get("payload") if isinstance(points[0], dict) else None
-        return payload if isinstance(payload, dict) else None
+        payloads = await self._scroll_filter(query_filter, label, 1)
+        return payloads[0] if payloads else None
 
     # ------------------------------------------------------------------
     # 登记原图时同步入向量库（图床无服务器侧钩子时的兜底通道）

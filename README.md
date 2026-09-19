@@ -5,7 +5,7 @@
 
 **群聊里随手转发的一张图，一键找回它的原图。**
 
-[![version](https://img.shields.io/badge/version-1.7.0-blue?style=flat-square)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.7.1-blue?style=flat-square)](./CHANGELOG.md)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4?style=flat-square)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat-square)](./LICENSE)
@@ -486,10 +486,14 @@ v1.5.3 起已通过 `pillow-heif` 支持 HEIC/HEIF。若日志出现「检测到
 
 插件会**先按文件名到 Qdrant 反查**那条带完整目录的权威直链（图床的 `/file/{path}` 只认完整对象键，裸名拼上去必然 404）；反查落空时才退回按 `{图床地址}/file/{文件名}` 直接探测。
 
-若报「找不到」，通常是这两种情况：
+**同一个文件名在图床里有多份**（同一张图被放进多个相册目录）是常见情况——实测本部署 2.4 万点里约 **37% 的文件名是重名的**。v1.7.1 起这类名字**能正常取到**：插件先判定这些同名点是否指向同一张图（组内 `size_bytes` 一致即认定相同），是则确定性地取一份返回。所以「同名多份」本身不再是失败原因。
+
+若仍报「找不到」，通常是这两种情况：
 
 1. **这张图还没进索引** —— 先用 `/溯源` 命中一次该图，之后 `/原图` 就能按名取到；或让索引侧补上；
 2. **名字与图床里的实际名不一致** —— 对照报错里附上的完整直链核对。名字含上传目录时也可以直接写出来（`/原图 2026/09/abc.jpg`），能跳过反查、按路径取。
+
+若提示是「**有 N 份同名文件且内容不同**」，说明这些同名点的内容确实不一样（大小/格式/感知哈希对不上），插件**不会替你赌**哪一份是你要的——请带上目录再试（`/原图 目录名/文件名.jpg`）。
 
 若图床不是 CloudFlare-ImgBed，或文件放在自定义目录，请改用 `/溯源` 命中后再发 `/原图`。
 
