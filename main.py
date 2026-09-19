@@ -64,7 +64,7 @@ try:
         image_file_ok,
         phash_hex_len,
     )
-    from .hash_index import HashIndex
+    from .hash_index import REMOTE_HASH_PAYLOAD_KEYS, HashIndex
     from .http_client import GuardedHttpClient
     from .image_bed import MODE_CFB, ImageBedClient
     from .image_delivery import (
@@ -134,7 +134,7 @@ except ImportError:  # 兼容插件以独立模块方式加载
         image_file_ok,
         phash_hex_len,
     )
-    from hash_index import HashIndex  # type: ignore[no-redef]
+    from hash_index import REMOTE_HASH_PAYLOAD_KEYS, HashIndex  # type: ignore[no-redef]
     from http_client import GuardedHttpClient  # type: ignore[no-redef]
     from image_bed import MODE_CFB, ImageBedClient  # type: ignore[no-redef]
     from image_delivery import (  # type: ignore[no-redef]
@@ -321,6 +321,9 @@ class ImageTracePlugin(Star):
         try:
             points = await self.vector.scroll_payloads(
                 key="phash",
+                # 必须显式带上展示字段：scroll 默认只取 key 一个字段，缺 image_url
+                # 会让 HashIndex.build 把全部点判成「无直链」跳过（索引恒为 0 条）
+                with_payload_keys=list(REMOTE_HASH_PAYLOAD_KEYS),
                 page_size=512,
                 max_points=self._remote_hash_max_points(),
             )

@@ -42,7 +42,10 @@ from .library import _POPCOUNT
 DEGENERATE_SENTINEL = "-"
 
 # 翻页时顺带取回的展示字段。取值要克制：全量 2.4 万点，多取一个字段就多几百 KB。
-_PAYLOAD_KEYS = ("phash", "src", "image_url", "file_name", "mime", "created_at", "thumb_url")
+# 公开为常量供 main.py 传给 scroll_payloads：scroll 默认只取 key 一个字段，
+# 不显式带上 image_url 等字段的话，build() 会把所有点判成「无直链」整批跳过
+# （1.7.0 生产路径就因漏传该参数导致索引恒为 0 条可用）。
+REMOTE_HASH_PAYLOAD_KEYS = ("phash", "src", "image_url", "file_name", "mime", "created_at", "thumb_url")
 
 # 单页点数。512 是 Qdrant 的常用档位：再大对服务端内存压力上升，再小则请求数翻倍。
 _PAGE_SIZE = 512
