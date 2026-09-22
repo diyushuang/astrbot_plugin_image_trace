@@ -5,7 +5,7 @@
 
 **群聊里随手转发的一张图，一键找回它的原图。**
 
-[![version](https://img.shields.io/badge/version-1.7.1-blue?style=flat-square)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.7.2-blue?style=flat-square)](./CHANGELOG.md)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4?style=flat-square)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat-square)](./LICENSE)
