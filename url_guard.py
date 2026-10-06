@@ -248,7 +248,11 @@ async def read_limited_text(
     raw = await read_limited_bytes(resp, limit)
     try:
         encoding = resp.get_encoding() or "utf-8"
-    except (LookupError, ValueError):
+    except (LookupError, ValueError, RuntimeError):
+        # RuntimeError：为限长，响应体由 read_limited_bytes 手动流式读取，
+        # aiohttp 的 _body 仍为空，get_encoding 在头部未声明 charset 时
+        # 无法从响应体探测编码（application/json 已默认 utf-8，不会走到
+        # 这里）；此时头部必无 charset，按 utf-8 解码即可。
         encoding = "utf-8"
     return raw.decode(encoding, errors="replace")
 
