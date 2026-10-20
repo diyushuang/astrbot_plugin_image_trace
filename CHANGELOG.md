@@ -1,5 +1,42 @@
 # 更新日志
 
+## 1.7.3（2026-10-20，反查通道与 embed 解耦 + 失败可观测）
+
+另一台 AstrBot 实例（v4.29.1）随机图命中缩略图后回显
+「随机图命中的是缩略图且反查不到原图」，且日志里查不到任何原因。
+排除了代码（1.7.2 的反查链路在该实例上完整）与数据（Qdrant 里该缩略图按
+`thumb_path_key` 可唯一命中）之后，锁定两点：
+
+**根因一：反查通道的启用判定被一刀切。**
+`enabled = qdrant_url and embed_base_url and embed_model` 把「反查」与
+「以图搜图」绑死——反查只读 Qdrant payload、根本不碰 embed，却因缺
+embed 配置被整条禁用，且**完全静默**（连 DEBUG 日志都没有）。两者的配置
+依赖本就不同：反查只需要 Qdrant，以图搜图才需要 embed。
+
+**根因二：失败不可观测。** 五个反查入口（`thumb_url_for`、
+`original_url_for_thumb`、`original_info_for_thumb`、
+`original_by_file_name`、`file_name_matches`）在引擎不可用时一律静默返回
+None；调用方的 warning 只说「反查不到」，根因（Qdrant 未配置）无处可查。
+同日排查还确认甲骨文主实例漏部署了 4b9cdb1（url_guard 对无 charset 响应
+抛 RuntimeError 的兜底，10-06 只提交未部署，已补部署），它的症状也是
+「整条向量检索链路失败」——两台实例、两种成因，日志上却难以区分。
+
+- `vector_search.py`：新增 `qdrant_ready = bool(qdrant_url)`，五个反查
+  入口的启用判定从 `enabled` 解耦为 `qdrant_ready`——缺 embed 时反查
+  仍可用（以图搜图不受影响、仍按 `enabled` 判定）；不可用时统一经
+  `_debug_disabled()` 留一行 DEBUG，把「为什么没查」说清楚。
+- `main.py`：随机图反查失败的 warning 带上引擎状态——未配置给配置指引、
+  缺 embed 说明反查仍可用、配置齐全指向 DEBUG 日志，不再是一句无从
+  下手的「反查不到」。
+
+**测试**：277 → **279 passed**（新增 2 例：缺 embed 反查仍可用；未配
+Qdrant 时返回 None 且留 DEBUG 记录；另有 2 例既有用例随新语义更新为
+钉死 `qdrant_ready`）；`ruff check` 全绿。
+
+**已知约束**：反查依然要求 Qdrant 可达（`qdrant_url` 必须能连通）；
+`enabled` 语义不变（完整向量检索仍需 embed 三件套），`/溯源` 的向量腿
+仍按 `enabled` 判定——缺 embed 时「以图搜图」不可用是预期行为。
+
 ## 1.7.2（2026-09-22，修复图床哈希索引刷新恒为 0 条可用）
 
 服务端 pHash 全量回填完成（23,932 点、覆盖率 100%、失败 0）后上线 1.7.1，

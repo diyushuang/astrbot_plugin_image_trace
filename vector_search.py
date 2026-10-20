@@ -196,6 +196,12 @@ class VectorEngine:
         self._http_getter = http_getter
         # embed_api_key 不参与启用判定：网关未开鉴权时留空是合法场景
         self.enabled = bool(self.qdrant_url and self.embed_base_url and self.embed_model)
+        # 反查通道（按 thumb_url / file_name 查 payload）只依赖 Qdrant、不碰
+        # embed，因此启用判定必须与 enabled 解耦：只配了 Qdrant、缺 embed 时
+        # enabled=False，但反查必须仍然可用。2026-10-20 线上排查实录：另一台
+        # AstrBot 实例（v4.29.1）配了 Qdrant 却因 enabled 一刀切为 False，
+        # 随机图命中缩略图后的反查全部静默失败，warning 里又无线索可查。
+        self.qdrant_ready = bool(self.qdrant_url)
 
     @staticmethod
     def _normalize_base_url(value: object) -> str:
@@ -204,6 +210,19 @@ class VectorEngine:
             logger.warning("忽略非法向量服务地址（必须以 http/https 开头）")
             return ""
         return base_url
+
+    @staticmethod
+    def _debug_disabled(action: str) -> None:
+        """反查入口不可用时的统一 DEBUG 说明。
+
+        这些入口长期「静默返回 None」：调用方的 warning 只说「反查不到」，
+        根因（Qdrant 未配置）连 DEBUG 日志里都找不到——2026-10-20 跨实例排查
+        时只能逐台实测。统一留一行 DEBUG，把「为什么没查」说清楚。
+        """
+        logger.debug(
+            f"向量引擎不可用（Qdrant 未配置），{action}按未命中处理；"
+            "补齐 vector_search.qdrant_url 并重启插件后生效"
+        )
 
     # ------------------------------------------------------------------
     # 配置诊断
@@ -624,7 +643,10 @@ class VectorEngine:
         绝不能因为查不到替身而让发送失败。
         """
         key = str(file_id or "").strip()
-        if not key or not self.enabled:
+        if not key:
+            return None
+        if not self.qdrant_ready:
+            self._debug_disabled("按点 id 查缩略图替身")
             return None
         try:
             obj = await self._request_json(
@@ -669,7 +691,10 @@ class VectorEngine:
         调用方走原有的「按名直查」逻辑，绝不能让 /原图 因为反查失败而不可用。
         """
         target = str(thumb_url or "").strip()
-        if not target or not self.enabled:
+        if not target:
+            return None
+        if not self.qdrant_ready:
+            self._debug_disabled("按缩略图直链反查原图直链")
             return None
         payload = await self._payload_by_thumb(target)
         if payload is None:
@@ -697,7 +722,10 @@ class VectorEngine:
         与 original_url_for_thumb 同样：命中数非 1 一律放弃，永不抛错。
         """
         target = str(thumb_url or "").strip()
-        if not target or not self.enabled:
+        if not target:
+            return None
+        if not self.qdrant_ready:
+            self._debug_disabled("按缩略图直链反查原图信息")
             return None
         payload = await self._payload_by_thumb(target)
         if payload is None:
@@ -745,7 +773,10 @@ class VectorEngine:
         本方法**永不抛错**，失败一律返回 None。
         """
         target = str(file_name or "").strip()
-        if not target or not self.enabled:
+        if not target:
+            return None
+        if not self.qdrant_ready:
+            self._debug_disabled("按文件名反查原图")
             return None
         query_filter = {"must": [{"key": "file_name", "match": {"value": target}}]}
         label = f"文件名 {target}"
@@ -856,7 +887,10 @@ class VectorEngine:
         放在失败路径上按需付费，成功路径一次请求都不多发。
         """
         target = str(file_name or "").strip()
-        if not target or not self.enabled:
+        if not target:
+            return None
+        if not self.qdrant_ready:
+            self._debug_disabled("按文件名诊断命中数")
             return None
         query_filter = {"must": [{"key": "file_name", "match": {"value": target}}]}
         return await self._count_filter(query_filter, f"文件名诊断 {target}")

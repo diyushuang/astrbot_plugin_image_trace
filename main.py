@@ -2781,7 +2781,21 @@ class ImageTracePlugin(Star):
                     # 真名取自 payload.file_name（图床没改过名的原始名）
                     original_name = str(info.get("file_name") or "").strip()
                 else:
-                    logger.warning(f"随机图命中的是缩略图且反查不到原图: {media_url}")
+                    # 2026-10-20 排查实录：反查失败的原因有多种——引擎未配置、
+                    # Qdrant 请求失败、数据未命中——后两者各有 DEBUG 记录（线上
+                    # 默认 INFO 看不到），而「引擎未配置」历史上完全静默，导致
+                    # warning 里看不出任何线索、跨实例排查只能逐台实测。把引擎
+                    # 状态直接写进 warning：未配置 → 给配置指引；缺 embed（此时
+                    # 反查仍可用）→ 说明只影响以图搜图；配置齐全 → 指向 DEBUG。
+                    if not self.vector.qdrant_ready:
+                        hint = "向量引擎未配置，请在插件配置 vector_search 一节补齐"
+                    elif not self.vector.enabled:
+                        hint = "向量引擎缺 embed 配置（反查仍可用，仅以图搜图不可用）"
+                    else:
+                        hint = "原因见 DEBUG 日志"
+                    logger.warning(
+                        f"随机图命中的是缩略图且反查不到原图（{hint}）: {media_url}"
+                    )
             send_url = await self._random_send_url(original_url, settings)
             # 配文一律用**原图**名并清洗掉图床改名的前缀（时间戳 + `@` 换 `_`），
             # 显示缩略图名对用户没有意义
