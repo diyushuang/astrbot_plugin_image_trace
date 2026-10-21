@@ -2436,7 +2436,7 @@ class ImageTracePlugin(Star):
         查不到时返回 ("", "")，调用方据此给出可读提示；宁可说「找不到」，也
         绝不把缩略图当原图发出去。
         """
-        if not self.vector.enabled:
+        if not self.vector.qdrant_ready:
             return "", ""
         reference = str(thumb_ref or "").strip()
         if not reference:
@@ -2470,6 +2470,36 @@ class ImageTracePlugin(Star):
             or ""
         )
         # 反查到的原图直链可能带处理参数（图床缓存过的形态），按原图口径还原
+        return display, build_original_url(info["url"])
+
+    async def _original_from_thumb_name(self, name: str) -> tuple[str, str]:
+        """按「缩略图改名后的文件名」反查原图 (名称, 直链)；查不到返回 ("", "")。
+
+        与 `_original_from_thumbnail` 的分工：那个认**带 `thumbnails/` 段**的直链，
+        这个只认**文件名**，用于目录段已经在流转中丢掉的场景（QQ 把机器人发的图
+        转存到自己的 CDN 后，插件拿到的只有裸文件名）。两者都是反查，返回的都
+        是同一个 Qdrant 点上的原图直链。
+
+        展示名取 payload.file_name（图床登记真名，`@` 完好）；反查失败返回空，
+        由调用方继续走裸名探测与可读提示——**绝不把缩略图当原图发出去**。
+        """
+        if not self.vector.qdrant_ready:
+            return "", ""
+        query = str(name or "").strip()
+        if not query:
+            return "", ""
+        try:
+            info = await self.vector.original_info_for_thumb_name(query)
+        except Exception as exc:  # original_info_for_thumb_name 已兜错，再保一层
+            logger.debug(f"按缩略图名反查原图失败: {exc}")
+            info = None
+        if not info or not info.get("url"):
+            return "", ""
+        display = (
+            str(info.get("file_name") or "").strip()
+            or clean_display_name(info["url"])
+            or query
+        )
         return display, build_original_url(info["url"])
 
     async def _lookup_imgbed_file(self, name: str, *, quoted: str = "") -> tuple[str, str, str]:
@@ -2534,6 +2564,21 @@ class ImageTracePlugin(Star):
             original_name, original_url = found
             logger.info(f"/原图 按名反查命中原图: {name} -> {original_url}")
             return original_name, original_url, ""
+        # ①.5 名字本身是「缩略图被改名后的文件名」时，按缩略图名反查原图。
+        #     这一段要放在 ② 之前：这类名字（`1789…_【微博_…】.jpg`）在图床里
+        #     只存在于 `thumbnails/` 下，裸名拼 URL 必然 404，探测只会给出
+        #     「图床里没有找到」这种让人白核对的提示。
+        #
+        #     为什么 ① 拦不住它：① 按 payload.file_name 精确匹配，而缩略图名
+        #     被图床改过（前置毫秒时间戳、`@` 换成 `_`，且 `_` 不可逆）。
+        #     为什么 quoted 也可能拦不住：用户引用机器人消息时，QQ 会把图转存到
+        #     自己的 CDN，插件手上的直链里**没有 `thumbnails/` 段**，
+        #     `is_thumbnail_url` 只能返回 False，于是走到这里。
+        thumb_hit = await self._original_from_thumb_name(name)
+        if thumb_hit[1]:
+            original_name, original_url = thumb_hit
+            logger.info(f"/原图 按缩略图名反查回原图: {name} -> {original_url}")
+            return original_name, original_url, ""
         # ② 反查未命中（未进索引 / 同名多份 / 向量检索关闭）→ 退回裸名拼 URL + 探测，
         #    对根目录文件与「用户直接给完整相对路径」两种情形仍然管用
         candidate = build_imgbed_file_url(base, name)
@@ -2567,7 +2612,7 @@ class ImageTracePlugin(Star):
         对齐库内 `VectorEngine.file_name_matches`——本方法存在的意义只是把
         「引擎未启用 / 异常」收敛成 None，让调用方不必到处判 self.vector。
         """
-        if not self.vector.enabled:
+        if not self.vector.qdrant_ready:
             return None
         try:
             return await self.vector.file_name_matches(name)
@@ -2593,7 +2638,7 @@ class ImageTracePlugin(Star):
         本方法**永不抛错**：反查只是获取目录层级的捷径，失败由调用方走兜底。
         """
         query = str(name or "").strip()
-        if not query or "/" in query or not self.vector.enabled:
+        if not query or "/" in query or not self.vector.qdrant_ready:
             return "", ""
         try:
             info = await self.vector.original_by_file_name(query)
@@ -2669,6 +2714,10 @@ class ImageTracePlugin(Star):
         # 引用图里的**原始**直链/名字：保留 `thumbnails/` 路径段，供缩略图判定与
         # 反查使用（反查要拼出与 Qdrant payload 同形的完整缩略图直链）
         quoted = ""
+        # 取值来源，只用于日志：历史命中 / 按名直查 / 缩略图反查。
+        # 线上排查时「/原图 到底走了哪条路」是最关键的一条信息，而历史命中
+        # 这条最常见、却原本一行日志都不打，导致日志里完全看不到命令执行过。
+        source = "history"
         if query:
             status, payload = self.history.find(session, query)
             if status == "ambiguous":
@@ -2702,6 +2751,7 @@ class ImageTracePlugin(Star):
             if not query:
                 yield event.plain_result(self._original_usage())
                 return
+            source = "lookup"
             name, url, message = await self._lookup_imgbed_file(query, quoted=quoted)
             if not url:
                 yield event.plain_result(message)
@@ -2716,6 +2766,7 @@ class ImageTracePlugin(Star):
             if original_url:
                 logger.info(f"/原图 历史命中缩略图，已反查回原图: {url} -> {original_url}")
                 name, url = original_name, original_url
+                source = "history-thumb-reverse"
             else:
                 yield event.plain_result(
                     f"本会话记录的「{name}」是缩略图，且查不到它对应的原图；"
@@ -2724,7 +2775,19 @@ class ImageTracePlugin(Star):
                 return
         # R6：/原图 只发 URL、不落地字节——剥离 ImgBed 处理参数还原未处理原文件，
         # 并强制 original-url + 禁用本地回退
-        block = {"url": build_original_url(url), "file_name": name}
+        final_url = build_original_url(url)
+        # 最后一次校验：走到这里说明上游每一条路径都「自认为」拿到的是原图，
+        # 但只要最终直链仍指向缩略图目录，就绝不能发出去——静默发出一张 720px
+        # 小图，用户只会觉得「/原图 又没生效」，比明确报错难排查得多。
+        if is_thumbnail_url(final_url):
+            logger.warning(f"/原图 最终直链仍是缩略图，已拒绝发送: {final_url}")
+            yield event.plain_result(
+                f"取到的「{name}」仍是图床里的缩略图直链，已中止发送；"
+                "请改用原图文件名，或先 /溯源 命中该图后再发 /原图。"
+            )
+            return
+        logger.info(f"/原图 发出（来源={source}）: {name} <- {final_url}")
+        block = {"url": final_url, "file_name": name}
         async for result in self._yield_delivery(
             event,
             f"🖼️ {name}（原图）",
@@ -2848,8 +2911,8 @@ class ImageTracePlugin(Star):
         file_id = self._bed_file_id(media_url)
         if not file_id:
             return media_url
-        if not self.vector.enabled:
-            # 向量引擎没配好就无从查替身；这不是错误，直接发原图
+        if not self.vector.qdrant_ready:
+            # 向量库没配好就无从查替身；这不是错误，直接发原图
             return media_url
         try:
             thumb = await self.vector.thumb_url_for(file_id)

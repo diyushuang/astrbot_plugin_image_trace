@@ -22,6 +22,7 @@ import base64
 import json
 import math
 import os
+import re
 import time
 import uuid
 from typing import Any
@@ -736,6 +737,71 @@ class VectorEngine:
         return {
             "url": original,
             "file_name": str(payload.get("file_name") or "").strip(),
+        }
+
+    async def original_info_for_thumb_name(self, thumb_name: str) -> dict | None:
+        """按「缩略图改名后的**文件名**」反查原图；无法唯一确定时返回 None。
+
+        为什么必须单独有这一条：`original_info_for_thumb` 的判据是直链路径里
+        含 `thumbnails` 段。一旦这一段在流转中丢掉，整条反查就**静默失效**：
+
+        - 用户引用机器人发出的图片时，QQ 会把图转存到自己的 CDN，插件拿到的
+          `url` 是 `multimedia.nt.qq.com.cn/...`，`file` 只剩一个裸文件名；
+        - `clean_display_name()` 按设计只取末段（展示用），目录层级同样被丢掉。
+
+        这两种情形手上只剩「图床给缩略图改过名的那个文件名」
+        （`1789658616018_【微博_赵今麦工作室official】….jpg`，`@` 已被换成 `_`）。
+        此时按 `file_name` 反查原图必然 0 命中（真名里是 `@`、且没有时间戳前缀），
+        裸名拼 `/file/{name}` 又必然 404 —— 用户看到的就是「图床里没有找到」。
+
+        匹配分两步：先用 `match.text` 搜 `thumb_url`（库里存的是同一个被改名的
+        串）缩小候选，再**在本地按 basename 精确比对**。后者才是判据——`text`
+        匹配是分词匹配，拿它当命中依据会误配。
+
+        返回的仍是**同一点上的原图**（`image_url` + `file_name`），所以即便调用方
+        传进来的是原图名（碰巧命中缩略图字段），拿回的也是同一张图的原图直链，
+        不会张冠李戴。候选非唯一（同名多目录）一律放弃，交调用方走原逻辑。
+
+        本方法**永不抛错**：与其余反查入口一致，查不到就当没查到。
+        """
+        raw = str(thumb_name or "").strip()
+        if not raw:
+            return None
+        if not self.qdrant_ready:
+            self._debug_disabled("按缩略图文件名反查原图")
+            return None
+        # 只取文件名：调用方可能给的是相对路径
+        name = unquote(raw.rsplit("/", 1)[-1]).strip()
+        if not name or "." not in name:
+            return None
+        # 与 random_media.THUMBNAIL_PREFIX_PATTERN 保持同一口径：只剥起始的
+        # 「10 位以上数字 + 下划线」，不做任何猜测性还原（`@`→`_` 不可逆）
+        stripped = re.sub(r"^\d{10,}_", "", name).strip()
+        if not stripped:
+            return None
+        query_filter = {"must": [{"key": "thumb_url", "match": {"text": stripped}}]}
+        payloads = await self._scroll_filter(
+            query_filter, f"缩略图名 {stripped}", 20
+        )
+        hits: list[dict] = []
+        for payload in payloads:
+            thumb = str(payload.get("thumb_url") or "").strip()
+            if not thumb:
+                continue
+            base = unquote(thumb_path_key(thumb).rsplit("/", 1)[-1]).strip()
+            if base in (stripped, name):
+                hits.append(payload)
+        if len(hits) != 1:
+            logger.debug(
+                f"按缩略图文件名反查命中 {len(hits)} 条，放弃反查: {stripped}"
+            )
+            return None
+        original = str(hits[0].get("image_url") or "").strip()
+        if not original:
+            return None
+        return {
+            "url": original,
+            "file_name": str(hits[0].get("file_name") or "").strip(),
         }
 
     async def original_by_file_name(self, file_name: str) -> dict | None:
