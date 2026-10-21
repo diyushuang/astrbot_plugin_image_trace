@@ -800,23 +800,23 @@ class VectorEngine:
             logger.debug(f"按缩略图文件名反查未命中: {stripped}")
             return None
         if len(hits) > 1:
-            # 命中多条时先按**原图直链**去重：图床侧同一文件被重复入库时，
-            # 会产生多个点、每点一个不同时间戳的缩略图副本（实测
-            # `1789658616018_…` 与 `1789659967539_…` 就是同一张图的两份），
-            # 此时原图直链唯一，取哪一个都对。
-            # 原图直链不唯一才说明是「同名不同图」，那才是真的不能猜。
-            originals = {
-                str(item.get("image_url") or "").strip() for item in hits
-            }
-            originals.discard("")
-            if len(originals) != 1:
+            # 命中多条是常态而不是异常：图床里同一个文件常被放进多个相册目录，
+            # 入库时每份各建一个点（各带一份不同时间戳的缩略图副本）。实测本部署
+            # 6,127 个重名组全部满足「同名 + 同大小 + 同 phash」，即同一张图。
+            # 故直接复用 `_duplicate_equivalent` 的既有口径：等价才选一份，
+            # 不等价（真正的同名不同图）一律放弃，绝不赌。
+            if not self._duplicate_equivalent(hits):
                 logger.debug(
-                    f"按缩略图文件名反查命中 {len(hits)} 条且原图不同，放弃: {stripped}"
+                    f"按缩略图文件名反查命中 {len(hits)} 条且不等价，放弃: {stripped}"
                 )
                 return None
+            chosen = self._pick_duplicate(hits)
+            if chosen is None:
+                return None
             logger.debug(
-                f"按缩略图文件名反查命中 {len(hits)} 条重复点（原图相同），取其一: {stripped}"
+                f"按缩略图文件名反查命中 {len(hits)} 条等价点，已按路径字典序选定: {stripped}"
             )
+            hits = [chosen]
         original = str(hits[0].get("image_url") or "").strip()
         if not original:
             return None
