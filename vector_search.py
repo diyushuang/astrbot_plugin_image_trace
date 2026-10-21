@@ -789,13 +789,34 @@ class VectorEngine:
             if not thumb:
                 continue
             base = unquote(thumb_path_key(thumb).rsplit("/", 1)[-1]).strip()
-            if base in (stripped, name):
+            # 两侧都要「带前缀/不带前缀」各比一次：调用方手上的名字可能已被上游
+            # 剥掉毫秒前缀（`strip_leading_decoration` 就会剥），而库里存的
+            # `thumb_url` 一定带前缀——只比原始形态会漏掉这种最常见的情形
+            # （实测：带前缀的名字能命中，剥掉前缀后命中数直接从 1 掉到 0）。
+            base_stripped = re.sub(r"^\d{10,}_", "", base).strip()
+            if base in (name, stripped) or base_stripped in (name, stripped):
                 hits.append(payload)
-        if len(hits) != 1:
-            logger.debug(
-                f"按缩略图文件名反查命中 {len(hits)} 条，放弃反查: {stripped}"
-            )
+        if not hits:
+            logger.debug(f"按缩略图文件名反查未命中: {stripped}")
             return None
+        if len(hits) > 1:
+            # 命中多条时先按**原图直链**去重：图床侧同一文件被重复入库时，
+            # 会产生多个点、每点一个不同时间戳的缩略图副本（实测
+            # `1789658616018_…` 与 `1789659967539_…` 就是同一张图的两份），
+            # 此时原图直链唯一，取哪一个都对。
+            # 原图直链不唯一才说明是「同名不同图」，那才是真的不能猜。
+            originals = {
+                str(item.get("image_url") or "").strip() for item in hits
+            }
+            originals.discard("")
+            if len(originals) != 1:
+                logger.debug(
+                    f"按缩略图文件名反查命中 {len(hits)} 条且原图不同，放弃: {stripped}"
+                )
+                return None
+            logger.debug(
+                f"按缩略图文件名反查命中 {len(hits)} 条重复点（原图相同），取其一: {stripped}"
+            )
         original = str(hits[0].get("image_url") or "").strip()
         if not original:
             return None
