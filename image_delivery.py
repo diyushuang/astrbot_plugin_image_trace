@@ -8,6 +8,7 @@ import io
 import ipaddress
 import math
 from collections.abc import Mapping
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
@@ -130,6 +131,51 @@ def delivery_settings(config: Any) -> tuple[str, int, int, str]:
     if style not in SCALED_URL_STYLES:
         style = "query"
     return mode, max_side, quality, style
+
+
+# ---------------------------------------------------------------------------
+# 推送目标画像：所有「按平台分叉」的判断都收口到这里
+# ---------------------------------------------------------------------------
+
+_ONEBOT_PLATFORM = "aiocqhttp"
+# 媒体经第三方服务器转存/拉流的平台关键字（平台名去分隔符后小写匹配）
+_OFFBOX_PLATFORM_HINTS = ("qqofficial",)
+
+
+@dataclass(frozen=True)
+class DeliveryTarget:
+    """一个平台「能把图片怎么送出去」的能力画像。
+
+    这些判断此前散在三个静态方法里（能否 OneBot 直发 / 媒体是否经第三方转存 /
+    能否渲染原生 At），同一件事在不同代码路径上各问一遍，等于各有各的真相。
+    收成一个不可变画像后：判定只有一处、传参只有一份、测试只覆盖一个纯函数。
+
+    - direct_send：有 OneBot 原生接口可直发（图片字节/URL 段、纯文本）。
+      aiocqhttp 且 bot 就绪才为真——bot 缺席时 call_action 必失败。
+    - offbox_upload：媒体会经第三方服务器转存（qq_official）。这类平台既要
+      格式白名单体检（假 jpg 会被打回），也要考虑上传通道能否绕开适配器
+      固定的 base64 直传上限。
+    - native_mention：能把 At 段渲染成真正的 @。仅 aiocqhttp；其余平台会把
+      At 拼成平台标记原文糊在文案前，故不加。
+    """
+
+    name: str
+    direct_send: bool
+    offbox_upload: bool
+    native_mention: bool
+
+
+def delivery_target(platform: str, *, has_bot: bool = True) -> DeliveryTarget:
+    """按平台名构造推送目标画像（纯函数，测试无需 astrbot 运行时）。"""
+    name = str(platform or "").strip().lower()
+    compact = name.replace("_", "").replace("-", "")
+    onebot = name == _ONEBOT_PLATFORM
+    return DeliveryTarget(
+        name=name,
+        direct_send=onebot and bool(has_bot),
+        offbox_upload=any(hint in compact for hint in _OFFBOX_PLATFORM_HINTS),
+        native_mention=onebot,
+    )
 
 
 # ---------------------------------------------------------------------------

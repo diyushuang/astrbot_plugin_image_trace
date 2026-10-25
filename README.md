@@ -5,7 +5,7 @@
 
 **群聊里随手转发的一张图，一键找回它的原图。**
 
-[![version](https://img.shields.io/badge/version-1.7.11-blue?style=flat-square)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.7.12-blue?style=flat-square)](./CHANGELOG.md)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4?style=flat-square)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat-square)](./LICENSE)
@@ -30,9 +30,10 @@ _An AstrBot plugin that traces a reposted, compressed or cropped image back to i
 | | | |
 | --- | --- | --- |
 | [特性一览](#特性一览) | [快速开始](#快速开始) | [安装](#安装) |
-| [指令](#指令) | [配置项](#配置项) | [存储对接](#存储对接) |
-| [向量引擎](#向量引擎qdrant--多模态向量-ai) | [本地目录建库](#本地目录建库) | [工作原理](#工作原理) |
-| [项目结构与开发](#项目结构与开发) | [常见问题](#常见问题) | [数据与要求](#数据存储与环境要求) |
+| [指令](#指令) | [配置项](#配置项) | [图片推送结构](#图片推送三层结构) |
+| [存储对接](#存储对接) | [向量引擎](#向量引擎qdrant--多模态向量-ai) | [本地目录建库](#本地目录建库) |
+| [工作原理](#工作原理) | [项目结构与开发](#项目结构与开发) | [常见问题](#常见问题) |
+| [数据与要求](#数据存储与环境要求) | [参与贡献](#参与贡献) | [许可证](#许可证) |
 
 ## 特性一览
 
@@ -178,6 +179,33 @@ flowchart LR
 | `random_media.send_thumbnail` | `true` | `/随机图` 发送缩略图替身：按图床取原图后，再按原图 id 查它同一点的 `thumb_url` 发出（小文件、协议端下载快）。会话历史仍记原图，故 `/原图` 仍返回全尺寸；查不到替身时自动发原图 |
 | `advanced_settings` | `false` | 面板收纳开关 |
 | `vector_search.advanced` | `false` | 面板收纳开关：开启后才显示向量引擎的进阶项 |
+
+<a id="图片推送三层结构"></a>
+
+## 图片推送：三层结构
+
+图片从图床到 QQ 要经过三个**互相独立**的决策点。分开的理由很实际：混在一起时，用户看到三个开关（回传模式、上传通道、发送缩略图）根本判断不出哪个说了算，出了问题也不知道该关哪个。
+
+| 层 | 决定什么 | 配置项 | 可选值 |
+| --- | --- | --- | --- |
+| **③ 内容** | 配什么文 | 无（自动） | 配文与「已压缩」标识按实测证据生成 |
+| **② 形态** | 发哪一份图 | `random_media.send_thumbnail` | 缩略图替身（720px） / 原图 |
+| **① 通道** | 怎么把图送出去 | `image_delivery.mode`（aiocqhttp）<br>`qq_upload.mode`（qq_official） | 见下方两个折叠块 |
+
+**优先级**：`qq_official` 且 `qq_upload.mode ≠ direct` 时，先由通道层的「上传通道」接管；接管失败（或设成 `direct`＝关闭本组）才回落到 `image_delivery.mode` 的原逻辑。其余平台只用 `image_delivery.mode`。
+
+**互不覆盖**：换通道不改「发哪一份图」，换形态不改「走哪条通道」。所以「随机图发缩略图 + QQ 分片上传」这种组合是合法的——缩略图先替身，替身再按体积选上传通道。
+
+常见诉求对应到哪一层：
+
+| 我想… | 改哪一层 | 具体改动 |
+| --- | --- | --- |
+| QQ 官方机器人发大图不再报「上传文件大小超过限制」 | ① 通道 | `qq_upload.mode=auto`（默认） |
+| 图床只有内网、腾讯拉不到 | ① 通道 | `qq_upload.auto_prefer=chunked` |
+| 少走本机带宽、发图更快 | ① 通道 | `qq_upload.auto_prefer=url`（默认） |
+| 随机图发小图省流量 | ② 形态 | `random_media.send_thumbnail=true` |
+| 随机图也要原图 | ② 形态 | `random_media.send_thumbnail=false` |
+| NapCat 侧压缩一定要生效 | ① 通道 | `image_delivery.mode=local-compress`（默认） |
 
 <a id="回图模式"></a>
 

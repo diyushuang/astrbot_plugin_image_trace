@@ -73,6 +73,7 @@ try:
     from .image_bed import MODE_CFB, ImageBedClient
     from .image_delivery import (
         CompressionEvidence,
+        DeliveryTarget,
         SendOutcome,
         bounded_int,
         build_imgbed_file_url,
@@ -85,6 +86,7 @@ try:
         content_length_from_headers,
         deduplicate_vector_hits,
         delivery_settings,
+        delivery_target,
         is_napcat_parseable_url,
         is_public_http_url,
         is_scaling_capability_rejection,
@@ -150,6 +152,7 @@ except ImportError:  # 兼容插件以独立模块方式加载
     from image_bed import MODE_CFB, ImageBedClient  # type: ignore[no-redef]
     from image_delivery import (  # type: ignore[no-redef]
         CompressionEvidence,
+        DeliveryTarget,
         SendOutcome,
         bounded_int,
         build_imgbed_file_url,
@@ -162,6 +165,7 @@ except ImportError:  # 兼容插件以独立模块方式加载
         content_length_from_headers,
         deduplicate_vector_hits,
         delivery_settings,
+        delivery_target,
         is_napcat_parseable_url,
         is_public_http_url,
         is_scaling_capability_rejection,
@@ -960,21 +964,21 @@ class ImageTracePlugin(Star):
         return tuple(host for host in hosts if host)
 
     @staticmethod
-    def _media_url_fetched_offbox(event: AstrMessageEvent) -> bool:
-        """该平台发媒体是否由第三方服务器按 URL 拉流/转存（而非本机下载）。
+    def _delivery_target(event: AstrMessageEvent) -> DeliveryTarget:
+        """当前事件的推送目标画像——平台判定的唯一入口。
 
-        QQ 官方机器人（qq_official / qqofficial_webhook）：视频 URL 原样交给
-        腾讯服务器下载，内网直连地址它访问不到，须回退公网直链（腾讯侧 DNS
-        不受本机解析影响）；图片虽是本机下载后 base64 上传，但字节会经腾讯
-        富媒体接口**转存**，格式必须满足其白名单（假 jpg 的 HEIF/AVIF 会被
-        打回「富媒体文件格式不支持」）。aiocqhttp（NapCat，与 AstrBot 同机）
-        等平台由本机拉流，无上述限制。
+        此前「能不能 OneBot 直发」「媒体是否经第三方转存」「能不能渲染原生 At」
+        是三个各自去问 get_platform_name() 的静态方法，同一次推送里被反复问、
+        也没有任何地方能一眼看出这些能力之间的约束关系。现在统一由这里构造，
+        各分支只读字段（见 image_delivery.DeliveryTarget）。
         """
         try:
-            name = str(event.get_platform_name() or "").lower()
+            platform = str(event.get_platform_name() or "")
         except Exception:
-            return False
-        return "qqofficial" in name.replace("_", "").replace("-", "")
+            platform = ""
+        return delivery_target(
+            platform, has_bot=getattr(event, "bot", None) is not None
+        )
 
     @staticmethod
     def _random_bool(value, default: bool) -> bool:
@@ -1019,25 +1023,23 @@ class ImageTracePlugin(Star):
             )
 
     def _can_send_via_onebot(self, event: AstrMessageEvent) -> bool:
-        try:
-            if event.get_platform_name() != "aiocqhttp":
-                return False
-        except Exception:
-            return False
-        return getattr(event, "bot", None) is not None
+        """能否用 OneBot 原生接口直发（图片字节/URL 段、纯文本）。
 
-    @staticmethod
-    def _mention_prefix(event: AstrMessageEvent) -> list:
-        """回传链开头的「@发送者」段；仅 OneBot(aiocqhttp) 平台启用。
+        保留为薄封装：判定已收口到 _delivery_target（aiocqhttp 且 bot 就绪）。
+        """
+        return self._delivery_target(event).direct_send
+
+    def _mention_prefix(self, event: AstrMessageEvent) -> list:
+        """回传链开头的「@发送者」段；仅能渲染原生 At 的平台启用。
 
         qq_official 等平台没有原生 At 段：适配器会把 At 转成平台标记原文
         （`<qqbot-at-user id="..."/>`）拼进纯文本，而官方群消息的纯文本并不
         渲染该标记（仅 markdown 消息类型生效），用户看到的就是一串“代码”
         糊在文案前。故 @ 前缀只给能原生渲染它的 aiocqhttp，其余平台不加。
         """
+        if not self._delivery_target(event).native_mention:
+            return []
         try:
-            if event.get_platform_name() != "aiocqhttp":
-                return []
             sender = str(event.get_sender_id() or "").strip()
         except Exception:
             return []
@@ -1510,20 +1512,18 @@ class ImageTracePlugin(Star):
         if self._event_already_sent(event):
             logger.warning("本次事件已投递过图片，跳过重复投递")
             return
+        target = self._delivery_target(event)
         self._remember_blocks(event, blocks if remember_blocks is None else remember_blocks)
-        if self._media_url_fetched_offbox(event):
-            # qq_official 等第三方转存平台：图片字节终会过腾讯富媒体上传，
-            # 假格式（扩展名 .jpg 实为 HEIF/AVIF/WEBP，微博 live 图常见）会被
-            # 打回「富媒体文件格式不支持」。历史已按原始直链记好（上一行），
-            # 这里只改写**发送**用的 block：可转码 → 本地 JPEG path；不可转码
-            # → 缩略图替身 URL。溯源 / 随机图 / 原图 三条路径由此统一覆盖
-            blocks = await self._offbox_rewrite_blocks(blocks)
-            # 上传通道分流（qq_upload 组）：direct 之外由插件自己按 url/chunked
-            # 上传并发消息，绕开适配器「图片恒 base64 直传、5MB 上限」那条路。
-            # 接管成功后必须标记已发送并 stop_event，否则 respond stage 会再发一遍
-            if await self._qq_upload_takeover(
+        if target.offbox_upload:
+            # 第三方转存平台的两个前置动作（格式体检 → 上传通道接管）收在一个
+            # 入口里：前者可能把假格式换成 path/缩略图 URL，后者必须拿着改写后
+            # 的 block 才能判断该走 URL 还是分片，顺序不可交换
+            blocks, handled = await self._offbox_pipeline(
                 event, header, blocks, mark_compressed=mark_compressed
-            ):
+            )
+            if handled:
+                # 通道接管已自行发完消息：必须标记已发送并 stop_event，否则
+                # respond stage 会照原路（base64 直传）再发一遍
                 self._mark_event_sent(event)
                 event.stop_event()
                 return
@@ -1542,7 +1542,7 @@ class ImageTracePlugin(Star):
         direct_ok = (
             direct_mode
             and all_urls
-            and self._can_send_via_onebot(event)
+            and target.direct_send
             and (mode == "original-url" or all(is_napcat_parseable_url(u) for u in raw_urls))
         )
 
@@ -1567,9 +1567,9 @@ class ImageTracePlugin(Star):
             )
             # 走 URL 直传但没能直发成功：既包括 FAILED 后的回退，也包括扩展名
             # 让协议端解析不了宽高、压根没尝试直发的情形（改本地压缩成 JPEG 再发）
-            onebot_failed = self._can_send_via_onebot(event) and direct_mode and all_urls
+            onebot_failed = target.direct_send and direct_mode and all_urls
             if should_compress or onebot_failed:
-                if mode == "local-compress" and self._can_send_via_onebot(event):
+                if mode == "local-compress" and target.direct_send:
                     # OneBot 下 local-compress 直发压缩字节（混合载荷）：压缩结果
                     # 经 base64 段直达 QQ，不经协议端二次下载，压缩 100% 生效
                     outcome = await self._local_compress_delivery(
@@ -2962,14 +2962,15 @@ class ImageTracePlugin(Star):
             # 改写幂等；公网域名形式的直链也一并收进来），后续取字节不出公网
             media_url = swap_url_origin(media_url, settings["lan_base_url"], lan_hosts)
         media_url = upgrade_to_https(media_url, settings["base_url"])
+        target = self._delivery_target(event)
         kind = media_kind(media_url, content_type)
         if kind == "video":
+            # 官方机器人等平台把视频 URL 交给腾讯服务器拉流，内网地址它访问
+            # 不到，须换回公网直链；换不出来（第三方内网地址等）就保持原样，
+            # 与图片 URL 上传共用同一套换源判定（_public_media_url）
             send_url = media_url
-            if lan_hosts and self._media_url_fetched_offbox(event):
-                # 官方机器人等平台把视频 URL 交给腾讯服务器拉流，内网地址它
-                # 访问不到，改写回公网直链（路径不变；且 /random 走内网时返回的
-                # 直链本身已是内网源，必须显式换源而不是“不替换”）
-                send_url = swap_url_origin(media_url, settings["base_url"], lan_hosts)
+            if target.offbox_upload:
+                send_url = self._public_media_url(media_url, settings) or media_url
             caption = self._random_caption(media_url, "video", settings)
             yield event.chain_result([Comp.Plain(caption), Comp.Video.fromURL(send_url)])
             return
@@ -3054,6 +3055,30 @@ class ImageTracePlugin(Star):
         if index < 0:
             return ""
         return unquote(path[index + len(marker) :]).strip()
+
+    async def _offbox_pipeline(
+        self,
+        event: AstrMessageEvent,
+        header: str,
+        blocks: list[dict],
+        *,
+        mark_compressed: bool = False,
+    ) -> tuple[list[dict], bool]:
+        """第三方转存平台的两个前置动作合一：格式体检 → 上传通道接管。
+
+        顺序不可交换：体检可能把「假 jpg」换成本地转码 JPEG（path）或缩略图
+        替身 URL，上传通道必须拿着**改写后**的 block 才能决定发 URL 还是发
+        分片（path 只能分片）。合并前这是 _yield_delivery 里两段独立 hook，
+        很容易出现「改写了 blocks 却忘了把它交给下一步」这类顺序错误。
+
+        返回 (最终 blocks, 是否已投递完毕)：handled 为真时调用方只需标记已
+        发送并 stop_event，不要再走任何原生回传分支（否则会重复投递）。
+        """
+        blocks = await self._offbox_rewrite_blocks(blocks)
+        handled = await self._qq_upload_takeover(
+            event, header, blocks, mark_compressed=mark_compressed
+        )
+        return blocks, handled
 
     async def _offbox_rewrite_blocks(self, blocks: list[dict]) -> list[dict]:
         """对 blocks 里每个待发 URL 做官方富媒体格式体检，按需改写发送形态。
@@ -3214,17 +3239,21 @@ class ImageTracePlugin(Star):
         kind, session_id = target
         return {"group_openid": session_id} if kind == "group" else {"openid": session_id}
 
-    def _qq_public_url(self, url: str, settings: dict) -> str | None:
-        """把待发直链换成「腾讯侧能下载」的公网地址；换不出来返回 None。
+    def _public_media_url(self, url: str, settings: dict) -> str | None:
+        """把图床直链换成「外部服务器下载得到」的公网地址；换不出来返回 None。
+
+        两处共用：qq_official 的视频要交给腾讯拉流、图片要交给腾讯按 URL 转存。
+        内网直连（lan_base_url）只是图床与 AstrBot 之间的便利通道，对外正源是
+        base_url，故命中内网主机时按 base_url 换源（只换协议+主机端口，路径与
+        查询串原样保留）。
 
         判定不能只看 IP 段：本部署的内网直连地址是 `192.9.240.227`，它属于
         **公网段**（RFC1918 私有段只有 10/8、172.16/12、192.168/16），句法检查
-        会把它当成公网地址放行，于是 URL 上传发给腾讯后必然下载失败。因此这里
-        以配置为准：
+        会把它当成公网地址放行。因此以配置为准：
 
         1. 命中内网直连主机（lan_base_url）→ 按 base_url 换回公网源；
         2. 换完仍落在内网主机上（说明 base_url 本身就配成了内网）→ 不可用；
-        3. 与 base_url 同主机 → 视为公网直链（配置文件已声明它是公网站点）；
+        3. 与 base_url 同主机 → 视为公网直链（配置已声明它是公网站点）；
         4. 其余第三方主机 → 退化为句法判断（公网域名/公网 IP 放行）。
         """
         if not url:
@@ -3313,7 +3342,7 @@ class ImageTracePlugin(Star):
             # 固定 url/chunked 通道不依赖体积，省掉一次 HEAD 探测
             size = None if mode in {"url", "chunked"} else await self._qq_block_size(block)
             url = str(block.get("url") or "")
-            public_url = self._qq_public_url(url, settings) if url else None
+            public_url = self._public_media_url(url, settings) if url else None
             url_usable = public_url is not None
             if mode == "auto" and url_usable and self._qq_url_cooling():
                 # 刚撞过「腾讯拉不到公网直链」：冷却期内 auto 直接分片，别再白等

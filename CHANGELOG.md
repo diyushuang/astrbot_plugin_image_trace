@@ -1,5 +1,32 @@
 # 更新日志
 
+## 1.7.12（2026-10-25，推送链路整合：一份平台画像 + 一条前置流水线 + 三层配置）
+
+1.7.10/1.7.11 加的 qq_official 上传通道本身没问题，但它与既有的图片回传、格式
+体检、缩略图替身是**四次独立叠加**的：`_yield_delivery` 里两段连续 hook、
+`_random_media_delivery` 里一处提前换 URL、三个静态方法各自去问平台名、配置
+面板上三个开关谁也说不清谁说了算。本次做整合，**行为不变**（原有 348 例全绿）：
+
+- **平台判定收口**：新增 `image_delivery.DeliveryTarget`（不可变画像）与纯函数
+  `delivery_target(platform, has_bot=)`，字段 `direct_send` / `offbox_upload` /
+  `native_mention`（后者同时继承原 `_media_url_fetched_offbox` 的语义与注释）。
+  `main._delivery_target(event)` 成为唯一入口；`_can_send_via_onebot` /
+  `_mention_prefix` 保留为语义化薄封装（仍被提示语与 @ 段使用），
+  `_media_url_fetched_offbox` 已无调用点，删除。`_yield_delivery` 与视频路径
+  改为读字段，同一次推送只算一次画像。
+- **前置流水线合一**：新增 `_offbox_pipeline()`，把「格式体检 → 上传通道接管」
+  两步收成一个入口、一个契约 `(blocks, handled)`。顺序不可交换（体检可能把假
+  jpg 改成 path/缩略图 URL，通道必须拿改写后的 block），此前是两段并列 hook。
+- **换源逻辑复用**：`_qq_public_url` 更名 `_public_media_url`，视频拉流与图片
+  URL 上传共用同一套「内网直链 → 公网源」判定，删掉视频分支里的重复
+  `swap_url_origin`。
+- **配置界面分层**：`image_delivery` 组 hint 顶部写明「图片推送三层结构」与
+  优先级；`qq_upload` 组改名为「第 1 层：上传通道」，`mode` 的 `direct` 明确
+  标注为「相当于关闭本组」；`send_thumbnail` 标注为「第 2 层：形态」。README
+  新增「图片推送：三层结构」一节（三层表 + 诉求对照表）。
+- 测试：新增 `tests/test_delivery_target.py`（画像各平台判定、不可变、流水线
+  顺序契约）；`test_qq_upload.py` 同步改名。全量 362 passed。
+
 ## 1.7.11（2026-10-25，qq_upload：内网直链换公网源、auto 默认优先 URL、失败冷却）
 
 1.7.10 把「直传之外」的默认偏好设为分片，出发点是担心图床公网不可达；实际部署
