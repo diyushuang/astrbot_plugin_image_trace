@@ -5,7 +5,7 @@
 
 **群聊里随手转发的一张图，一键找回它的原图。**
 
-[![version](https://img.shields.io/badge/version-1.7.12-blue?style=flat-square)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.7.13-blue?style=flat-square)](./CHANGELOG.md)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4?style=flat-square)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat-square)](./LICENSE)
@@ -144,7 +144,7 @@ flowchart LR
 | `search_engine` | `auto` | `auto`=向量优先（未命中/不可用回退哈希）/ `vector` / `hash` |
 | `scan_dirs` | `[]` | 本地图库目录列表（绝对路径）；仅用 `/登记原图` 建库可留空 |
 | `image_bed.mode` | `local` | 图床模式：`local` / `generic_http` / `cloudflare_imgbed`；选定后组内展开对应字段 |
-| `image_delivery.mode` | `local-compress` | 回图模式：[详见下文](#回图模式) |
+| `image_delivery.mode` | `auto` | 推送通道，与 `qq_upload.mode` 同一套名字：`auto` / `native` / `bytes` / `url` / `url-scaled`（[详见下文](#回图模式)） |
 | `image_delivery.max_side` | `1920` | 缩放或本地压缩的最长边，范围 1~4096 |
 | `image_delivery.quality` | `85` | 本地 JPEG 压缩质量，范围 1~100 |
 | `image_delivery.verify_scaled` | `true` | 是否实测校验图床缩放真的生效（关闭后配文不再宣称「已压缩」） |
@@ -170,7 +170,7 @@ flowchart LR
 | `image_delivery.target_kb` | `0` | 本地压缩的目标体积上限（KB，0=不限制）。非 0 时启用质量阶梯 |
 | `image_delivery.webp` | `false` | 本地压缩改用 WebP 输出（体积更小，编码更慢；噪声极多的图可能反而更大，此时自动回退原字节） |
 | `image_delivery.onebot_image_timeout` | `60` | OneBot 图片段的 `timeout`（秒），即协议端下载网络图片的窗口。日志报 `sendMsg` 超时（retcode 1200）时可调大；范围 10~300 |
-| `image_delivery.scaled_url_style` | `query` | 仅 `scaled-url` 模式生效。`query`=查询参数式（兼容任何部署，但 QQ 协议端下载时可能剥离参数收到原图）；`cf-path`=Cloudflare Image Resizing 路径式（参数嵌在路径里剥不掉、必为压缩后流量，但要求图床域名经 Cloudflare 代理且开启 Image Resizing） |
+| `image_delivery.scaled_url_style` | `query` | 仅 `url-scaled` 通道生效。`query`=查询参数式（兼容任何部署，但 QQ 协议端下载时可能剥离参数收到原图）；`cf-path`=Cloudflare Image Resizing 路径式（参数嵌在路径里剥不掉、必为压缩后流量，但要求图床域名经 Cloudflare 代理且开启 Image Resizing） |
 | `random_media.api_endpoint` | `/random` | 随机图接口相对路径（不能填完整 URL） |
 | `random_media.api_token` | - | 随机图接口 Token（`Authorization: Bearer`）；配置 Token 时图床地址必须为 `https` |
 | `random_media.default_dir` | - | 未指定目录时使用的默认目录（如 `风景/2026`），留空从根目录取图。支持用 `,` 给出**目录池**（如 `风景,人像,日常`），此时每次请求随机取其一——图床的 `dir` 只收单值，池用于「不指定目录时尽量覆盖整库」 |
@@ -192,7 +192,7 @@ flowchart LR
 | **② 形态** | 发哪一份图 | `random_media.send_thumbnail` | 缩略图替身（720px） / 原图 |
 | **① 通道** | 怎么把图送出去 | `image_delivery.mode`（aiocqhttp）<br>`qq_upload.mode`（qq_official） | 见下方两个折叠块 |
 
-**优先级**：`qq_official` 且 `qq_upload.mode ≠ direct` 时，先由通道层的「上传通道」接管；接管失败（或设成 `direct`＝关闭本组）才回落到 `image_delivery.mode` 的原逻辑。其余平台只用 `image_delivery.mode`。
+**优先级**：`qq_official` 且 `qq_upload.mode ≠ native` 时，先由上传通道接管；接管失败（或设成 `native`＝关闭本组）才回落到 `image_delivery.mode` 的原逻辑。其余平台只用 `image_delivery.mode`。
 
 **互不覆盖**：换通道不改「发哪一份图」，换形态不改「走哪条通道」。所以「随机图发缩略图 + QQ 分片上传」这种组合是合法的——缩略图先替身，替身再按体积选上传通道。
 
@@ -201,22 +201,28 @@ flowchart LR
 | 我想… | 改哪一层 | 具体改动 |
 | --- | --- | --- |
 | QQ 官方机器人发大图不再报「上传文件大小超过限制」 | ① 通道 | `qq_upload.mode=auto`（默认） |
-| 图床只有内网、腾讯拉不到 | ① 通道 | `qq_upload.auto_prefer=chunked` |
+| 图床只有内网、腾讯拉不到 | ① 通道 | `qq_upload.auto_prefer=bytes` |
 | 少走本机带宽、发图更快 | ① 通道 | `qq_upload.auto_prefer=url`（默认） |
 | 随机图发小图省流量 | ② 形态 | `random_media.send_thumbnail=true` |
 | 随机图也要原图 | ② 形态 | `random_media.send_thumbnail=false` |
-| NapCat 侧压缩一定要生效 | ① 通道 | `image_delivery.mode=local-compress`（默认） |
+| NapCat 侧压缩一定要生效 | ① 通道 | `image_delivery.mode=auto`（默认） |
 
 <a id="回图模式"></a>
 
 <details>
-<summary><b>回图模式（<code>image_delivery.mode</code>）与压缩策略详解（点击展开）</b></summary>
+<summary><b>推送通道（<code>image_delivery.mode</code> / <code>qq_upload.mode</code>，统一词表）与压缩策略详解（点击展开）</b></summary>
 
-| 模式 | 行为 | 适用场景 |
-| --- | --- | --- |
-| `local-compress`（默认） | 插件下载后本地压缩（EXIF 转正、等比缩放、透明铺白底、JPEG 重编码、动图保持原样），压缩字节经 OneBot `base64` 段直达 QQ、不经协议端二次下载；已知小图（体积已知且 ≤200KB）自动跳过下载、仍以 URL 段直发 | 需要压缩 100% 生效的场景。QQ 协议端（NapCat 等）实测会剥离 URL 查询参数，`scaled-url` 直传拿回的常是原图 |
-| `scaled-url` | CloudFlare-ImgBed 标准 `/file/` 直链追加官方 `width` / `height` / `fallback=original` 等比缩放参数后直传；图片不超过 `max_side` 时不追加参数。参数风格由 `scaled_url_style` 决定（`query` / `cf-path`） | 图床域名经 Cloudflare 代理且开启 Image Resizing 时选 `cf-path`（参数嵌在路径里剥不掉）；否则只能 `query`，需接受「协议端可能剥离参数收到原图」 |
-| `original-url` | 直接直传原图 URL，不做任何处理 | 图床带宽充裕，追求最短链路 |
+两个平台共用**同一套通道名**，同名同义、落地实现不同：
+
+| 通道 | 含义 | NapCat / OneBot 落地 | QQ 官方机器人落地 | 适用场景 |
+| --- | --- | --- | --- | --- |
+| `auto`（默认） | 插件自动决定 | 下载后本地压缩（EXIF 转正、等比缩放、透明铺白底、JPEG 重编码、动图保持原样），压缩字节经 `base64` 段直达 QQ；已知小图（≤200KB）跳过下载直发 URL | 按体积分流：小图 `native`、中大图 `url`、超大或直链不可达 `bytes` | 默认。OneBot 侧压缩 100% 生效（协议端实测会剥离 URL 查询参数） |
+| `native` | 不加工，交给适配器 | 直接走标准消息链（URL 或字节原样） | 交回 AstrBot 二进制直传（超过 5MB 仍会报错，仅排查对照） | 定位问题、对照「插件有没有加工」 |
+| `bytes` | 本机准备好字节再上传 | 与 `auto` 同一实现（压缩后 base64 直发） | 分片上传（`upload_prepare` → 分片 PUT → 合并），保原图、上限 200MB | 图床公网不可达、或要保原图 |
+| `url` | 直链交给平台自己下载 | 原图 URL 段直传 | `files` 接口传 `url` 字段，腾讯侧下载转存（软限 20MB） | 图床带宽充裕、追求最短链路 |
+| `url-scaled` | 直链交给平台下载缩放版 | 图床缩放 URL 直传；不超过 `max_side` 时不追加参数，参数风格由 `scaled_url_style` 决定 | 同上，但交给腾讯的是缩放直链 | 想省平台侧流量；需图床支持缩放 |
+
+旧版本的 `local-compress` / `scaled-url` / `original-url` / `direct` / `chunked` 仍可读，分别映射为 `auto` / `url-scaled` / `url` / `native` / `bytes`，升级后无需改配置。
 
 **压缩标识只按证据写**：只有实测（图床缩放版字节更小）或本地压缩确实缩了字节，配文才写「已压缩」。图片不超过 `max_side` 时直接发原图 URL、不追加缩放参数——图床在图片不大或图像处理不可用时会按 `fallback=original` 原样返回，凭「URL 被改写」推断压缩会出现「文字说已压缩、收到的却是原图」。
 
@@ -224,9 +230,9 @@ flowchart LR
 
 - **文字在上、图片在下是必须的**：QQ 会把「text 段 + 紧邻其后的 image 段」合并渲染成图文混排卡片，卡片内图片按行内插图裁成**正方形缩略图**，与图片实际宽高比无关；连续多个 image 段才按普通大图渲染、保留宽高比。因此多图回传一律「文字集中成一段（含 `1.`/`2.` 序号）→ 图片连续排在末尾」，序号负责维持文字与图片的对应关系。
 - **单次发送保证**：OneBot 直发结果分「已送达 / 明确失败 / 结果未知」三态，只有明确失败才允许换通道回退；超时属「结果未知」（消息很可能已送达），一律不重发，并按事件打去重标记，杜绝同一张图发两遍。日志不再只写「结果未知」，而是按成因给结论（超时 / 连接不可用 / 协议端拒绝 / 未分类）与排查方向；三态判定与回退决策不受日志影响。
-- **混合载荷（local-compress）**：已知小图（向量 `payload.size_bytes` / 图库 `file_size` 记录的体积 ≤200KB 且协议端能解析宽高）跳过下载、直发 URL 段省一次往返；其余下载压缩后内联 base64，压缩结果不经协议端二次下载；未压缩且超 8MB 的巨型动图退回 URL 段，避免单条消息过大。
-- **local-compress 零探测**：本地压缩不依赖图床缩放能力，整条链路不向图床发任何探测请求（`scaled-url` 才需要探测原图/缩放版体积来判定压缩证据）。
-- **探测开销最小化（scaled-url / original-url）**：所有探测并发执行（上限 4）且受 8 秒总预算约束，超预算按「说不准」处理；探测用独立的 5 秒超时；命中条目自带原图体积时只探缩放版一次；图床明确拒绝缩放请求（405 / 501 / 400）后 600 秒内不再探测。
+- **混合载荷（`auto` / `bytes`）**：已知小图（向量 `payload.size_bytes` / 图库 `file_size` 记录的体积 ≤200KB 且协议端能解析宽高）跳过下载、直发 URL 段省一次往返；其余下载压缩后内联 base64，压缩结果不经协议端二次下载；未压缩且超 8MB 的巨型动图退回 URL 段，避免单条消息过大。
+- **压缩通道零探测**：`auto` / `bytes` 不依赖图床缩放能力，整条链路不向图床发任何探测请求（`url-scaled` 才需要探测原图/缩放版体积来判定压缩证据）。
+- **探测开销最小化（`url-scaled`）**：所有探测并发执行（上限 4）且受 8 秒总预算约束，超预算按「说不准」处理；探测用独立的 5 秒超时；命中条目自带原图体积时只探缩放版一次；图床明确拒绝缩放请求（405 / 501 / 400）后 600 秒内不再探测。
 - **回传计划只算一次**：URL 计划（含探测）在直发前算好，失败回退路径直接复用。
 - **本地压缩**：单次解码（不重复解码校验）、多图并发压缩（上限 3）、回退下载优先走内存（超过 8 MB 才落盘）。
 - **提示与图片并行**：OneBot 场景下命中提示与图片消息同时下发，首图不必等提示的整轮往返。
@@ -242,15 +248,15 @@ QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条
 
 | 通道 | 上限 | 说明 |
 | --- | --- | --- |
-| 二进制直传（`direct`） | **5MB** | 适配器把图片转 base64 走 `file_data`。超过即报「上传文件大小超过限制」，且异常发生在 AstrBot 的 respond stage，插件侧捕获不到 |
+| 二进制直传（`native`） | **5MB** | 适配器把图片转 base64 走 `file_data`（通道名 `native`）。超过即报「上传文件大小超过限制」，且异常发生在 AstrBot 的 respond stage，插件侧捕获不到 |
 | URL 上传（`url`） | 20MB | 上传接口只传 `url` 字段，由腾讯服务器下载转存。要求图床**公网可达**；超过 20MB 会被平台降级成「文件卡片」 |
-| 分片上传（`chunked`） | 200MB | `upload_prepare` → 并发 PUT 分片 → 逐片确认 → 合并。保原图，不依赖外部可达性，代价是先下到本地并多几次往返 |
+| 分片上传（`bytes`） | 200MB | `upload_prepare` → 并发 PUT 分片 → 逐片确认 → 合并。保原图，不依赖外部可达性，代价是先下到本地并多几次往返 |
 
 | 配置 | 默认 | 说明 |
 | --- | --- | --- |
-| `qq_upload.mode` | `auto` | `auto`=按体积分流；`direct`=始终交回 AstrBot 原生直传（维持原行为）；`url`=始终 URL 上传；`chunked`=始终分片。固定通道不因体积改道 |
+| `qq_upload.mode` | `auto` | 与 `image_delivery.mode` 同一套通道名。`auto`=按体积分流（小图 `native`、中大图 `url`、其余 `bytes`）；`native`=关闭本组；`url` / `url-scaled`=始终直链上传；`bytes`=始终分片。固定通道不因体积改道 |
 | `qq_upload.direct_max_mb` | `3` | `auto` 下不超过该体积走直传。直传硬限 5MB，base64 膨胀 4/3 后原图上限约 3.75MB，故默认留余量；填 `0` 表示从不直传 |
-| `qq_upload.auto_prefer` | `url` | `auto` 下直传之外优先哪条：`url`（默认，只发一条直链让腾讯侧下载转存，不占本机上行、不用落盘）/ `chunked`（先下到本地再分片，不依赖图床公网可达） |
+| `qq_upload.auto_prefer` | `url` | `auto` 下 `native` 之外优先哪条：`url`（默认，只发一条直链让腾讯侧下载转存，不占本机上行、不用落盘）/ `bytes`（先下到本地再分片，不依赖图床公网可达） |
 | `qq_upload.url_max_mb` | `20` | URL 通道软限；`auto` 下超过该值直接分片。填 `0` 表示不限制（注意超限会变成文件卡片） |
 | `qq_upload.max_upload_mb` | `100` | 分片通道的下载上限，独立于全局 `max_download_mb`（后者默认 20MB，装不下需要分片的大图） |
 | `qq_upload.on_failure` | `fallback` | 通道失败后：`fallback` 交回原有降级链（本地压缩/缩略图）；`notify` 直接回一条文字说明。**本批已成功发过图时无论哪档都不会再交回**，以免同一张图发两遍 |
@@ -260,7 +266,7 @@ QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条
 - **与缩略图配置完全分开**：`random_media.send_thumbnail` 管的是「随机图要不要发 720px 替身」，`qq_upload` 管的是「这张图用什么方式送到 QQ」，两者互不影响。
 - **内网直链会换成公网地址再上传**：`lan_base_url` 只是图床与 AstrBot 之间走内网的便利通道，对外的正源是 `base_url`。命中内网主机时按 `base_url` 换源（协议+主机端口换掉，路径与查询串原样保留）；若 `base_url` 本身也配成了内网地址，则判定 URL 通道不可用并降级到分片。
 - **URL 通道失败自动冷却**：公网域名存在不代表腾讯侧拉得到（域名停用/防盗链/防火墙）。URL 上传失败一次即进入 600 秒冷却，期间 `auto` 直接走分片，不会每次交付都先白撞一轮；固定 `url` 通道不受冷却影响（用户显式钉死就该照做）。
-- **接管后由插件自己发消息**：命中 `url`/`chunked` 时，插件自行上传并 `post_group_message` / `post_c2c_message`（`msg_type=7`），随后 `stop_event()`——否则 respond stage 会照原路再发一次。
+- **接管后由插件自己发消息**：命中 `url`/`url-scaled`/`bytes` 时，插件自行上传并 `post_group_message` / `post_c2c_message`（`msg_type=7`），随后 `stop_event()`——否则 respond stage 会照原路再发一次。
 - **`/原图` 语义不变**：本通道发的是原图（URL 原样 / 分片原始字节），不会把原图悄悄换成缩略图；配文按「原图」口径写。
 
 </details>
@@ -494,7 +500,7 @@ QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条
 
 - 用图床直链时，确认直链**公网可读**且协议端 / QQ 服务器能访问；
 - 用本地文件时，确认协议端能访问该路径（容器部署常见坑：宿主机路径在协议端容器内不可见）；
-- 图床开启了防盗链时，协议端取图可能被拦，改用 `local-compress` 模式可绕开。
+- 图床开启了防盗链时，协议端取图可能被拦，改用 `auto` 通道（本机下载后直发）可绕开。
 
 </details>
 

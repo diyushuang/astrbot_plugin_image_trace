@@ -1259,7 +1259,7 @@ class ImageTracePlugin(Star):
                 data = await self._load_delivery_bytes(block, validate=not compress)
                 if data is None:
                     return None
-                if not compress or mode == "original-url":
+                if not compress or mode == "url":
                     return data, False
                 result = await asyncio.to_thread(
                     prepare_image_bytes,
@@ -1308,7 +1308,7 @@ class ImageTracePlugin(Star):
         *,
         mark_compressed: bool,
     ) -> SendOutcome | None:
-        """local-compress 模式在 OneBot 下的混合载荷直发。
+        """auto / bytes 模式下 OneBot 的混合载荷直发。
 
         逐图决定 URL 段还是 base64 段：已知小图（≤COMPRESS_MIN_BYTES 且协议端
         能解析宽高）跳过下载、直发原图 URL——本地压缩本就会跳过这类图，下载再
@@ -1384,13 +1384,13 @@ class ImageTracePlugin(Star):
         sizes: list[tuple] = []
         jobs: list[tuple[str, str, int] | None] = []
         verify = (
-            mode == "scaled-url" and self._verify_scaled() and not self._scaled_verify_cooling()
+            mode == "url-scaled" and self._verify_scaled() and not self._scaled_verify_cooling()
         )
         for block in image_blocks:
             original = build_original_url(str(block.get("url") or ""))
             size = (block.get("width"), block.get("height"))
             sizes.append(size)
-            if mode != "scaled-url" or not original:
+            if mode != "url-scaled" or not original:
                 urls.append(original or str(block.get("url") or ""))
                 jobs.append(None)
                 continue
@@ -1477,16 +1477,22 @@ class ImageTracePlugin(Star):
         mark_compressed: bool = False,
         remember_blocks: list[dict] | None = None,
     ):
-        """统一回传入口：按模式选主路径，失败后逐级回退。
+        """统一回传入口：按通道选主路径，失败后逐级回退。
 
-        - scaled-url / original-url：URL 直传优先，本地压缩只作为失败回退；
-        - local-compress（默认）：OneBot 下压缩字节经 base64 段直发（混合载荷，
-          已知小图跳过下载直发 URL），失败改走标准消息链 URL；其他平台走
-          chain_result(fromBytes)。QQ 协议端（NapCat 等）会剥离 URL 查询参数，
-          缩放 URL 直传拿回的常是原图，本地压缩是唯一能保证压缩 100% 生效的
-          路径。
+        mode 取统一词表（auto / native / bytes / url / url-scaled，两平台同名
+        同义，见 image_delivery.normalize_delivery_mode）：
+        - auto（默认）：交给插件自动决定。OneBot 下压缩字节经 base64 段直发
+          （混合载荷，已知小图跳过下载直发 URL），失败改走标准消息链 URL；
+          qq_official 下按体积分流到 native/url/bytes。
+        - bytes：一律本机准备好字节再上传（OneBot 压缩后直发；qq_official 分片）。
+        - url / url-scaled：URL 直传优先（原图 / 图床缩放版），本地压缩只作为
+          失败回退。
+        - native：不加工，直接交给适配器原样发送（排障对照用）。
 
-        mode_override 供 /原图 强制走 original-url、无视全局回传模式；
+        OneBot 侧仍默认压缩：QQ 协议端（NapCat 等）会剥离 URL 查询参数，缩放
+        URL 直传拿回的常是原图，本地压缩是唯一能保证压缩 100% 生效的路径。
+
+        mode_override 供 /原图 强制走 url、无视全局通道；
         allow_local_fallback=False 时彻底不进入下载字节/本地压缩分支。注意
         qq_official 等第三方转存平台例外：入口处的格式体检（_offbox_rewrite_blocks）
         可能把假格式图片改写为本地转码 JPEG 交付——官方富媒体上传拒收假格式，
@@ -1498,8 +1504,8 @@ class ImageTracePlugin(Star):
         三处既有调用点行为与改造前一致（offbox 格式体检除外，见上）。
 
         qq_official 例外：格式体检之后还会按 `qq_upload` 组做上传通道分流，
-        命中 url/chunked 时由 _qq_upload_takeover 自己上传并发消息（绕开
-        适配器「图片恒 base64 直传、5MB 上限」）。该分支返回即视为已投递。
+        命中 url / url-scaled / bytes 时由 _qq_upload_takeover 自己上传并发消息
+        （绕开适配器「图片恒 base64 直传、5MB 上限」）。该分支返回即视为已投递。
 
         单次发送保证：同一批图片在一次调用里只发起一次发送。只有 OneBot 直发
         明确失败（FAILED）才允许换通道重发；结果未知（超时）一律就此打住——
@@ -1533,17 +1539,17 @@ class ImageTracePlugin(Star):
         image_blocks = [block for block in blocks if block.get("url") or block.get("path")]
         raw_urls = [str(block["url"]) for block in image_blocks if block.get("url")]
         all_urls = bool(image_blocks) and len(raw_urls) == len(image_blocks)
-        direct_mode = mode in {"scaled-url", "original-url"}
+        direct_mode = mode in {"url", "url-scaled"}
         # URL 直发条件：模式允许 + 全是 URL + 能走 OneBot + 所有 URL 扩展名
         # 能被协议端解析出宽高（否则 QQ 侧拿不到尺寸，体验差）。
-        # scaled-url 模式下默认走 URL 直传；若 QQ 协议端会剥离查询参数导致
+        # url-scaled 模式下默认走 URL 直传；若 QQ 协议端会剥离查询参数导致
         # 图床返回原图，可把 scaled_url_style 改为 "cf-path"（路径式，参数
         # 嵌在路径里不会被剥离，但需图床域名开启 Cloudflare Image Resizing）。
         direct_ok = (
             direct_mode
             and all_urls
             and target.direct_send
-            and (mode == "original-url" or all(is_napcat_parseable_url(u) for u in raw_urls))
+            and (mode == "url" or all(is_napcat_parseable_url(u) for u in raw_urls))
         )
 
         # 回传计划最多只算一次：回退路径此前会重跑一遍规划，把同样的探测白做
@@ -1562,15 +1568,16 @@ class ImageTracePlugin(Star):
                 return
 
         if allow_local_fallback and not self._event_already_sent(event):
-            should_compress = mode == "local-compress" or (
-                mode == "scaled-url" and any(block.get("path") for block in image_blocks)
+            should_compress = mode in {"auto", "bytes"} or (
+                mode == "url-scaled"
+                and any(block.get("path") for block in image_blocks)
             )
             # 走 URL 直传但没能直发成功：既包括 FAILED 后的回退，也包括扩展名
             # 让协议端解析不了宽高、压根没尝试直发的情形（改本地压缩成 JPEG 再发）
             onebot_failed = target.direct_send and direct_mode and all_urls
             if should_compress or onebot_failed:
-                if mode == "local-compress" and target.direct_send:
-                    # OneBot 下 local-compress 直发压缩字节（混合载荷）：压缩结果
+                if mode in {"auto", "bytes"} and target.direct_send:
+                    # OneBot 下 auto/bytes 直发压缩字节（混合载荷）：压缩结果
                     # 经 base64 段直达 QQ，不经协议端二次下载，压缩 100% 生效
                     outcome = await self._local_compress_delivery(
                         event, header, blocks, image_blocks, mark_compressed=mark_compressed
@@ -1584,7 +1591,7 @@ class ImageTracePlugin(Star):
                     logger.warning("OneBot 压缩直发未成功，改用标准消息链 URL 发送")
                 else:
                     prepared = await self._prepare_delivery_blocks(
-                        image_blocks, compress=mode != "original-url"
+                        image_blocks, compress=mode != "url"
                     )
                     if prepared is not None:
                         evidences = [
@@ -2914,7 +2921,7 @@ class ImageTracePlugin(Star):
                 )
                 return
         # R6：/原图 只发 URL、不落地字节——剥离 ImgBed 处理参数还原未处理原文件，
-        # 并强制 original-url + 禁用本地回退
+        # 并强制 url 通道 + 禁用本地回退
         final_url = build_original_url(url)
         # 最后一次校验：走到这里说明上游每一条路径都「自认为」拿到的是原图，
         # 但只要最终直链仍指向缩略图目录，就绝不能发出去——静默发出一张 720px
@@ -2932,7 +2939,7 @@ class ImageTracePlugin(Star):
             event,
             f"🖼️ {name}（原图）",
             [block],
-            mode_override="original-url",
+            mode_override="url",
             allow_local_fallback=False,
         ):
             yield result
@@ -2942,9 +2949,9 @@ class ImageTracePlugin(Star):
     ):
         """取一条随机媒体并回传。
 
-        图片走 _yield_delivery（复用全局回传策略：scaled-url / original-url /
-        local-compress），视频走标准消息链 Video.fromURL；无法识别类型时回退
-        纯文本直链。同域 http 直链先升级为 https，减少协议端一次跳转。
+        图片走 _yield_delivery（复用全局通道：auto / bytes / url / url-scaled /
+        native），视频走标准消息链 Video.fromURL；无法识别类型时回退纯文本
+        直链。同域 http 直链先升级为 https，减少协议端一次跳转。
         """
         # 未指定目录时回退到配置的 default_dir 池：图床若设置了
         # randomImageAPI.allowedDir，不带 dir 的裸 /random 会被判为「目录不允许」
@@ -3325,7 +3332,8 @@ class ImageTracePlugin(Star):
         mode, direct_max, url_max, auto_prefer, max_upload, on_failure = (
             self._qq_upload_config()
         )
-        if mode == "direct":
+        if mode == "native":
+            # 通道关闭：交给 image_delivery 的原生回传逻辑（含压缩）
             return False
         target = self._qq_send_target(event)
         bot = getattr(event, "bot", None)
@@ -3339,8 +3347,8 @@ class ImageTracePlugin(Star):
         settings = self._random_settings()
         plan: list[tuple[dict, str, str | None]] = []
         for block in images:
-            # 固定 url/chunked 通道不依赖体积，省掉一次 HEAD 探测
-            size = None if mode in {"url", "chunked"} else await self._qq_block_size(block)
+            # 固定通道（native/bytes/url/url-scaled）不依赖体积，省掉一次 HEAD 探测
+            size = None if mode != "auto" else await self._qq_block_size(block)
             url = str(block.get("url") or "")
             public_url = self._public_media_url(url, settings) if url else None
             url_usable = public_url is not None
@@ -3355,14 +3363,14 @@ class ImageTracePlugin(Star):
                 url_usable=url_usable,
                 auto_prefer=auto_prefer,
             )
-            if channel == "direct":
+            if channel == "native":
                 # 混批里只要有一张判定该直传，就整批交回原逻辑：拆成两次投递会
                 # 绕开「一次事件只投递一批图」的去重盾，用户可能收到重复图片
                 logger.debug("qq_official 上传通道：该批含直传图，交回原回传逻辑")
                 return False
-            if channel == "url" and public_url is None:
+            if channel in {"url", "url-scaled"} and public_url is None:
                 logger.warning(
-                    f"qq_official 固定 URL 通道但拿不到公网直链（图床地址疑似内网）: {url}"
+                    f"qq_official 固定直链通道但拿不到公网直链（图床地址疑似内网）: {url}"
                 )
             plan.append((block, channel, public_url))
 
@@ -3390,8 +3398,8 @@ class ImageTracePlugin(Star):
                     f"qq_official {channel} 通道上传/发送失败"
                     f"（第 {index + 1}/{len(plan)} 张）: {detail}"
                 )
-                if channel == "url":
-                    # 公网直链拿得到、腾讯却拉不到：记冷却，auto 后续直接分片
+                if channel in {"url", "url-scaled"}:
+                    # 公网直链拿得到、腾讯却拉不到：记冷却，auto 后续直接走 bytes
                     self._note_qq_url_unsupported(exc)
                 if not sent_any and on_failure == "fallback":
                     logger.warning(
@@ -3412,11 +3420,23 @@ class ImageTracePlugin(Star):
         target: tuple[str, str],
         max_upload: int,
     ):
-        """按通道上传一张图，返回 QQ 侧 Media。"""
-        if channel == "url":
+        """按通道上传一张图，返回 QQ 侧 Media。
+
+        url / url-scaled 共用同一条 URL 上传实现，区别只在交给腾讯的是原图
+        直链还是图床缩放直链；bytes 即分片上传（官方术语 chunked upload），
+        需要先把图落到本地。
+        """
+        if channel in {"url", "url-scaled"}:
             if not public_url:
                 raise RuntimeError("没有公网直链，QQ 无法按 URL 拉取该图")
-            return await self._qq_upload_via_url(event, public_url, target)
+            upload_url = public_url
+            if channel == "url-scaled":
+                _mode, max_side, quality, style = self._delivery_config()
+                upload_url = (
+                    build_scaled_url(public_url, max_side, quality=quality, style=style)
+                    or public_url
+                )
+            return await self._qq_upload_via_url(event, upload_url, target)
         path = str(block.get("path") or "")
         temp = ""
         try:

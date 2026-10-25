@@ -1,5 +1,33 @@
 # 更新日志
 
+## 1.7.13（2026-10-25，通道命名统一：两平台共用 auto/native/bytes/url/url-scaled）
+
+问题：同样是「怎么把图送出去」，NapCat 侧叫 `local-compress` / `scaled-url` /
+`original-url`，QQ 官方机器人侧叫 `auto` / `direct` / `url` / `chunked`——两套
+词表、两组配置、同一个概念三四个名字，面板上根本看不出谁对应谁。
+
+- 统一词表 `DELIVERY_MODES = {auto, native, bytes, url, url-scaled}`，两平台
+  **同名同义**，只是落地实现不同：
+  - `auto`：插件自动（OneBot 下载后压缩直发；qq_official 按体积分流）
+  - `native`：不加工，交给适配器（原 qq 的 `direct`；OneBot 直接走消息链）
+  - `bytes`：本机准备好字节再上传（OneBot 压缩后 base64；qq_official 分片，
+    即原 `chunked`）
+  - `url`：直链交平台自己下载原图（原 OneBot `original-url`、qq `url`）
+  - `url-scaled`：直链交平台下载缩放版（原 OneBot `scaled-url`）
+- `normalize_delivery_mode()` 统一归一化：旧写法 `local-compress` / `scaled-url`
+  / `original-url` / `direct` / `chunked` 自动映射，**升级后配置无需改动**；
+  `auto_prefer` 的旧值 `chunked` 同样映射为 `bytes`。
+- `choose_qq_upload_channel()` 返回值同步改名（`direct`→`native`、
+  `chunked`→`bytes`），并新增 `url-scaled` 通道：把图床缩放直链交给腾讯——
+  此前缩放只有 OneBot 侧能用。`_qq_upload_block()` 按通道决定上传原图还是
+  缩放直链。
+- `image_delivery.mode` 默认值 `local-compress` → `auto`（同一实现，纯改名）。
+- 配置面板：两组 `mode` 的选项、顺序、说明措辞完全一致；`scaled_url_style`
+  的显示条件改为 `url-scaled`；`qq_upload.mode` 的 `native` 标注为「关闭本组，
+  交回原逻辑」。README 的通道表合并为一张「统一词表 + 两平台落地」对照表。
+- 测试：新增统一词表/旧写法映射/`url-scaled` 上传缩放直链用例；`test_image_delivery`
+  的默认值断言随改名更新。全量 365 passed。
+
 ## 1.7.12（2026-10-25，推送链路整合：一份平台画像 + 一条前置流水线 + 三层配置）
 
 1.7.10/1.7.11 加的 qq_official 上传通道本身没问题，但它与既有的图片回传、格式

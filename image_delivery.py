@@ -21,7 +21,16 @@ except ImportError:  # Pillow 缺失时本地压缩自动降级为原字节
     PILImageOps = None
 
 
-DELIVERY_MODES = frozenset({"scaled-url", "original-url", "local-compress"})
+DELIVERY_MODES = frozenset({"auto", "native", "bytes", "url", "url-scaled"})
+# 统一命名前的旧取值 → 等价新取值（1.7.13）。配置文件里残留的旧写法继续可用，
+# 避免升级瞬间把用户的通道选择重置成默认值。
+LEGACY_DELIVERY_MODES = {
+    "local-compress": "auto",
+    "scaled-url": "url-scaled",
+    "original-url": "url",
+    "direct": "native",
+    "chunked": "bytes",
+}
 IMGBED_MANAGED_QUERY_KEYS = frozenset({"width", "height", "fit", "fallback"})
 NAPCAT_PARSEABLE_EXTENSIONS = frozenset(
     {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
@@ -105,14 +114,31 @@ def bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
 SCALED_URL_STYLES = frozenset({"query", "cf-path"})
 
 
+def normalize_delivery_mode(value: Any, default: str = "auto") -> str:
+    """把通道取值归一化到统一词表（auto/native/bytes/url/url-scaled）。
+
+    两个平台共用同一套命名，旧写法（local-compress / scaled-url / original-url
+    / direct / chunked）按等价关系映射，升级后无需改配置也能继续工作。词表外
+    的脏值一律回退 default，绝不让非法值把推送打成「什么都不发」。
+    """
+    mode = str(value or "").strip().lower()
+    mode = LEGACY_DELIVERY_MODES.get(mode, mode)
+    return mode if mode in DELIVERY_MODES else default
+
+
 def delivery_settings(config: Any) -> tuple[str, int, int, str]:
     """归一化图片回传配置，返回 (mode, max_side, quality, scaled_url_style)。
 
-    默认 local-compress：QQ 协议端（NapCat 等）实测会剥离 URL 查询参数，
-    图床缩放 URL 直传拿回的是原图；本地压缩后的字节经 base64 段直达 QQ，
-    压缩 100% 生效，配文证据也是实测精确值。
+    mode 是**统一词表**，两平台同名同义（见 normalize_delivery_mode）：
+    - auto：交给插件自动决定。aiocqhttp（NapCat 等）下默认下载后本地压缩，
+      压缩字节经 base64 段直达 QQ——协议端实测会剥离 URL 查询参数，缩放 URL
+      直传拿回的常是原图；已知小图仍直发 URL 段省一次往返。qq_official 下按
+      体积在 native/url/bytes 之间分流。
+    - native：不加工，交给适配器原样发送（排障对照用）。
+    - bytes：本机准备好字节再上传（aiocqhttp 压缩后 base64；qq_official 分片）。
+    - url / url-scaled：把直链交给平台自己下载（原图 / 图床缩放版）。
 
-    scaled_url_style：scaled-url 模式下缩放参数的 URL 风格：
+    scaled_url_style：url-scaled 下缩放参数的 URL 风格：
     - query（默认）：查询参数式，如 /file/abc.jpg?width=1920&height=1920&fallback=original
       优点是兼容 CloudFlare-ImgBed 原生接口，且任何图床站点都能用；
       缺点是 QQ 协议端下载时可能剥离查询参数，导致 fallback=original 返回原图。
@@ -122,9 +148,7 @@ def delivery_settings(config: Any) -> tuple[str, int, int, str]:
       是压缩后的；缺点是需图床域名开启 Cloudflare Image Resizing（付费）。
     """
     raw = config if isinstance(config, dict) else {}
-    mode = str(raw.get("mode") or "local-compress").strip().lower()
-    if mode not in DELIVERY_MODES:
-        mode = "local-compress"
+    mode = normalize_delivery_mode(raw.get("mode"), "auto")
     max_side = bounded_int(raw.get("max_side"), 1920, 1, 4096)
     quality = bounded_int(raw.get("quality"), 85, 1, 100)
     style = str(raw.get("scaled_url_style") or "query").strip().lower()
@@ -189,17 +213,21 @@ def delivery_target(platform: str, *, has_bot: bool = True) -> DeliveryTarget:
 # respond stage（插件 yield 之后），插件侧的事后重试根本捕获不到。唯一可行的
 # 做法是**发送前就选对通道**：
 #
-# - direct：仍交回适配器原生路径（≤5MB 直传，可叠加本地压缩）；
+# 通道命名与「推送通道」共用同一套词表（normalize_delivery_mode），两平台同名
+# 同义，只是落地实现不同：
+# - native：不接管，交回适配器原生路径（≤5MB 直传，可叠加本地压缩）；
 # - url：上传接口改传 `url` 字段，由腾讯侧下载转存，免 base64 体积上限
 #   （图片软限 20MB，超过会被降级成「文件卡片」）；前提是图床公网可达；
-# - chunked：upload_prepare → 分片 PUT → upload_part_finish → 合并，保原图、
+# - url-scaled：同 url，但交出去的是图床缩放版直链，进一步省腾讯侧流量；
+# - bytes：upload_prepare → 分片 PUT → upload_part_finish → 合并，保原图、
 #   上限 200MB，代价是多次往返与先落盘。
 #
 # 通道选择是纯决策，放本模块便于单测；网络请求与消息发送在 main.py。
 
-QQ_UPLOAD_MODES = frozenset({"auto", "direct", "url", "chunked"})
-QQ_UPLOAD_CHANNELS = frozenset({"direct", "url", "chunked"})
-QQ_AUTO_PREFER = frozenset({"chunked", "url"})
+QQ_UPLOAD_CHANNELS = frozenset({"native", "bytes", "url", "url-scaled"})
+QQ_AUTO_PREFER = frozenset({"bytes", "url"})
+# auto 偏好的旧写法（统一命名前叫 chunked）
+LEGACY_AUTO_PREFER = {"chunked": "bytes"}
 QQ_UPLOAD_FAILURE_MODES = frozenset({"fallback", "notify"})
 QQ_DIRECT_MAX_DEFAULT_MB = 3
 QQ_URL_MAX_DEFAULT_MB = 20
@@ -216,24 +244,25 @@ def qq_upload_settings(config: Any) -> tuple[str, int, int, str, int, str]:
           max_upload_bytes, on_failure)。
 
     各项默认值的依据：
+    - mode 与 image_delivery.mode 共用统一词表（auto/native/bytes/url/
+      url-scaled），旧写法 direct/chunked 自动映射为 native/bytes。
     - direct_max_mb＝3：QQ 二进制直传硬限 5MB，base64 膨胀 4/3 后原图最多约
-      3.75MB，取 3 留余量；填 0 表示从不直传（大图一律 url/chunked）。
+      3.75MB，取 3 留余量；填 0 表示从不直传（大图一律 url/bytes）。
     - url_max_mb＝20：图片 URL 上传的软限，超过会被平台降级成文件卡片。
     - auto_prefer＝url：图床对公网的直链几乎总是存在（否则 QQ 用户根本看不到
       图），内网直连地址也能按 base_url 换回公网源，而 URL 上传只需一次 JSON、
-      不占本机上行、不用落盘，比先下载再分片划算；万一腾讯侧拉不到（域名停用/
-      防盗链），失败一次即进入冷却、auto 自动改分片，所以默认取 url。纯内网
-      部署（拿不到公网直链）会在选择阶段直接判为不可用，自动落到分片。
-    - max_upload_mb＝100：分片路径要先把原图下到本地，这个上限独立于
+      不占本机上行、不用落盘，比先下载再分片（bytes）划算；万一腾讯侧拉不到
+      （域名停用/防盗链），失败一次即进入冷却、auto 自动改 bytes，所以默认取
+      url。纯内网部署（拿不到公网直链）在选择阶段就判为不可用，自动落到 bytes。
+    - max_upload_mb＝100：bytes 路径要先把原图下到本地，这个上限独立于
       max_download_mb（后者默认 20MB，装不下需要分片的大图）。
     - on_failure＝fallback：通道失败后交回原有回传逻辑（本地压缩/缩略图），
       而不是把错误直接抛给用户。
     """
     raw = config if isinstance(config, dict) else {}
-    mode = str(raw.get("mode") or "auto").strip().lower()
-    if mode not in QQ_UPLOAD_MODES:
-        mode = "auto"
+    mode = normalize_delivery_mode(raw.get("mode"), "auto")
     prefer = str(raw.get("auto_prefer") or "url").strip().lower()
+    prefer = LEGACY_AUTO_PREFER.get(prefer, prefer)
     if prefer not in QQ_AUTO_PREFER:
         prefer = "url"
     failure = str(raw.get("on_failure") or "fallback").strip().lower()
@@ -255,28 +284,29 @@ def choose_qq_upload_channel(
     url_usable: bool = False,
     auto_prefer: str = "url",
 ) -> str:
-    """选上传通道：direct / url / chunked。
+    """选上传通道：native / bytes / url / url-scaled。
 
-    mode 填了固定通道就原样返回、不因体积改道——用户显式钉死一条通道时，
-    失败与否由 on_failure 决定，不该被悄悄换成别的通道。
+    mode 与「推送通道」共用统一词表；填了固定通道就原样返回、不因体积改道——
+    用户显式钉死一条通道时，失败与否由 on_failure 决定，不该被悄悄换掉。
 
     auto 的判定顺序：
-    1. 体积已知且 ≤ direct_max → direct（最快，走适配器原生路径，还能叠加
+    1. 体积已知且 ≤ direct_max → native（最快，走适配器原生路径，还能叠加
        本地压缩）；
     2. auto_prefer=url（默认）、公网直链可用、且体积不超过 URL 软限 → url
        （一次 JSON 请求，不占本机上行、不落盘）；
-    3. 其余 → chunked（不依赖图床公网可达，且保原图）。
+    3. 其余 → bytes（不依赖图床公网可达，且保原图）。
 
-    size_bytes 为 None 表示体积未知：这时不判 direct（怕它其实是大图），按
+    size_bytes 为 None 表示体积未知：这时不判 native（怕它其实是大图），按
     2/3 的偏好继续走。url_usable=False 表示拿不到公网直链（内网直连且无公网
     base、或直链本身就指向私网），URL 上传必然失败，直接跳过该通道。
     """
-    normalized = str(mode or "").strip().lower()
-    if normalized in QQ_UPLOAD_CHANNELS:
+    normalized = normalize_delivery_mode(mode, "auto")
+    if normalized != "auto":
         return normalized
     if size_bytes is not None and 0 < size_bytes <= max(0, direct_max_bytes):
-        return "direct"
+        return "native"
     prefer = str(auto_prefer or "url").strip().lower()
+    prefer = LEGACY_AUTO_PREFER.get(prefer, prefer)
     # url_max_bytes ≤ 0 视为不限制（配置填 0 表示「软限不管」）
     if (
         prefer == "url"
@@ -284,7 +314,7 @@ def choose_qq_upload_channel(
         and (size_bytes is None or url_max_bytes <= 0 or size_bytes <= url_max_bytes)
     ):
         return "url"
-    return "chunked"
+    return "bytes"
 
 
 def is_public_http_url(url: str) -> bool:
