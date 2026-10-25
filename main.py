@@ -977,6 +977,23 @@ class ImageTracePlugin(Star):
         return getattr(event, "bot", None) is not None
 
     @staticmethod
+    def _mention_prefix(event: AstrMessageEvent) -> list:
+        """回传链开头的「@发送者」段；仅 OneBot(aiocqhttp) 平台启用。
+
+        qq_official 等平台没有原生 At 段：适配器会把 At 转成平台标记原文
+        （`<qqbot-at-user id="..."/>`）拼进纯文本，而官方群消息的纯文本并不
+        渲染该标记（仅 markdown 消息类型生效），用户看到的就是一串“代码”
+        糊在文案前。故 @ 前缀只给能原生渲染它的 aiocqhttp，其余平台不加。
+        """
+        try:
+            if event.get_platform_name() != "aiocqhttp":
+                return []
+            sender = str(event.get_sender_id() or "").strip()
+        except Exception:
+            return []
+        return [Comp.At(qq=sender)] if sender else []
+
+    @staticmethod
     def _read_file_bytes(path: str) -> bytes:
         with open(path, "rb") as file:
             return file.read()
@@ -1509,9 +1526,9 @@ class ImageTracePlugin(Star):
                             item is CompressionEvidence.COMPRESSED for item in evidences
                         ):
                             fallback_header += "（已压缩）"
-                        chain = [Comp.At(qq=event.get_sender_id())]
+                        chain = self._mention_prefix(event)
                         if fallback_header:
-                            chain.append(Comp.Plain(" " + fallback_header))
+                            chain.append(Comp.Plain((" " if chain else "") + fallback_header))
                         image_index = 0
                         for block in blocks:
                             if block.get("text"):
@@ -1532,9 +1549,9 @@ class ImageTracePlugin(Star):
         urls, evidences = plan
         if mark_compressed:
             self._mark_compressed_captions(blocks, evidences)
-        chain = [Comp.At(qq=event.get_sender_id())]
+        chain = self._mention_prefix(event)
         if header:
-            chain.append(Comp.Plain(" " + header))
+            chain.append(Comp.Plain((" " if chain else "") + header))
         image_index = 0
         for block in blocks:
             if block.get("text"):

@@ -1,5 +1,21 @@
 # 更新日志
 
+## 1.7.6（2026-10-25，修复 QQ 官方机器人回传文案前出现 `<qqbot-at-user …/>` 标记原文）
+
+线上现象：qq_official 平台 `/随机图` 回传的文案变成
+`<qqbot-at-user id="…" /> 🖼️ 文件名.jpg`，一大串“代码”糊在配文前面。
+
+根因：`_yield_delivery` 在回传链最前面无条件加 `At(qq=发送者)`（为
+aiocqhttp/NapBot 的原生 @ 效果设计）。qq_official 适配器没有原生 At 段，
+会把 At 转成官方平台标记 `<qqbot-at-user id="…"/>` **拼进纯文本**；而官方
+群消息的纯文本并不渲染该标记（仅 markdown 消息类型生效），于是按原文显示。
+
+- `main.py`：新增 `_mention_prefix()`——@发送者 前缀仅 `aiocqhttp` 平台保留，
+  其余平台（qq_official / telegram 等）回传链不再附带 At。两处注入点
+  （本地字节回退链与标准 URL 链）统一改用该函数。
+- 测试：`test_random_commands.py` 新增「aiocqhttp 保留 @、qq_official 不带 @」
+  的端到端用例。
+
 ## 1.7.5（2026-10-25，新增「图床内网直连」random_media.lan_base_url）
 
 线上现象：同一份随机图配置在 ihostart 实例一切正常，在甲骨文实例却每次
