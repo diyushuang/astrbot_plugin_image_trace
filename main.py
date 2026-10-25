@@ -1441,13 +1441,15 @@ class ImageTracePlugin(Star):
           路径。
 
         mode_override 供 /原图 强制走 original-url、无视全局回传模式；
-        allow_local_fallback=False 时彻底不进入下载字节/本地压缩分支，保证
-        /原图 只发 URL、不落地字节。两参数均有默认值。
+        allow_local_fallback=False 时彻底不进入下载字节/本地压缩分支。注意
+        qq_official 等第三方转存平台例外：入口处的格式体检（_offbox_rewrite_blocks）
+        可能把假格式图片改写为本地转码 JPEG 交付——官方富媒体上传拒收假格式，
+        正确送达优先于「只发 URL」的提速承诺。
 
         mark_compressed 供 /溯源 向量命中启用：为真时按各回传路径实际的压缩
         证据写入 block["text"]（含文件名与「已压缩」用法说明），使合并消息里
         每张图各带一句配文。为假时一个字节都不碰 block——哈希 /随机图 /原图
-        三处既有调用点行为与改造前一致。
+        三处既有调用点行为与改造前一致（offbox 格式体检除外，见上）。
 
         单次发送保证：同一批图片在一次调用里只发起一次发送。只有 OneBot 直发
         明确失败（FAILED）才允许换通道重发；结果未知（超时）一律就此打住——
@@ -1461,6 +1463,13 @@ class ImageTracePlugin(Star):
             logger.warning("本次事件已投递过图片，跳过重复投递")
             return
         self._remember_blocks(event, blocks if remember_blocks is None else remember_blocks)
+        if self._media_url_fetched_offbox(event):
+            # qq_official 等第三方转存平台：图片字节终会过腾讯富媒体上传，
+            # 假格式（扩展名 .jpg 实为 HEIF/AVIF/WEBP，微博 live 图常见）会被
+            # 打回「富媒体文件格式不支持」。历史已按原始直链记好（上一行），
+            # 这里只改写**发送**用的 block：可转码 → 本地 JPEG path；不可转码
+            # → 缩略图替身 URL。溯源 / 随机图 / 原图 三条路径由此统一覆盖
+            blocks = await self._offbox_rewrite_blocks(blocks)
         mode, max_side, quality, scaled_url_style = self._delivery_config()
         if mode_override is not None:
             mode = mode_override
@@ -2955,24 +2964,7 @@ class ImageTracePlugin(Star):
             caption = self._random_caption(
                 original_url, "image", settings, display_name=original_name
             )
-            if self._media_url_fetched_offbox(event):
-                # 官方机器人富媒体上传只收标准 JPEG/PNG/GIF；图床里混有
-                # 扩展名 .jpg、实为 HEIF/AVIF 的文件（微博 live 图），原样
-                # 交付必被打回「富媒体文件格式不支持」。体检发现假格式时：
-                # 可转码 → 转码 JPEG 本地字节交付；不可转码 → 换发缩略图
-                # 替身直链。历史仍记原图直链，/原图 不受影响
-                outcome = await self._offbox_image_delivery(send_url, settings)
-                if outcome is not None:
-                    kind, value = outcome
-                    if kind == "path":
-                        self._remember_blocks(event, [{"url": original_url}])
-                        chain = self._mention_prefix(event)
-                        if caption:
-                            chain.append(Comp.Plain(caption))
-                        chain.append(Comp.Image.fromFileSystem(value))
-                        yield event.chain_result(chain)
-                        return
-                    send_url = value
+            # qq_official 等平台的假格式体检已下沉到 _yield_delivery 统一处理
             blocks = [
                 {
                     "url": send_url,
@@ -3005,6 +2997,39 @@ class ImageTracePlugin(Star):
         if index < 0:
             return ""
         return unquote(path[index + len(marker) :]).strip()
+
+    async def _offbox_rewrite_blocks(self, blocks: list[dict]) -> list[dict]:
+        """对 blocks 里每个待发 URL 做官方富媒体格式体检，按需改写发送形态。
+
+        体检点放在 _yield_delivery（三条回传路径的汇合处）：标准格式原样
+        保留（只花一次 16 字节嗅探）；假格式可解码 → 换成本地 JPEG path；
+        不可解码 → 换成缩略图替身 URL。全部体检失败按原样保留——体检是
+        增强，不能反过来挡住发送。
+        """
+        settings = self._random_settings()
+        rewritten: list[dict] = []
+        for block in blocks:
+            url = str(block.get("url") or "")
+            if not url or block.get("path"):
+                rewritten.append(block)
+                continue
+            try:
+                outcome = await self._offbox_image_delivery(url, settings)
+            except Exception as exc:
+                logger.warning(f"qq_official 图片格式体检异常，按原样交付: {exc}")
+                outcome = None
+            if outcome is None:
+                rewritten.append(block)
+                continue
+            kind, value = outcome
+            new_block = dict(block)
+            if kind == "path":
+                new_block.pop("url", None)
+                new_block["path"] = value
+            else:
+                new_block["url"] = value
+            rewritten.append(new_block)
+        return rewritten
 
     async def _offbox_image_delivery(
         self, url: str, settings: dict
