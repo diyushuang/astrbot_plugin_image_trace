@@ -70,6 +70,23 @@ def _check_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address, host: str) -> N
         raise UrlBlockedError(f"已拒绝指向非公网地址的请求: {host} -> {ip}")
 
 
+# 允许解析到内网/私网地址的主机白名单：仅由管理员通过插件配置注入（见
+# set_allowed_private_hosts），用于图床与 AstrBot 同机/同内网部署时走内网直连
+# （random_media.lan_base_url）。白名单只豁免「私网地址拒绝」这一步：地址仍会
+# 逐个解析并钉扎给连接阶段，重定向的每一跳、以及其他一切主机不受影响。
+_ALLOWED_PRIVATE_HOSTS: set[str] = set()
+
+
+def set_allowed_private_hosts(hosts) -> None:
+    """整体替换「允许内网地址」的主机白名单（主机名小写、不含端口）。
+
+    以主机名（而非 IP）入白名单：解析结果仍走原有流程（含钉扎），只是不再
+    因落在私网段被拒。传空集合即恢复默认的全拒绝，插件卸载时应如此清理。
+    """
+    global _ALLOWED_PRIVATE_HOSTS
+    _ALLOWED_PRIVATE_HOSTS = {str(h).strip().lower() for h in hosts if str(h or "").strip()}
+
+
 def _url_port(parsed) -> int:
     """取 URL 端口；缺省按协议补全，非法端口统一转为 UrlBlockedError。"""
     try:
@@ -108,6 +125,10 @@ def resolve_public_addrs(url: str) -> tuple[str, list[ResolveResult]]:
     if not host:
         raise UrlBlockedError("URL 缺少主机名")
 
+    # 管理员配置的内网直连主机（如 lan_base_url 的主机）豁免私网地址拒绝；
+    # 其余主机维持 fail-closed：解析到内网地址即拒绝
+    allow_private = host.lower() in _ALLOWED_PRIVATE_HOSTS
+
     # 端口合法性先于任何放行判断，避免 http://1.2.3.4:99999/ 之类绕过
     port = _url_port(parsed)
 
@@ -116,7 +137,8 @@ def resolve_public_addrs(url: str) -> tuple[str, list[ResolveResult]]:
     except ValueError:
         ip = None
     if ip is not None:
-        _check_ip(ip, host)
+        if not allow_private:
+            _check_ip(ip, host)
         return host, [
             ResolveResult(
                 hostname=host,
@@ -142,7 +164,8 @@ def resolve_public_addrs(url: str) -> tuple[str, list[ResolveResult]]:
             resolved = ipaddress.ip_address(ip_str)
         except ValueError as e:
             raise UrlBlockedError(f"域名解析到非法地址: {host}") from e
-        _check_ip(resolved, host)
+        if not allow_private:
+            _check_ip(resolved, host)
         addrs.append(
             ResolveResult(
                 hostname=host,

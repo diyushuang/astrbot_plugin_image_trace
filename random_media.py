@@ -17,7 +17,7 @@ import json
 import random
 import re
 from collections.abc import Awaitable, Callable
-from urllib.parse import unquote, urlencode, urljoin, urlsplit
+from urllib.parse import unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 import aiohttp
 
@@ -270,6 +270,30 @@ def parse_random_response(text, response_url, content_type_header) -> str | None
     return None
 
 
+def swap_url_origin(url, origin_base, allowed_hosts) -> str:
+    """把 URL 的「协议 + 主机端口」换成 origin_base 的；仅当主机在 allowed_hosts。
+
+    用于图床内网直连（lan_base_url）：图床各处产出的直链主机可能不一致——
+    /random 按请求 Host 生成直链（内网请求即内网源），而 Qdrant 里登记的
+    thumb_url / 原图 URL 是公网域名。把「属于本图床」的直链统一改写成内网
+    源，后续取字节（插件下载或协议端下载）就都留在内网；第三方主机不受
+    影响，路径与查询串原样保留。
+    """
+    origin = urlsplit(str(origin_base or ""))
+    if origin.scheme not in {"http", "https"} or not origin.netloc:
+        return str(url or "")
+    try:
+        target = urlsplit(str(url or ""))
+    except ValueError:
+        return str(url or "")
+    if target.scheme not in {"http", "https"} or not target.hostname:
+        return str(url or "")
+    allowed = {str(host).lower() for host in allowed_hosts if str(host or "").strip()}
+    if target.hostname.lower() not in allowed:
+        return str(url or "")
+    return urlunsplit((origin.scheme, origin.netloc, target.path, target.query, target.fragment))
+
+
 def media_filename(url) -> str | None:
     """从媒体 URL 提取文件名；末段不含点号（不像文件名）时返回 None。"""
     try:
@@ -472,15 +496,19 @@ class RandomMediaClient:
         # 单独留一份本次实际发出的目录，供 403 诊断定位（build_random_api_url 会
         # 把它编码进查询串，反解回来只为了日志/提示可读）
         api_dir = str(directory or "").strip()
+        # 内网直连优先：配置 lan_base_url（图床与 AstrBot 同机/同内网部署）时
+        # 接口地址改走内网源，公网 base_url 只用于后续直链改写时的主机匹配
+        lan_base = str(self.settings.get("lan_base_url") or "").strip()
         api_url = build_random_api_url(
-            self.settings.get("base_url"),
+            lan_base or self.settings.get("base_url"),
             self.settings.get("api_endpoint"),
             directory=directory,
             content_type=content_type,
         )
         token = str(self.settings.get("api_token") or "").strip()
-        if token and urlsplit(api_url).scheme != "https":
-            # 图床若是 http，Token 会明文过网，宁可拒绝也不泄露
+        if token and urlsplit(api_url).scheme != "https" and not lan_base:
+            # 图床若是 http，Token 会明文过公网，宁可拒绝也不泄露；内网直连
+            # （lan_base_url，http）是管理员显式声明的可信路径，不受此限
             raise RandomMediaError("配置随机图 Token 时图床地址必须使用 https")
 
         def prepare(_url: str, _method: str, cross_origin: bool) -> dict:

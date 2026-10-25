@@ -1,5 +1,38 @@
 # 更新日志
 
+## 1.7.5（2026-10-25，新增「图床内网直连」random_media.lan_base_url）
+
+线上现象：同一份随机图配置在 ihostart 实例一切正常，在甲骨文实例却每次
+`/随机图` 超时失败（`随机图第 N 次请求失败:` 异常文本为空，即 asyncio 超时）。
+
+现场取证结论（与插件代码无关的环境层故障）：
+
+- 域名（自建图床）的权威侧**答案分裂**——DENIC 委派只剩 Cloudflare 两个 NS
+  （注册商已切干净），但 Cloudflare zone 内 apex NS RRset 仍带着 3 条 netcup NS
+  （建站时扫描旧 DNS 导入的残留），且 netcup 那台至今仍权威应答旧 A 记录
+  （指向一台已失效的旧源站，TTL 86400，443 不通）；
+- 递归解析器以子 zone 宣告的 NS 集合为准 → 甲骨文 VCN 解析器抽中 netcup 侧、
+  拿到死 IP 并按 24h 缓存；ihostart 的 8.8.8.8 抽中 Cloudflare 侧 → 正常。
+
+除根因侧（删 CF zone 里 3 条 netcup NS + 让 netcup 下掉残留 zone）外，插件侧
+新增**内网直连**能力，图床与 AstrBot 同机/同内网部署时整条随机图链路不再出公网：
+
+- `_conf_schema.json`：`random_media` 组新增 `lan_base_url`（选填）。
+- `url_guard.py`：新增 `set_allowed_private_hosts()`——管理员显式配置的内网主机
+  白名单，仅豁免「私网地址拒绝」这一步（钉扎、逐跳校验、其它主机不受影响）；
+  插件卸载时清空。默认行为不变（fail-closed）。
+- `random_media.py`：`RandomMediaClient.fetch` 配置 `lan_base_url` 时接口地址改走
+  内网源；内网 http + Token 不再强制 https（管理员声明的可信路径）。新增纯函数
+  `swap_url_origin()`（仅改写主机在白名单集合内的直链源，路径查询保留）。
+- `main.py`：`_random_settings()` 归一化并注册白名单；随机图链路上所有床内直链
+  （/random 返回值、Qdrant 反查的原图与缩略图）统一改写为内网源。**QQ 官方机器
+  人例外**：其适配器把视频 URL 原样交给腾讯服务器拉流（图片则是本机下载成
+  base64 再上传），故 qq_official 平台的 `/随机视频` 显式改写回公网直链
+  （`_video_url_fetched_offbox`），aiocqhttp/NapCat（同机拉流）继续走内网。
+- 测试：`test_url_guard.py`（白名单放行/清空语义）、`test_random_media.py`
+  （swap_url_origin、lan 模式 fetch、内网 http+Token）、`test_random_commands.py`
+  （lan 模式端到端、官方机器人视频公网回退、aiocqhttp 视频内网）。
+
 ## 1.7.4（2026-10-21，修复「缩略图名丢了目录段」导致 /原图 只能报找不到）
 
 线上现象：发 `/原图` 仍拿回缩略图，或回「图床里没有找到」，而图其实就在图床里。

@@ -21,7 +21,7 @@ import os
 import secrets
 import time
 from collections.abc import AsyncGenerator
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urlsplit
 
 import aiohttp
 import astrbot.api.message_components as Comp
@@ -103,7 +103,9 @@ try:
         media_kind,
         pick_default_directory,
         strip_leading_decoration,
+        swap_url_origin,
     )
+    from .url_guard import set_allowed_private_hosts
     from .vector_search import VectorEngine, VectorEngineError
 except ImportError:  # 兼容插件以独立模块方式加载
     from common import (  # type: ignore[no-redef]
@@ -173,7 +175,9 @@ except ImportError:  # 兼容插件以独立模块方式加载
         media_kind,
         pick_default_directory,
         strip_leading_decoration,
+        swap_url_origin,
     )
+    from url_guard import set_allowed_private_hosts  # type: ignore[no-redef]
     from vector_search import VectorEngine, VectorEngineError  # type: ignore[no-redef]
 
 PLUGIN_NAME = "astrbot_plugin_image_trace"
@@ -856,14 +860,29 @@ class ImageTracePlugin(Star):
 
         default_dir 支持单个目录或用 `,` 分隔的目录池：图床的 /random 只收单一
         dir，池用于「不指定目录时尽量覆盖整库」——见 pick_default_directory。
+
+        lan_base_url（内网直连）非空时：随机接口改走内网源，其主机注册进
+        url_guard 的私网白名单（仅豁免该主机的私网地址拒绝，其它 SSRF 校验
+        照旧）；每次归一化都重注册，配置改动后热重载即可生效。
         """
         raw = self._dict_cfg("random_media")
+        lan_base = str(raw.get("lan_base_url") or "").strip()
+        lan_host = ""
+        if lan_base:
+            parsed_lan = urlsplit(lan_base)
+            if parsed_lan.scheme in ("http", "https") and parsed_lan.netloc:
+                lan_host = (parsed_lan.hostname or "").lower()
+            else:
+                logger.warning(f"random_media.lan_base_url 不是有效的 http(s) 地址，已忽略: {lan_base}")
+                lan_base = ""
+        set_allowed_private_hosts({lan_host} if lan_host else ())
         timeout = as_float(raw.get("timeout"), 10.0)
         if timeout <= 0:
             # 0/负数会让请求立即超时，回退默认值
             timeout = 10.0
         return {
             "base_url": str(raw.get("base_url") or "").strip(),
+            "lan_base_url": lan_base,
             "api_endpoint": str(raw.get("api_endpoint") or RANDOM_ENDPOINT_DEFAULT).strip()
             or RANDOM_ENDPOINT_DEFAULT,
             "api_token": str(raw.get("api_token") or "").strip(),
@@ -874,6 +893,38 @@ class ImageTracePlugin(Star):
             "enable_llm": self._random_bool(raw.get("enable_llm"), True),
             "send_thumbnail": self._random_bool(raw.get("send_thumbnail"), True),
         }
+
+    @staticmethod
+    def _lan_url_hosts(settings: dict) -> tuple[str, ...]:
+        """内网直连模式下允许改写源的主机集合：内网 base 与公网 base 的主机名。
+
+        图床自己产出的直链只可能落在这两个主机上（/random 按请求 Host 生成、
+        Qdrant 登记的是公网域名），命中才改写成内网源，第三方链接不受影响。
+        """
+        lan = str((settings or {}).get("lan_base_url") or "").strip()
+        if not lan:
+            return ()
+        hosts = [urlsplit(lan).hostname or ""]
+        base_host = urlsplit(str((settings or {}).get("base_url") or "")).hostname
+        if base_host:
+            hosts.append(base_host)
+        return tuple(host for host in hosts if host)
+
+    @staticmethod
+    def _video_url_fetched_offbox(event: AstrMessageEvent) -> bool:
+        """该平台发视频是否由第三方服务器按 URL 拉流（而非本机下载）。
+
+        QQ 官方机器人（qq_official / qqofficial_webhook）把视频 URL 原样交给
+        腾讯服务器下载，内网直连地址它访问不到，须回退公网直链（腾讯侧 DNS
+        不受本机解析影响）；aiocqhttp（NapCat，与 AstrBot 同机）等平台由
+        本机拉流，可安全走内网。图片不受此限：官方适配器发图是本机下载成
+        base64 再上传，内网可用。
+        """
+        try:
+            name = str(event.get_platform_name() or "").lower()
+        except Exception:
+            return False
+        return "qqofficial" in name.replace("_", "").replace("-", "")
 
     @staticmethod
     def _random_bool(value, default: bool) -> bool:
@@ -2816,11 +2867,22 @@ class ImageTracePlugin(Star):
             logger.warning(f"获取随机媒体失败: {exc}")
             yield event.plain_result(f"⚠️ 获取随机媒体失败：{exc}")
             return
+        lan_hosts = self._lan_url_hosts(settings)
+        if lan_hosts:
+            # 内网直连：床内直链统一改写为内网源（/random 直链可能已是内网源，
+            # 改写幂等；公网域名形式的直链也一并收进来），后续取字节不出公网
+            media_url = swap_url_origin(media_url, settings["lan_base_url"], lan_hosts)
         media_url = upgrade_to_https(media_url, settings["base_url"])
         kind = media_kind(media_url, content_type)
         if kind == "video":
+            send_url = media_url
+            if lan_hosts and self._video_url_fetched_offbox(event):
+                # 官方机器人等平台把视频 URL 交给腾讯服务器拉流，内网地址它
+                # 访问不到，改写回公网直链（路径不变；且 /random 走内网时返回的
+                # 直链本身已是内网源，必须显式换源而不是“不替换”）
+                send_url = swap_url_origin(media_url, settings["base_url"], lan_hosts)
             caption = self._random_caption(media_url, "video", settings)
-            yield event.chain_result([Comp.Plain(caption), Comp.Video.fromURL(media_url)])
+            yield event.chain_result([Comp.Plain(caption), Comp.Video.fromURL(send_url)])
             return
         if kind == "image":
             # 发送用缩略图替身、历史留原图：QQ 侧下载小图更快，sendMsg 回执超时
@@ -2841,6 +2903,11 @@ class ImageTracePlugin(Star):
                     logger.debug(f"随机图反查原图失败（按原样处理）: {exc}")
                 if info and info.get("url"):
                     original_url = info["url"]
+                    if lan_hosts:
+                        # Qdrant 反查回的是公网直链，内网直连模式下同样改写
+                        original_url = swap_url_origin(
+                            original_url, settings["lan_base_url"], lan_hosts
+                        )
                     # 真名取自 payload.file_name（图床没改过名的原始名）
                     original_name = str(info.get("file_name") or "").strip()
                 else:
@@ -2923,6 +2990,10 @@ class ImageTracePlugin(Star):
             logger.debug(f"该图无缩略图替身，按原图发送: {file_id}")
             return media_url
         logger.debug(f"随机图改发缩略图替身: {file_id} -> {thumb}")
+        lan_hosts = self._lan_url_hosts(settings)
+        if lan_hosts:
+            # Qdrant 登记的 thumb_url 是公网直链，内网直连模式下改写为内网源
+            thumb = swap_url_origin(thumb, str(settings.get("lan_base_url") or ""), lan_hosts)
         return thumb
 
     @staticmethod
@@ -3005,11 +3076,16 @@ class ImageTracePlugin(Star):
         的事件循环，asyncio.create_task 会直接抛错。缓存为空时也照常刷新——
         首次启动后第一次 /溯源 不该因为「索引还没拉」而报未命中。
         """
+        # 提前注册内网直连主机白名单：/原图 可能先于任何随机图命令运行，
+        # 而它要取的直链可能是历史里记下的内网地址
+        self._random_settings()
         if self.remote_hash_on():
             self.start_remote_hash_refresh()
 
     async def terminate(self):
         errors: list[str] = []
+        # 内网直连白名单随插件卸载清理，避免残留到同进程的其它插件实例
+        set_allowed_private_hosts(())
         await self._stop_remote_hash_refresh(errors)
         if self._http is not None:
             try:

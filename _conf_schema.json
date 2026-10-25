@@ -498,7 +498,7 @@
   "random_media": {
     "description": "随机图设置（CloudFlare-ImgBed 随机图接口）",
     "type": "object",
-    "hint": "通过图床随机图接口（GET /random）取图；/随机图、/随机视频、/原图 与 LLM 工具 sendRandomMedia 均依赖本组配置。前置条件：须先在 ImgBed 站点后台开启「随机图」功能，否则取图会失败（插件会给出对应提示）。图床须公网可达（插件出网经 SSRF 校验，不接受内网地址）。回传方式复用上方「图片回传设置」组，本组不重复配置。",
+    "hint": "通过图床随机图接口（GET /random）取图；/随机图、/随机视频、/原图 与 LLM 工具 sendRandomMedia 均依赖本组配置。前置条件：须先在 ImgBed 站点后台开启「随机图」功能，否则取图会失败（插件会给出对应提示）。图床默认须公网可达（插件出网经 SSRF 校验，不接受内网地址）；图床与 AstrBot 同机/同内网部署时可改用「内网直连地址」走内网。回传方式复用上方「图片回传设置」组，本组不重复配置。",
     "items": {
       "base_url": {
         "description": "【必填】图床站点地址",
@@ -506,6 +506,12 @@
         "default": "",
         "obvious_hint": true,
         "hint": "你部署的 CloudFlare-ImgBed 站点首页地址，如 https://img.example.com（不带尾斜杠，且不能含账号密码/查询参数）。必须是公网可访问的 http/https 地址。"
+      },
+      "lan_base_url": {
+        "description": "【选填】图床内网直连地址",
+        "type": "string",
+        "default": "",
+        "hint": "图床（或其反代）与 AstrBot 同机/同内网部署时可填内网地址（如 http://172.20.0.1:7658）。配置后随机图接口与后续取图直链都改走内网，绕开公网 DNS 与 CDN；该主机会加入插件 SSRF 白名单（仅允许它解析到内网地址，其他主机仍一律拒绝）。留空则始终使用上方图床站点地址。"
       },
       "api_endpoint": {
         "description": "【选填】随机图接口路径",
