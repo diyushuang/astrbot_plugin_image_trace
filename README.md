@@ -5,7 +5,7 @@
 
 **群聊里随手转发的一张图，一键找回它的原图。**
 
-[![version](https://img.shields.io/badge/version-1.7.10-blue?style=flat-square)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.7.11-blue?style=flat-square)](./CHANGELOG.md)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4?style=flat-square)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat-square)](./LICENSE)
@@ -222,7 +222,7 @@ QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条
 | --- | --- | --- |
 | `qq_upload.mode` | `auto` | `auto`=按体积分流；`direct`=始终交回 AstrBot 原生直传（维持原行为）；`url`=始终 URL 上传；`chunked`=始终分片。固定通道不因体积改道 |
 | `qq_upload.direct_max_mb` | `3` | `auto` 下不超过该体积走直传。直传硬限 5MB，base64 膨胀 4/3 后原图上限约 3.75MB，故默认留余量；填 `0` 表示从不直传 |
-| `qq_upload.auto_prefer` | `chunked` | `auto` 下直传之外优先哪条：`chunked`（不依赖公网可达，最稳）/ `url`（更快、不占本机上行，但要求腾讯能访问图床直链） |
+| `qq_upload.auto_prefer` | `url` | `auto` 下直传之外优先哪条：`url`（默认，只发一条直链让腾讯侧下载转存，不占本机上行、不用落盘）/ `chunked`（先下到本地再分片，不依赖图床公网可达） |
 | `qq_upload.url_max_mb` | `20` | URL 通道软限；`auto` 下超过该值直接分片。填 `0` 表示不限制（注意超限会变成文件卡片） |
 | `qq_upload.max_upload_mb` | `100` | 分片通道的下载上限，独立于全局 `max_download_mb`（后者默认 20MB，装不下需要分片的大图） |
 | `qq_upload.on_failure` | `fallback` | 通道失败后：`fallback` 交回原有降级链（本地压缩/缩略图）；`notify` 直接回一条文字说明。**本批已成功发过图时无论哪档都不会再交回**，以免同一张图发两遍 |
@@ -230,7 +230,8 @@ QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条
 要点：
 
 - **与缩略图配置完全分开**：`random_media.send_thumbnail` 管的是「随机图要不要发 720px 替身」，`qq_upload` 管的是「这张图用什么方式送到 QQ」，两者互不影响。
-- **URL 通道的公网判定以配置为准**：内网直连地址可能是公网段 IP（如 `192.9.x.x` 并非 RFC1918 私有段），只靠 IP 判断分不出来。插件按 `random_media.lan_base_url` 换回 `base_url` 公网源；若 `base_url` 本身也是内网地址，则判定不可用并降级到分片。
+- **内网直链会换成公网地址再上传**：`lan_base_url` 只是图床与 AstrBot 之间走内网的便利通道，对外的正源是 `base_url`。命中内网主机时按 `base_url` 换源（协议+主机端口换掉，路径与查询串原样保留）；若 `base_url` 本身也配成了内网地址，则判定 URL 通道不可用并降级到分片。
+- **URL 通道失败自动冷却**：公网域名存在不代表腾讯侧拉得到（域名停用/防盗链/防火墙）。URL 上传失败一次即进入 600 秒冷却，期间 `auto` 直接走分片，不会每次交付都先白撞一轮；固定 `url` 通道不受冷却影响（用户显式钉死就该照做）。
 - **接管后由插件自己发消息**：命中 `url`/`chunked` 时，插件自行上传并 `post_group_message` / `post_c2c_message`（`msg_type=7`），随后 `stop_event()`——否则 respond stage 会照原路再发一次。
 - **`/原图` 语义不变**：本通道发的是原图（URL 原样 / 分片原始字节），不会把原图悄悄换成缩略图；配文按「原图」口径写。
 

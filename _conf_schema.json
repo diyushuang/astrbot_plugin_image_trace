@@ -225,11 +225,11 @@
         "description": "【选填】auto 模式在直传之外的偏好",
         "type": "string",
         "options": [
-          "chunked",
-          "url"
+          "url",
+          "chunked"
         ],
-        "default": "chunked",
-        "hint": "chunked=优先分片（默认，不依赖图床公网可达，失败率最低）；url=优先 URL 上传（更快、不占本机上行带宽，但要求腾讯服务器能访问图床公网直链，否则每次都会失败再兜底）。仅 auto 模式生效。"
+        "default": "url",
+        "hint": "url=优先 URL 上传（默认）：只发一条直链让腾讯侧下载转存，不占本机上行、不用落盘，内网直链会先按「图床站点地址」换回公网源；chunked=优先分片：不依赖图床公网可达，失败率最低但需先下到本地。选 url 后若腾讯侧拉不到（域名停用/防盗链/防火墙），失败一次即进入 600 秒冷却，期间 auto 自动改走分片，不会反复白撞。仅 auto 模式生效。"
       },
       "url_max_mb": {
         "description": "【选填】URL 上传体积上限（MB）",

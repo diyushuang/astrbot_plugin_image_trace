@@ -36,6 +36,11 @@ PROBE_CONCURRENCY = 4
 # 探测缩放版，避免每次交付都白花一次请求。
 SCALED_VERIFY_COOLDOWN_SECONDS = 600
 
+# QQ URL 上传通道失败后的冷却时间（秒）。图床公网域名存在、但腾讯侧拉不到
+# （域名已停用、防盗链、防火墙）时，每一次交付都会先撞一次必败的 URL 上传，
+# 白等一轮往返；冷却期内 auto 模式直接走分片。
+QQ_URL_COOLDOWN_SECONDS = 600
+
 # 本地压缩并发上限。Pillow 编解码期间释放 GIL，线程并行确有收益；
 # 上限用于压住低配机器的 CPU 峰值。
 COMPRESS_CONCURRENCY = 3

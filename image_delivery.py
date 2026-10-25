@@ -173,8 +173,11 @@ def qq_upload_settings(config: Any) -> tuple[str, int, int, str, int, str]:
     - direct_max_mb＝3：QQ 二进制直传硬限 5MB，base64 膨胀 4/3 后原图最多约
       3.75MB，取 3 留余量；填 0 表示从不直传（大图一律 url/chunked）。
     - url_max_mb＝20：图片 URL 上传的软限，超过会被平台降级成文件卡片。
-    - auto_prefer＝chunked：URL 上传要腾讯侧反过来访问图床，公网不可达就必然
-      失败；分片不依赖任何外部可达性，做默认更稳，要更快可改 url。
+    - auto_prefer＝url：图床对公网的直链几乎总是存在（否则 QQ 用户根本看不到
+      图），内网直连地址也能按 base_url 换回公网源，而 URL 上传只需一次 JSON、
+      不占本机上行、不用落盘，比先下载再分片划算；万一腾讯侧拉不到（域名停用/
+      防盗链），失败一次即进入冷却、auto 自动改分片，所以默认取 url。纯内网
+      部署（拿不到公网直链）会在选择阶段直接判为不可用，自动落到分片。
     - max_upload_mb＝100：分片路径要先把原图下到本地，这个上限独立于
       max_download_mb（后者默认 20MB，装不下需要分片的大图）。
     - on_failure＝fallback：通道失败后交回原有回传逻辑（本地压缩/缩略图），
@@ -184,9 +187,9 @@ def qq_upload_settings(config: Any) -> tuple[str, int, int, str, int, str]:
     mode = str(raw.get("mode") or "auto").strip().lower()
     if mode not in QQ_UPLOAD_MODES:
         mode = "auto"
-    prefer = str(raw.get("auto_prefer") or "chunked").strip().lower()
+    prefer = str(raw.get("auto_prefer") or "url").strip().lower()
     if prefer not in QQ_AUTO_PREFER:
-        prefer = "chunked"
+        prefer = "url"
     failure = str(raw.get("on_failure") or "fallback").strip().lower()
     if failure not in QQ_UPLOAD_FAILURE_MODES:
         failure = "fallback"
@@ -204,7 +207,7 @@ def choose_qq_upload_channel(
     direct_max_bytes: int = QQ_DIRECT_MAX_DEFAULT_MB * _MB,
     url_max_bytes: int = QQ_URL_MAX_DEFAULT_MB * _MB,
     url_usable: bool = False,
-    auto_prefer: str = "chunked",
+    auto_prefer: str = "url",
 ) -> str:
     """选上传通道：direct / url / chunked。
 
@@ -214,19 +217,20 @@ def choose_qq_upload_channel(
     auto 的判定顺序：
     1. 体积已知且 ≤ direct_max → direct（最快，走适配器原生路径，还能叠加
        本地压缩）；
-    2. auto_prefer=url、且公网直链可用、且体积不超过 URL 软限 → url；
+    2. auto_prefer=url（默认）、公网直链可用、且体积不超过 URL 软限 → url
+       （一次 JSON 请求，不占本机上行、不落盘）；
     3. 其余 → chunked（不依赖图床公网可达，且保原图）。
 
     size_bytes 为 None 表示体积未知：这时不判 direct（怕它其实是大图），按
-    2/3 的偏好继续走。url_usable=False 表示拿不到公网直链（内网直连，或直链
-    本身就指向私网），URL 上传必然失败，直接跳过该通道。
+    2/3 的偏好继续走。url_usable=False 表示拿不到公网直链（内网直连且无公网
+    base、或直链本身就指向私网），URL 上传必然失败，直接跳过该通道。
     """
     normalized = str(mode or "").strip().lower()
     if normalized in QQ_UPLOAD_CHANNELS:
         return normalized
     if size_bytes is not None and 0 < size_bytes <= max(0, direct_max_bytes):
         return "direct"
-    prefer = str(auto_prefer or "chunked").strip().lower()
+    prefer = str(auto_prefer or "url").strip().lower()
     # url_max_bytes ≤ 0 视为不限制（配置填 0 表示「软限不管」）
     if (
         prefer == "url"

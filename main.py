@@ -49,6 +49,7 @@ try:
         PLAN_TOTAL_TIMEOUT,
         PROBE_CONCURRENCY,
         PROBE_TIMEOUT,
+        QQ_URL_COOLDOWN_SECONDS,
         RESCAN_BATCH_SIZE,
         RESCAN_PROGRESS_EVERY,
         SCALED_VERIFY_COOLDOWN_SECONDS,
@@ -125,6 +126,7 @@ except ImportError:  # 兼容插件以独立模块方式加载
         PLAN_TOTAL_TIMEOUT,
         PROBE_CONCURRENCY,
         PROBE_TIMEOUT,
+        QQ_URL_COOLDOWN_SECONDS,
         RESCAN_BATCH_SIZE,
         RESCAN_PROGRESS_EVERY,
         SCALED_VERIFY_COOLDOWN_SECONDS,
@@ -304,6 +306,9 @@ class ImageTracePlugin(Star):
         # 图床缩放能力冷却截止时刻（time.monotonic 口径，0 表示未观测到拒绝）。
         # 探测到 API 级拒绝（405/501 等）后的一段时间内不再探测缩放版。
         self._scaled_verify_unsupported_until = 0.0
+        # QQ URL 上传通道冷却截止时刻：图床公网域名存在但腾讯侧拉不到时，auto
+        # 模式在一段时间内直接分片，避免每次都先白撞一次必败的 URL 上传
+        self._qq_url_unsupported_until = 0.0
         self._cleanup_tmp()
         # 先吃磁盘缓存（同步、瞬时），网络刷新交给生命周期钩子里的后台任务——
         # __init__ 里不能建 Task（此时还没有运行中的事件循环）
@@ -832,6 +837,24 @@ class ImageTracePlugin(Star):
     def _scaled_verify_cooling(self) -> bool:
         """是否处在「图床不支持缩放」的冷却期内。"""
         return time.monotonic() < self._scaled_verify_unsupported_until
+
+    def _note_qq_url_unsupported(self, exc: BaseException) -> None:
+        """记录「QQ 拉不到图床公网直链」，随后一段时间 auto 模式改走分片。
+
+        与「图床拒绝缩放请求」同一套思路：公网域名存在不代表腾讯侧拉得到
+        （域名停用、防盗链、防火墙、跨境链路），而这类失败每次都要白等一轮
+        往返。失败一次就记冷却，冷却期内 auto 直接分片；固定 `url` 通道不受
+        影响——用户显式钉死一条通道时就该照做，失败由 on_failure 决定。
+        """
+        self._qq_url_unsupported_until = time.monotonic() + QQ_URL_COOLDOWN_SECONDS
+        logger.warning(
+            f"QQ URL 上传失败：{QQ_URL_COOLDOWN_SECONDS} 秒内 auto 模式改走分片"
+            f"（固定 url 通道不受影响）; {type(exc).__name__}: {exc}"
+        )
+
+    def _qq_url_cooling(self) -> bool:
+        """是否处在「URL 上传通道不可用」的冷却期内。"""
+        return time.monotonic() < self._qq_url_unsupported_until
 
     def _verify_scaled(self) -> bool:
         """image_delivery.verify_scaled：图床缩放是否实测校验，未配置时默认开启。"""
@@ -3291,12 +3314,16 @@ class ImageTracePlugin(Star):
             size = None if mode in {"url", "chunked"} else await self._qq_block_size(block)
             url = str(block.get("url") or "")
             public_url = self._qq_public_url(url, settings) if url else None
+            url_usable = public_url is not None
+            if mode == "auto" and url_usable and self._qq_url_cooling():
+                # 刚撞过「腾讯拉不到公网直链」：冷却期内 auto 直接分片，别再白等
+                url_usable = False
             channel = choose_qq_upload_channel(
                 mode=mode,
                 size_bytes=size,
                 direct_max_bytes=direct_max,
                 url_max_bytes=url_max,
-                url_usable=public_url is not None,
+                url_usable=url_usable,
                 auto_prefer=auto_prefer,
             )
             if channel == "direct":
@@ -3334,6 +3361,9 @@ class ImageTracePlugin(Star):
                     f"qq_official {channel} 通道上传/发送失败"
                     f"（第 {index + 1}/{len(plan)} 张）: {detail}"
                 )
+                if channel == "url":
+                    # 公网直链拿得到、腾讯却拉不到：记冷却，auto 后续直接分片
+                    self._note_qq_url_unsupported(exc)
                 if not sent_any and on_failure == "fallback":
                     logger.warning(
                         "qq_official 上传通道不可用，交回原回传逻辑（本地压缩/缩略图）"
