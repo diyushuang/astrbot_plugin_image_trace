@@ -205,6 +205,54 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".jfif", ".heic"
 # QQ 开放平台富媒体 file_type：1=图片、2=视频、3=语音、4=文件
 QQ_IMAGE_FILE_TYPE = 1
 
+# ----------------------------------------------------------------------
+# 配置布局（1.7.14）：同类项合并进 basic / delivery / limits 三个组。
+# 旧布局（顶层散项 + image_delivery / qq_upload 两组）继续可读——新键优先、
+# 旧键回落，启动时由 _migrate_config_layout 落盘迁移，用户无需手动改配置。
+# ----------------------------------------------------------------------
+
+# 旧顶层键 → (新组, 新字段)
+_SCALAR_PATHS: dict[str, tuple[str, str]] = {
+    "search_engine": ("basic", "search_engine"),
+    "scan_dirs": ("basic", "scan_dirs"),
+    "similarity_threshold": ("basic", "hash_similarity_threshold"),
+    "hash_size": ("basic", "hash_size"),
+    "top_n": ("basic", "top_n"),
+    "max_images_per_query": ("basic", "max_images_per_query"),
+    "ai_verify": ("basic", "ai_verify"),
+    "register_admin_only": ("basic", "register_admin_only"),
+    "max_download_mb": ("limits", "max_download_mb"),
+    "remote_hash_enabled": ("limits", "remote_hash_enabled"),
+    "remote_hash_ttl": ("limits", "remote_hash_ttl"),
+    "remote_hash_max_points": ("limits", "remote_hash_max_points"),
+}
+
+# 当前配置布局版本（写在隐藏项 config_layout 里，避免重复迁移覆盖用户新值）
+_LAYOUT_VERSION = "3"
+
+# 旧 image_delivery 字段 → delivery 组里的 NapCat 字段
+_NAPCAT_KEY_MAP: dict[str, str] = {
+    "mode": "napcat_mode",
+    "max_side": "napcat_max_side",
+    "quality": "napcat_quality",
+    "verify_scaled": "napcat_verify_scaled",
+    "scaled_url_style": "napcat_scaled_url_style",
+    "target_kb": "napcat_target_kb",
+    "webp": "napcat_webp",
+    "onebot_image_timeout": "napcat_timeout",
+}
+
+# 旧 qq_upload 字段 → delivery 组里的 QQ 官方字段
+_QQ_KEY_MAP: dict[str, str] = {
+    "mode": "qq_mode",
+    "direct_max_mb": "qq_native_max_mb",
+    "auto_prefer": "qq_auto_prefer",
+    "url_max_mb": "qq_url_max_mb",
+    "max_upload_mb": "qq_max_upload_mb",
+    "on_failure": "qq_on_failure",
+}
+
+
 
 def _describe_bad_image(path: str) -> tuple[str, str | None]:
     """坏产物摘要 + 按文件头识别的容器格式，供日志与失败分诊使用。
@@ -273,10 +321,12 @@ class ImageTracePlugin(Star):
         self.tmp_dir = os.path.join(self.data_dir, "tmp")
         os.makedirs(self.tmp_dir, exist_ok=True)
 
+        # 旧布局先搬进 basic / delivery / limits，后续读取一律走新路径
+        self._migrate_config_layout()
         # pHash 十六进制长度 = phash_hex_len(hash_size)（packbits 补齐到字节
         # 边界）；hash_size 必须为 4 的倍数，否则长度公式与旧数据对不上，
         # 全库记录都会被判为不匹配、索引静默清空
-        hash_size = as_int(self.config.get("hash_size"), 16)
+        hash_size = as_int(self._cfg("hash_size"), 16)
         if not 4 <= hash_size <= 32 or hash_size % 4 != 0:
             logger.warning(
                 f"hash_size 配置值 {hash_size} 无效（须为 4~32 之间 4 的倍数，"
@@ -394,18 +444,134 @@ class ImageTracePlugin(Star):
         value = self.config.get(key)
         return value if isinstance(value, dict) else {}
 
+    def _ensure_group(self, name: str) -> dict:
+        """取（必要时创建）对象型配置组，迁移与新键写入共用。"""
+        group = self.config.get(name)
+        if not isinstance(group, dict):
+            group = {}
+            self.config[name] = group
+        return group
+
+    def _cfg(self, key: str):
+        """读标量配置：新布局（basic / limits）优先，回落旧顶层键。
+
+        迁移未执行（配置被手改、或用户回滚过版本）时旧键仍能生效；两处都有值时
+        以新键为准，避免"面板改了不生效"。
+        """
+        group, field = _SCALAR_PATHS.get(key, ("", key))
+        if group:
+            value = self._dict_cfg(group).get(field)
+            if not is_blank(value):
+                return value
+        return self.config.get(key)
+
     def _int_cfg(self, key: str, default: int) -> int:
-        return as_int(self.config.get(key), default)
+        return as_int(self._cfg(key), default)
 
     def _float_cfg(self, key: str, default: float) -> float:
-        return as_float(self.config.get(key), default)
+        return as_float(self._cfg(key), default)
 
     def _bool_cfg(self, key: str, default: bool) -> bool:
         """布尔配置：未配置（缺键/空串/null）时取默认值，与数值配置口径一致。"""
-        value = self.config.get(key)
+        value = self._cfg(key)
         if self._is_blank(value):
             return default
         return truthy(value)
+
+    def _migrate_config_layout(self) -> None:
+        """把旧布局搬进 basic / delivery / limits（一次性，带版本标记）。
+
+        为什么不「删旧键」：AstrBot 加载插件配置时会按 schema 删除已不存在的键
+        （AstrBotConfig.check_config_integrity 会丢掉 refer_conf 之外的键），键名
+        一改，用户的旧值在插件初始化**之前**就已经被清成默认值了。所以旧键继续以
+        「隐藏镜像」的形式留在 schema 里（condition 恒假，面板不显示），迁移只做
+        搬移 + 打标记，之后不再覆盖——用户此后在面板改的新值不会被旧值盖回去。
+
+        旧值优先于新键：新键在首次加载时已被 schema 默认值填满，此时「新键非空」
+        不代表用户改过，只有旧键才是用户真实设置。
+        """
+        if str(self.config.get("config_layout") or "") == _LAYOUT_VERSION:
+            return
+        moved = False
+        for legacy, (group, field) in _SCALAR_PATHS.items():
+            value = self.config.get(legacy)
+            if is_blank(value):
+                continue
+            self._ensure_group(group)[field] = value
+            moved = True
+        for legacy_group, key_map in (
+            ("image_delivery", _NAPCAT_KEY_MAP),
+            ("qq_upload", _QQ_KEY_MAP),
+        ):
+            legacy_items = self.config.get(legacy_group)
+            if not isinstance(legacy_items, dict):
+                continue
+            target = self._ensure_group("delivery")
+            for old_key, new_key in key_map.items():
+                value = legacy_items.get(old_key)
+                if not is_blank(value):
+                    target[new_key] = value
+                    moved = True
+        self.config["config_layout"] = _LAYOUT_VERSION
+        try:
+            self.config.save_config()
+        except Exception as exc:  # 保存失败不影响本次会话
+            logger.warning(f"配置布局迁移写入失败（重启后会自动重试）: {exc}")
+        if moved:
+            logger.info("配置已迁移到新布局：basic / delivery / limits（旧键保留为隐藏镜像）")
+
+    def _napcat_delivery_cfg(self) -> dict:
+        """推送通道（NapCat）配置，键名沿用 delivery_settings 的入参约定。
+
+        delivery.napcat_* 优先，逐项回落旧 image_delivery.*（迁移未执行时也能用）。
+        """
+        new = self._dict_cfg("delivery")
+        old = self._dict_cfg("image_delivery")
+        return {
+            "mode": self._first_value(new.get("napcat_mode"), old.get("mode")),
+            "max_side": self._first_value(new.get("napcat_max_side"), old.get("max_side")),
+            "quality": self._first_value(new.get("napcat_quality"), old.get("quality")),
+            "scaled_url_style": self._first_value(
+                new.get("napcat_scaled_url_style"), old.get("scaled_url_style")
+            ),
+            "verify_scaled": self._first_value(
+                new.get("napcat_verify_scaled"), old.get("verify_scaled")
+            ),
+            "target_kb": self._first_value(new.get("napcat_target_kb"), old.get("target_kb")),
+            "webp": self._first_value(new.get("napcat_webp"), old.get("webp")),
+            "onebot_image_timeout": self._first_value(
+                new.get("napcat_timeout"), old.get("onebot_image_timeout")
+            ),
+        }
+
+    def _qq_delivery_cfg(self) -> dict:
+        """推送通道（QQ 官方）配置，键名沿用 qq_upload_settings 的入参约定。"""
+        new = self._dict_cfg("delivery")
+        old = self._dict_cfg("qq_upload")
+        return {
+            "mode": self._first_value(new.get("qq_mode"), old.get("mode")),
+            "direct_max_mb": self._first_value(
+                new.get("qq_native_max_mb"), old.get("direct_max_mb")
+            ),
+            "auto_prefer": self._first_value(
+                new.get("qq_auto_prefer"), old.get("auto_prefer")
+            ),
+            "url_max_mb": self._first_value(new.get("qq_url_max_mb"), old.get("url_max_mb")),
+            "max_upload_mb": self._first_value(
+                new.get("qq_max_upload_mb"), old.get("max_upload_mb")
+            ),
+            "on_failure": self._first_value(
+                new.get("qq_on_failure"), old.get("on_failure")
+            ),
+        }
+
+    @staticmethod
+    def _first_value(*values):
+        """取第一个非空值（0 / False 是合法配置，不能按假值跳过）。"""
+        for value in values:
+            if not is_blank(value):
+                return value
+        return None
 
     def _migrate_bucket_config(self) -> None:
         """v1.2.x 升级迁移（幂等）：image_bed 组里的储存桶模式与字段搬到
@@ -503,7 +669,7 @@ class ImageTracePlugin(Star):
 
     def _engine_choice(self) -> str:
         """当前检索引擎：hash | vector | auto（vector 优先，失败/未命中回退 hash）。"""
-        choice = str(self.config.get("search_engine") or "auto").strip().lower()
+        choice = str(self._cfg("search_engine") or "auto").strip().lower()
         return choice if choice in ("hash", "vector", "auto") else "auto"
 
     def _vector_index_on_register(self) -> bool:
@@ -513,7 +679,7 @@ class ImageTracePlugin(Star):
         return truthy(value)
 
     def _scan_dirs(self) -> list:
-        raw = self.config.get("scan_dirs")
+        raw = self._cfg("scan_dirs")
         if isinstance(raw, str):  # 手工配置成单个路径字符串时按一个目录处理
             raw = [raw]
         if not isinstance(raw, list):
@@ -861,19 +1027,19 @@ class ImageTracePlugin(Star):
         return time.monotonic() < self._qq_url_unsupported_until
 
     def _verify_scaled(self) -> bool:
-        """image_delivery.verify_scaled：图床缩放是否实测校验，未配置时默认开启。"""
-        raw = self._dict_cfg("image_delivery").get("verify_scaled")
+        """delivery.napcat_verify_scaled：图床缩放是否实测校验，未配置时默认开启。"""
+        raw = self._napcat_delivery_cfg().get("verify_scaled")
         return True if is_blank(raw) else truthy(raw)
 
     def _onebot_image_timeout(self) -> int:
-        """image_delivery.onebot_image_timeout：image 段 timeout 字段（秒）。
+        """delivery.napcat_timeout：OneBot image 段的 timeout 字段（秒）。
 
         该字段是协议端（NapCat 等）下载网络图片的窗口，不是插件的出网超时。
         未配置或填了非数字时用 common.ONEBOT_IMAGE_TIMEOUT；其余值收敛到
         [10, 300]——填 0 会落到 10 而不是原样写 0，否则等于告诉协议端「立刻
         放弃下载」，图片必然拉不到。
         """
-        raw = self._dict_cfg("image_delivery").get("onebot_image_timeout")
+        raw = self._napcat_delivery_cfg().get("onebot_image_timeout")
         return bounded_int(raw, ONEBOT_IMAGE_TIMEOUT, 10, 300)
 
     async def _get_http(self) -> GuardedHttpClient:
@@ -902,7 +1068,7 @@ class ImageTracePlugin(Star):
             pass
 
     def _delivery_config(self) -> tuple[str, int, int, str]:
-        return delivery_settings(self.config.get("image_delivery"))
+        return delivery_settings(self._napcat_delivery_cfg())
 
     def _random_settings(self) -> dict:
         """归一化随机图配置组（random_media）。
@@ -1351,7 +1517,7 @@ class ImageTracePlugin(Star):
 
     def _encode_options(self) -> tuple[int, bool]:
         """本地压缩进阶选项：目标体积上限（字节，0 表示不限制）与 WebP 输出。"""
-        raw = self._dict_cfg("image_delivery")
+        raw = self._napcat_delivery_cfg()
         target_kb = bounded_int(raw.get("target_kb"), 0, 0, 10240)
         return target_kb * 1024, truthy(raw.get("webp"))
 
@@ -3202,8 +3368,8 @@ class ImageTracePlugin(Star):
     # ------------------------------------------------------------------
 
     def _qq_upload_config(self) -> tuple[str, int, int, str, int, str]:
-        """qq_upload 配置组归一化，语义见 image_delivery.qq_upload_settings。"""
-        return qq_upload_settings(self._dict_cfg("qq_upload"))
+        """推送通道（QQ 官方）配置归一化，语义见 image_delivery.qq_upload_settings。"""
+        return qq_upload_settings(self._qq_delivery_cfg())
 
     @staticmethod
     def _qq_send_target(event: AstrMessageEvent) -> tuple[str, str] | None:
@@ -3324,7 +3490,7 @@ class ImageTracePlugin(Star):
         调用方必须标记已发送并 stop_event，否则 respond stage 会照原路（base64
         直传）再发一次，那正是「上传文件大小超过限制」的来源。
 
-        失败语义两档（qq_upload.on_failure）：
+        失败语义两档（delivery.qq_on_failure）：
         - fallback（默认）：一张都还没发出去时返回 False，交回原有的本地压缩 /
           缩略图降级链；只要已经发过就绝不再交回，避免同一张图发两遍。
         - notify：不交回，改回一条文字说明失败原因。

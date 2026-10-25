@@ -1,5 +1,36 @@
 # 更新日志
 
+## 1.7.14（2026-10-25，配置面板重构：19 个顶层项 → 7 组，同类合并 + 说明精简）
+
+问题：面板顶层有 19 项（7 组 + 12 个散项），同类概念散在多处——两个推送组
+（`image_delivery` / `qq_upload`）、两个"进阶"开关（顶层 `advanced_settings` 与
+`vector_search.advanced`）、两个 `timeout`、一个与向量组同名的
+`similarity_threshold`；说明越写越长，混着历史沿革与原理。
+
+- **分层**：顶层收敛为 `basic`（基础）/ `delivery`（图片推送）/ `image_bed` /
+  `storage_bucket` / `random_media` / `vector_search` / `limits`（限制与缓存）
+  七组，仅保留 `advanced_settings` 一个面板开关。
+- **合并同类项**：
+  - `image_delivery` + `qq_upload` → `delivery`，用平台前缀区分：`napcat_*` 8 项、
+    `qq_*` 6 项（`qq_upload.direct_max_mb` → `delivery.qq_native_max_mb`，与新词表对齐）；
+  - 8 个顶层标量进 `basic`，`max_download_mb` + `remote_hash_*` 进 `limits`；
+  - 哈希阈值更名 `basic.hash_similarity_threshold`，与 `vector_search.similarity_threshold` 区分。
+- **折叠**：改用 WebUI 原生 `collapsed`（每组「更多配置」展开器），删掉自造的
+  两个「进阶开关」（顶层 `advanced_settings`、`vector_search.advanced`）——原先
+  同一件事有两种折叠机制。`basic.hash_size` / `top_n` / `max_images_per_query`、
+  `limits.*`、`delivery.napcat_target_kb` / `napcat_webp` / `napcat_timeout`、
+  向量组 4 项收进折叠区；`napcat_scaled_url_style` 仅在 `napcat_mode=url-scaled` 时显示。
+- **说明精简**：每条只保留"是什么 + 必要约束"（最长由 456 字降到约 130 字），
+  通道词表说明集中到 `delivery` 组级 hint 一次；原理与排障细节留给 README/CHANGELOG。
+- **兼容（关键）**：AstrBot 加载插件配置时会按 schema **删除已不存在的键**
+  （`AstrBotConfig.check_config_integrity`），直接改名会把用户旧值在插件初始化
+  之前就清成默认值。因此旧键以**隐藏镜像**（`invisible: true`）保留在 schema 里，
+  `_migrate_config_layout()` 首次加载时把旧值搬进新组并写入 `config_layout` 版本
+  标记（只搬一次，之后不再覆盖面板新值）；`_cfg()` 仍逐项回落到旧键，配置被手改
+  回旧布局也照常工作。旧镜像计划在后续版本移除。
+- 测试：新增 `tests/test_config_layout.py` 13 例（搬移/合并/只跑一次/旧值优先/
+  回落）。全量 378 passed。
+
 ## 1.7.13（2026-10-25，通道命名统一：两平台共用 auto/native/bytes/url/url-scaled）
 
 问题：同样是「怎么把图送出去」，NapCat 侧叫 `local-compress` / `scaled-url` /

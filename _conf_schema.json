@@ -1,241 +1,196 @@
 {
-  "search_engine": {
-    "description": "【选填】检索引擎",
-    "type": "string",
-    "options": ["auto", "vector", "hash"],
-    "default": "auto",
-    "obvious_hint": true,
-    "hint": "auto=向量优先：先查 Qdrant 向量库，未命中或向量引擎不可用时自动回退 pHash 哈希库；vector=只用向量引擎；hash=只用原哈希引擎（保持旧行为）。向量引擎要求下方「向量检索设置」配置完整。"
-  },
-  "scan_dirs": {
-    "description": "【按需必填】本地图库目录（原图片库 / 图床存储目录）",
-    "type": "list",
-    "default": [],
-    "obvious_hint": true,
-    "hint": "需要把已有本地图库（如本地图床 Lsky Pro 的存储目录）纳入检索时必填；仅靠 /登记原图 积累图库可留空。目录下（含子目录）的图片文件将被建立索引，必须是机器人进程可访问的绝对路径。修改后执行 /溯源重扫 生效。"
-  },
-  "vector_search": {
-    "description": "向量检索设置（Qdrant + 多模态向量 AI）",
+  "basic": {
+    "description": "基础设置",
     "type": "object",
-    "hint": "为什么必填向量 AI：向量库（Qdrant）里只存向量不存图片，/溯源 时插件必须调用与图床入库侧相同的多模态向量 AI 把查询图转成向量，才能去 Qdrant 检索，因此 embed_base_url / embed_model 必填（embed_api_key 在网关无鉴权时可留空）。embed 的 base_url/model/image_input 三值必须与图床入库侧完全一致，否则查询向量与库中向量不在同一空间、相似度无意义。登记原图时若图床自带服务器侧钩子（如 cloudflare_imgbed），插件不会重复写入。进阶项（图片输入格式、返回候选数、超时等）在组内「显示进阶配置」开启后显示。",
+    "hint": "检索方式、图库目录与判定阈值。日常通常只需改前两项。",
     "items": {
-      "qdrant_url": {
-        "description": "【必填】Qdrant 服务地址",
+      "search_engine": {
+        "description": "【选填】检索引擎",
         "type": "string",
-        "default": "",
+        "options": [
+          "auto",
+          "vector",
+          "hash"
+        ],
+        "default": "auto",
         "obvious_hint": true,
-        "hint": "Qdrant REST 地址，如 http://<你的服务器IP>:6333。必须是公网可达的 http/https 地址（插件出网经 SSRF 校验，不接受内网地址）。"
+        "hint": "auto=向量优先、不可用时回退哈希；hash=只用本地 pHash；vector=只用向量库。"
       },
-      "qdrant_api_key": {
-        "description": "【选填】Qdrant API Key",
-        "type": "string",
-        "secret": true,
-        "default": "",
-        "hint": "Qdrant 启动时通过 QDRANT__SERVICE__API_KEY 设置的密钥，留空则不带鉴权头。"
+      "scan_dirs": {
+        "description": "【按需必填】本地图库目录",
+        "type": "list",
+        "default": [],
+        "hint": "每行一个绝对路径。/溯源重扫 按此扫描；留空则只用图床哈希索引。",
+        "obvious_hint": true
       },
-      "collection_name": {
-        "description": "【选填】Qdrant 集合名",
-        "type": "string",
-        "default": "imgbed_images",
-        "hint": "向量点所在的集合，需与图床入库侧一致。"
-      },
-      "embed_base_url": {
-        "description": "【必填】多模态向量 AI 地址",
-        "type": "string",
-        "default": "",
-        "obvious_hint": true,
-        "hint": "OpenAI 兼容 embedding 服务的 base，如 https://<你的网关域名>/v1（不带尾斜杠），实际请求 POST {base}/embeddings。与图床入库侧填同一个地址。"
-      },
-      "embed_api_key": {
-        "description": "【选填】向量 AI API Key",
-        "type": "string",
-        "secret": true,
-        "default": "",
-        "hint": "embedding 请求的 Authorization: Bearer 密钥；网关未开启鉴权时可留空（留空则不带鉴权头）。"
-      },
-      "embed_model": {
-        "description": "【必填】多模态图片向量模型",
-        "type": "string",
-        "default": "",
-        "obvious_hint": true,
-        "hint": "接受图片输入的多模态 embedding 模型 ID（文本 embedding 模型无法对图片向量化），例如 Qwen/Qwen3-VL-Embedding-8B。必须与图床入库侧一致。"
-      },
-      "similarity_threshold": {
-        "description": "【选填】向量相似度阈值（0~1）",
+      "hash_similarity_threshold": {
+        "description": "【选填】哈希命中阈值（0~1）",
         "type": "float",
-        "default": 0.8,
+        "default": 0.85,
         "obvious_hint": true,
-        "hint": "Qdrant cosine 相似度达到该值判定命中（同一张图的压缩/裁剪变体通常 0.85+，不同图通常更低）。建议先用少量成对图片实测校准。"
+        "hint": "相似度 = 1 − 汉明距离/总位数，达到该值才判命中。默认 0.85 对应 hash_size=16。"
       },
-      "duplicate_vector_threshold": {
-        "description": "【选填】重复图片向量阈值（0~1）",
-        "type": "float",
-        "default": 0.995,
-        "hint": "向量命中候选之间的 cosine 相似度达到该值时视为同一张图，只回传相似度最高的一张并显示合并数量。Qdrant 未返回向量时仅按相同 src/image_url 去重。"
-      },
-      "vector_index_on_register": {
-        "description": "【选填】登记原图时同步写入向量库",
-        "type": "bool",
-        "default": true,
-        "hint": "/登记原图 上传成功后，把新图向量写入 Qdrant（cloudflare_imgbed 模式由图床侧钩子自动入库，插件不会重复写）。"
-      },
-      "advanced": {
-        "description": "显示进阶配置（面板收纳开关）",
+      "ai_verify": {
+        "description": "【选填】AI 视觉复核",
         "type": "bool",
         "default": false,
-        "hint": "开启后才会显示下方进阶项（图片输入序列化格式、input_type、返回候选数、请求超时）；不影响任何功能，一般保持关闭即可。"
+        "hint": "命中后用当前会话的视觉大模型复核，减少误报；每张候选多一次模型调用。",
+        "obvious_hint": true
       },
-      "embed_image_input": {
-        "description": "【选填】图片输入序列化格式",
-        "type": "string",
-        "options": ["nemotron-vl", "qwen-vl", "dataurl", "jina-image"],
-        "default": "nemotron-vl",
-        "condition": {
-          "advanced": true
-        },
-        "hint": "默认 nemotron-vl=裸 dataURL 字符串 + input_type=passage（NVIDIA llama-nemotron-embed-vl 系只接受这一种，integrate.api.nvidia.com 即属此类）；qwen-vl=content 数组 [{\"type\":\"image\",\"image\":<dataURL>}]（仅 Qwen3-VL-Embedding 系需要）；dataurl=直接传 dataURL 字符串；jina-image=[{\"image\":<base64>}]（jina-clip 系）。请求报 500 'dict' object has no attribute 'strip'（把 qwen-vl 格式发给了只收字符串的模型）或 400 时在此切换，需与图床入库侧一致。"
+      "register_admin_only": {
+        "description": "【选填】仅管理员可登记原图",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后只有管理员能执行 /登记原图、/删除 等写操作。"
       },
-      "embed_input_type": {
-        "description": "【选填】NVIDIA 非对称模型 input_type",
-        "type": "string",
-        "options": ["passage", "query"],
-        "default": "passage",
-        "condition": {
-          "advanced": true,
-          "embed_image_input": "nemotron-vl"
-        },
-        "hint": "仅 nemotron-vl 模式相关：llama-nemotron-embed-vl 是非对称模型，图片只能走 passage 侧（query 侧拒绝图片）。本插件对图片固定使用 passage，此值仅供与图床入库侧核对一致性。"
-      },
-      "top_k": {
-        "description": "【选填】向量检索返回候选数",
+      "max_images_per_query": {
+        "description": "【选填】单次溯源最多处理图片数",
         "type": "int",
-        "default": 5,
-        "condition": {
-          "advanced": true
-        },
-        "hint": "每次从 Qdrant 取回的最相似点数：达到相似度阈值的命中会全部回传（按相似度降序），因此该值同时也是单次回传图片数量的上限；未命中时其中前 top_n 条作为候选列出。"
+        "default": 3,
+        "hint": "一条消息带多张图时按此截断。",
+        "collapsed": true
       },
-      "request_timeout": {
-        "description": "【选填】请求超时（秒）",
+      "hash_size": {
+        "description": "【选填】感知哈希精度",
         "type": "int",
-        "default": 30,
-        "condition": {
-          "advanced": true
-        },
-        "hint": "embedding 与 Qdrant 请求的超时时间。大模型 embedding 较慢时可调大。"
+        "default": 16,
+        "options": [
+          4,
+          8,
+          12,
+          16,
+          20,
+          24,
+          28,
+          32
+        ],
+        "hint": "16→256bit。须为 4 的倍数；修改后需 /溯源重扫 force 重建索引。",
+        "collapsed": true
+      },
+      "top_n": {
+        "description": "【选填】未命中时提示的候选数",
+        "type": "int",
+        "default": 3,
+        "hint": "0=不提示最接近的图。",
+        "collapsed": true
       }
     }
   },
-  "image_delivery": {
-    "description": "图片推送：通道与压缩参数（NapCat / OneBot）",
+  "delivery": {
+    "description": "图片推送",
     "type": "object",
-    "hint": "【图片推送的三层结构与通道名，先看这里】① 通道层（怎么把图送出去）：本组 mode 决定 aiocqhttp(OneBot) 怎么发；QQ 官方机器人另由「图片推送 · 通道层：QQ 官方机器人」组决定。两组通道名完全一致：auto / native / bytes / url / url-scaled，同名同义，只是落地实现不同。② 形态层（发哪一份图）：随机图的「发送缩略图」开关决定是否用 720px 替身。③ 内容层（配什么文）：配文与「已压缩」标识按实测证据自动生成，无需配置。优先级：QQ 官方机器人且其通道未设为 native 时，先由上传通道接管，接管失败或设为 native 才回到本组 mode。三层互不覆盖：换通道不改发哪份图，换形态不改走哪条通道。本平台默认 auto：下载后本地压缩，压缩字节经 OneBot 接口直达 QQ——QQ 协议端（NapCat 等）实测会剥离 URL 查询参数，图床缩放 URL 直传拿回的常是原图，本地压缩可确保压缩 100% 生效且配文为实测精确值。",
+    "hint": "通道名两平台通用：auto=自动；native=不加工，交给适配器；bytes=本机处理成字节再上传（QQ 官方为分片）；url=直链交平台下载原图；url-scaled=直链交平台下载缩放版。旧写法 local-compress / scaled-url / original-url / direct / chunked 自动映射为 auto / url-scaled / url / native / bytes。",
     "items": {
-      "mode": {
-        "description": "【选填】推送通道（NapCat / OneBot）",
+      "napcat_mode": {
+        "description": "【选填】通道（NapCat / OneBot）",
         "type": "string",
-        "options": ["auto", "native", "bytes", "url", "url-scaled"],
+        "options": [
+          "auto",
+          "native",
+          "bytes",
+          "url",
+          "url-scaled"
+        ],
         "default": "auto",
         "obvious_hint": true,
-        "hint": "通道名与「QQ 官方机器人」组完全一致（同名同义，只是落地实现不同）。auto=自动（默认；下载后压缩、经 base64 段直发，已知小图仍直发 URL 省一次往返）；native=不加工，交给 AstrBot 原样发送（排障对照）；bytes=一律在本机压缩成字节再发（本平台与 auto 同一实现，保留该值是为了两平台共用一套通道名）；url=原图直链直传；url-scaled=图床缩放直链直传（参数风格见下方缩放 URL 风格）。旧版本的 local-compress / scaled-url / original-url 仍可读，分别自动映射为 auto / url-scaled / url。"
+        "hint": "本平台用哪条通道推送。auto 下载后压缩直发（小图直发 URL）；bytes 同 auto；url / url-scaled 直传直链；native 直接交给适配器。"
       },
-      "scaled_url_style": {
-        "description": "【选填】缩放 URL 风格",
-        "type": "string",
-        "options": ["query", "cf-path"],
-        "default": "query",
-        "obvious_hint": true,
-        "hint": "仅 url-scaled 通道生效。query=查询参数式（?width=…&fallback=original），兼容任何 CloudFlare-ImgBed 部署，但 QQ 协议端下载时可能剥离参数；cf-path=Cloudflare Image Resizing 路径式（/cdn-cgi/image/width=…,fit=scale-down/file/…），参数嵌在路径里剥离不掉、图床→协议端流量必为压缩后，但要求图床域名经 Cloudflare 代理且开启 Image Resizing（付费功能）——IP 直连自建部署（无 Cloudflare 代理域名）不可用，请保持 query 或改用 auto 通道。",
-        "condition": {
-          "mode": "url-scaled"
-        }
-      },
-      "max_side": {
+      "napcat_max_side": {
         "description": "【选填】缩放/压缩最长边（像素）",
         "type": "int",
         "default": 1920,
-        "hint": "url-scaled 通道作为 CloudFlare-ImgBed width/height 最大边界；本地压缩时按该值等比缩放。范围 1~4096。"
+        "hint": "本地压缩按此等比缩放；url-scaled 作为图床 width/height 边界。1~4096。"
       },
-      "quality": {
-        "description": "【选填】本地 JPEG 压缩质量",
+      "napcat_quality": {
+        "description": "【选填】JPEG 压缩质量",
         "type": "int",
         "default": 85,
-        "hint": "仅本地压缩与 OneBot URL 直传失败后的压缩回退使用；范围 1~100。"
+        "hint": "1~100，本地压缩与回退路径生效。"
       },
-      "verify_scaled": {
-        "description": "【选填】实测校验图床缩放是否真的生效",
+      "napcat_verify_scaled": {
+        "description": "【选填】实测校验缩放是否生效",
         "type": "bool",
         "default": true,
-        "hint": "开启后，缩放 URL 直传前用 HEAD 比对缩放版与原图的响应体长度，只有确实更小才在配文里标注「已压缩」。命中条目已记录原图体积（向量 payload 的 size_bytes / 图库的 file_size）时只探测缩放版一次；所有探测并发执行且受总预算约束，图床明确拒绝缩放请求（405/501 等）后 600 秒内不再探测。图片不超过 max_side 时跳过缩放参数，不触发无意义的图床处理。关闭后不再宣称压缩。"
+        "hint": "开启后仅在实测缩放版更小时才标注「已压缩」。关闭则不做探测、也不标注。"
       },
-      "target_kb": {
-        "description": "【选填】本地压缩的目标体积上限（KB，0=不限制）",
+      "napcat_scaled_url_style": {
+        "description": "【选填】缩放 URL 风格",
+        "type": "string",
+        "options": [
+          "query",
+          "cf-path"
+        ],
+        "default": "query",
+        "obvious_hint": true,
+        "hint": "query=查询参数式，兼容任意 ImgBed 部署；cf-path=Cloudflare Image Resizing 路径式，需域名走 Cloudflare 且开启该功能。",
+        "condition": {
+          "napcat_mode": "url-scaled"
+        }
+      },
+      "napcat_target_kb": {
+        "description": "【选填】压缩目标体积（KB）",
         "type": "int",
         "default": 0,
-        "condition": {
-          "advanced_settings": true
-        },
-        "hint": "仅本地压缩与回退路径生效。设为非 0 时启用质量阶梯：先按 quality 编码，仍超上限就逐档降 10 质量（最低 45）重编，最多 3 次，用 CPU 换体积。例：填 300 可让每张图尽量不超过 300KB。0 表示只按 quality 编码一次。"
+        "hint": "0=只按质量编码一次；非 0 时逐档降质重编（最低 45，最多 3 次）。",
+        "collapsed": true
       },
-      "webp": {
-        "description": "【选填】本地压缩改用 WebP 输出",
+      "napcat_webp": {
+        "description": "【选填】压缩输出用 WebP",
         "type": "bool",
         "default": false,
-        "condition": {
-          "advanced_settings": true
-        },
-        "hint": "仅本地压缩与回退路径生效。WebP 在平滑内容上通常比同质量 JPEG 小 25%~60%，但编码耗时高一个量级（实测 1920 长边约 0.2~0.5 秒/张），且内容噪声极多时反而可能更大（此时会自动回退原字节），CPU 较弱的机器不建议开启；动图仍原样发送。"
+        "hint": "体积更小、编码更慢；反而变大时自动回退原字节。",
+        "collapsed": true
       },
-      "onebot_image_timeout": {
-        "description": "【选填】OneBot 图片段的下载超时（秒）",
+      "napcat_timeout": {
+        "description": "【选填】OneBot 图片段超时（秒）",
         "type": "int",
         "default": 60,
-        "condition": {
-          "advanced_settings": true
-        },
-        "hint": "写入每个 image 段的 timeout 字段，即协议端（NapCat 等）下载网络图片的超时窗口。若日志报 sendMsg 超时（retcode 1200，结果未知因而不重发），说明协议端等待客户端回调的窗口被耗尽，多图或大图时更易触发。可适当调大本值，减少大图下载慢导致的回执超时；base64 段不经下载，带该字段无副作用。建议范围 10~300。"
-      }
-    }
-  },
-  "qq_upload": {
-    "description": "图片推送 · 通道层：QQ 官方机器人",
-    "type": "object",
-    "hint": "只对 QQ 官方机器人（qq_official）生效，与「随机图发送缩略图」互不影响：本组决定「用什么通道把图上传给 QQ」，缩略图开关决定「发哪一份图」。通道名与「图片推送：通道与压缩参数（NapCat / OneBot）」组完全一致——auto / native / bytes / url / url-scaled，同名同义，落地实现不同。QQ 官方接口对图片有三种上传方式：① 二进制直传，上限 5MB（AstrBot 默认走这条，超过即报「上传文件大小超过限制」）；② URL 上传，把图床直链交给腾讯服务器下载转存，图片软限 20MB，要求直链公网可达；③ 分片上传，上限 200MB，保原图，但要多几次往返。本平台映射：native=交回 AstrBot 二进制直传（加上本组下方的体积阈值会让小图仍走这条）；url / url-scaled=URL 上传（原图 / 缩放版）；bytes=分片上传。任一通道失败都按「失败处理」一档兜底。",
-    "items": {
-      "mode": {
-        "description": "【选填】推送通道（QQ 官方机器人）",
+        "hint": "协议端下载网络图片的窗口，10~300。日志报 sendMsg 超时时调大。",
+        "collapsed": true
+      },
+      "qq_mode": {
+        "description": "【选填】通道（QQ 官方机器人）",
         "type": "string",
-        "options": ["auto", "native", "bytes", "url", "url-scaled"],
+        "options": [
+          "auto",
+          "native",
+          "bytes",
+          "url",
+          "url-scaled"
+        ],
         "default": "auto",
         "obvious_hint": true,
-        "hint": "与 OneBot 组同一套通道名。auto=自动（推荐；小图走 native、中大图走 url、超大或直链不可达走 bytes）；native=关闭本组，交回「图片推送：通道与压缩参数（NapCat / OneBot）」组的原逻辑（超过 5MB 的图仍会报错，仅用于排查对照）；bytes=始终分片上传（不依赖公网可达、保原图，大图会多花几秒）；url=始终 URL 上传（要求图床公网直链可达，超过 20MB 会被平台降级成文件卡片）；url-scaled=始终上传图床缩放版直链（更省腾讯侧流量，可能收到缩放图）。固定通道不会因体积改道，失败与否取决于下方「失败处理」。旧版本的 direct / chunked 仍可读，分别自动映射为 native / bytes。"
+        "hint": "本平台用哪条通道上传。auto=小图 native、中大图 url、其余 bytes；native=关闭本功能，交回原生回传。"
       },
-      "direct_max_mb": {
-        "description": "【选填】直传体积上限（MB）",
+      "qq_native_max_mb": {
+        "description": "【选填】native 体积上限（MB）",
         "type": "int",
         "default": 3,
-        "hint": "auto 模式下不超过该体积的图仍走 AstrBot 原生直传（最快，还能叠加本地压缩）。二进制直传上限是 5MB，而 base64 会膨胀约 4/3，故原图最多约 3.75MB；默认 3 留余量。填 0 表示从不直传（auto 下大图一律走 url 或 bytes）。"
+        "hint": "auto 下不超过该体积走 native。二进制直传硬限 5MB、base64 膨胀 4/3，故默认 3；0=从不走 native。"
       },
-      "auto_prefer": {
-        "description": "【选填】auto 模式在 native 之外的偏好",
+      "qq_auto_prefer": {
+        "description": "【选填】auto 在 native 之外的偏好",
         "type": "string",
-        "options": ["url", "bytes"],
+        "options": [
+          "url",
+          "bytes"
+        ],
         "default": "url",
-        "hint": "url=优先 URL 上传（默认）：只发一条直链让腾讯侧下载转存，不占本机上行、不用落盘，内网直链会先按「图床站点地址」换回公网源；bytes=优先分片：不依赖图床公网可达，失败率最低但需先下到本地。选 url 后若腾讯侧拉不到（域名停用/防盗链/防火墙），失败一次即进入 600 秒冷却，期间 auto 自动改走 bytes，不会反复白撞。仅 auto 通道生效；旧写法 chunked 会映射为 bytes。"
+        "hint": "url=只发直链让腾讯下载转存；bytes=先下到本地再分片。url 失败后自动冷却 600 秒改 bytes。"
       },
-      "url_max_mb": {
-        "description": "【选填】URL 上传体积上限（MB）",
+      "qq_url_max_mb": {
+        "description": "【选填】直链通道体积上限（MB）",
         "type": "int",
         "default": 20,
-        "hint": "QQ 图片 URL 上传的软限制。auto 模式下体积超过该值会跳过 URL 通道直接分片；填写 0 表示不限制（注意超过平台软限的图会被降级成「文件卡片」，接收方看到的不是图片）。仅与 URL 通道有关。"
+        "hint": "超过该体积会被平台降级为文件；0=不限制。"
       },
-      "max_upload_mb": {
-        "description": "【选填】分片上传的下载体积上限（MB）",
+      "qq_max_upload_mb": {
+        "description": "【选填】分片通道下载上限（MB）",
         "type": "int",
         "default": 100,
-        "hint": "分片通道需要先把原图下到 AstrBot 本地再分片上传，这个上限独立于全局「单张图片大小上限」（max_download_mb，默认 20MB，装不下需要分片的大图）。超过本值会直接失败并按下方的「失败处理」兜底。分片上传本身硬限 200MB。"
+        "hint": "bytes 通道先把原图下到本地，此限独立于「限制与缓存」里的单图上限。"
       },
-      "on_failure": {
+      "qq_on_failure": {
         "description": "【选填】通道失败后的处理",
         "type": "string",
         "options": [
@@ -243,173 +198,26 @@
           "notify"
         ],
         "default": "fallback",
-        "hint": "fallback=交回原有回传逻辑（本地压缩 / 缩略图替身等降级链，仍可能失败但尽量把图发出去）；notify=不再尝试其他通道，直接回一条文字说明失败原因。注意：本批只要已经成功发出过一张图，无论选哪档都不会再交回，以免同一张图发两遍。"
-      }
-    }
-  },
-  "similarity_threshold": {
-    "description": "【选填】相似度阈值（0~1，哈希引擎）",
-    "type": "float",
-    "default": 0.85,
-    "obvious_hint": true,
-    "hint": "哈希引擎下查询图与图库图片的感知哈希相似度达到该值才判定命中（相似度 = 1 - 汉明距离/总位数）。设置过高容易漏图，过低容易误报，推荐 0.85。"
-  },
-  "storage_bucket": {
-    "description": "储存桶设置（Cloudflare R2 / 甲骨文 OCI，可选）",
-    "type": "object",
-    "hint": "把登记原图（/登记原图）存到对象存储。储存桶配置完整时优先于下方图床设置；mode 为 none 或配置不完整时使用图床设置。上传失败时自动回退本地副本。选择对应模式后，下方才会展开该模式的配置字段。",
-    "items": {
-      "mode": {
-        "description": "【选填】储存桶模式",
-        "type": "string",
-        "options": ["none", "cloudflare_r2", "oracle_oci"],
-        "default": "none",
-        "obvious_hint": true,
-        "hint": "none=不使用储存桶（登记原图走下方图床设置）；cloudflare_r2=Cloudflare R2 对象存储（官方 S3 兼容 API）；oracle_oci=甲骨文 OCI Object Storage（官方 S3 兼容 API）。选定后需把展开的全部【必填】项填齐，配置不完整时自动改用图床设置。"
-      },
-      "r2_account_id": {
-        "description": "【R2 必填】R2 账户 ID（Account ID）",
-        "type": "string",
-        "default": "",
-        "condition": {
-          "mode": "cloudflare_r2"
-        },
-        "hint": "Cloudflare 控制台 → R2 → 概览页右侧的「账户 ID」。"
-      },
-      "r2_access_key_id": {
-        "description": "【R2 必填】R2 Access Key ID",
-        "type": "string",
-        "default": "",
-        "condition": {
-          "mode": "cloudflare_r2"
-        },
-        "hint": "在 R2「管理 R2 API 令牌」页创建 API 令牌（权限需含对象读写）后获得的 Access Key ID。"
-      },
-      "r2_secret_access_key": {
-        "description": "【R2 必填】R2 Secret Access Key",
-        "type": "string",
-        "secret": true,
-        "default": "",
-        "condition": {
-          "mode": "cloudflare_r2"
-        },
-        "hint": "创建 API 令牌时与 Access Key ID 一同生成，仅显示一次。"
-      },
-      "r2_bucket": {
-        "description": "【R2 必填】R2 存储桶名称",
-        "type": "string",
-        "default": "",
-        "condition": {
-          "mode": "cloudflare_r2"
-        },
-        "hint": "要使用的 R2 存储桶名。"
-      },
-      "r2_endpoint": {
-        "description": "【R2 选填】R2 S3 endpoint",
-        "type": "string",
-        "default": "",
-        "condition": {
-          "mode": "cloudflare_r2"
-        },
-        "hint": "留空使用官方默认 https://<账户ID>.r2.cloudflarestorage.com；欧盟等司法区的存储桶按官方文档填 https://<账户ID>.eu.r2.cloudflarestorage.com。"
-      },
-      "r2_public_base_url": {
-        "description": "【R2 必填】R2 公开访问域名",
-        "type": "string",
-        "default": "",
-        "obvious_hint": true,
-        "condition": {
-          "mode": "cloudflare_r2"
-        },
-        "hint": "在 R2 存储桶「设置 → 公开访问」中开启 r2.dev 子域（如 https://pub-xxxx.r2.dev）或绑定自定义域名。溯源回图需要长期有效的直链，未配置时该储存桶视为配置不完整。"
-      },
-      "oci_namespace": {
-        "description": "【OCI 必填】OCI 对象存储命名空间",
-        "type": "string",
-        "default": "",
-        "condition": {
-          "mode": "oracle_oci"
-        },
-        "hint": "OCI 控制台「对象存储 → 存储桶」页面可见的 Object Storage Namespace 字符串。"
-      },
-      "oci_region": {
-        "description": "【OCI 必填】OCI 区域标识",
-        "type": "string",
-        "default": "",
-        "condition": {
-          "mode": "oracle_oci"
-        },
-        "hint": "如 ap-osaka-1、us-ashburn-1。"
-      },
-      "oci_access_key_id": {
-        "description": "【OCI 必填】OCI Access Key",
-        "type": "string",
-        "default": "",
-        "condition": {
-          "mode": "oracle_oci"
-        },
-        "hint": "OCI 控制台「用户设置 → Customer Secret Keys（客户密钥）」中生成的 Access Key（S3 兼容 API 凭据）。"
-      },
-      "oci_secret_access_key": {
-        "description": "【OCI 必填】OCI Secret Key",
-        "type": "string",
-        "secret": true,
-        "default": "",
-        "condition": {
-          "mode": "oracle_oci"
-        },
-        "hint": "生成 Customer Secret Key 时显示的 Secret Key，仅显示一次。"
-      },
-      "oci_bucket": {
-        "description": "【OCI 必填】OCI 存储桶名称",
-        "type": "string",
-        "default": "",
-        "condition": {
-          "mode": "oracle_oci"
-        },
-        "hint": "要使用的 OCI 存储桶名。"
-      },
-      "oci_endpoint": {
-        "description": "【OCI 选填】OCI S3 endpoint",
-        "type": "string",
-        "default": "",
-        "condition": {
-          "mode": "oracle_oci"
-        },
-        "hint": "留空使用官方标准格式 https://<命名空间>.compat.objectstorage.<区域>.oraclecloud.com，一般无需填写。"
-      },
-      "oci_public_bucket": {
-        "description": "【OCI 必填·二选一】存储桶已设为公共可读",
-        "type": "bool",
-        "default": false,
-        "condition": {
-          "mode": "oracle_oci"
-        },
-        "hint": "开启后直链使用官方对象 URL 格式 https://objectstorage.<区域>.oraclecloud.com/n/<命名空间>/b/<桶>/o/<对象名>；需先在 OCI 控制台将存储桶可见性设为 Public。开启或填写 oci_public_base_url 二选一，否则该储存桶视为配置不完整。"
-      },
-      "oci_public_base_url": {
-        "description": "【OCI 必填·二选一】自定义公开地址",
-        "type": "string",
-        "default": "",
-        "condition": {
-          "mode": "oracle_oci"
-        },
-        "hint": "优先于 oci_public_bucket 生效。可填自定义域名，或 OCI 控制台为存储桶创建的「带对象名前缀的预认证请求（PAR）」URL（以 /o/ 结尾），直链 = 该地址 + 对象名。"
+        "hint": "fallback=交回原生回传（压缩/缩略图）；notify=只回一条文字说明。本批已发出图片时不回交。"
       }
     }
   },
   "image_bed": {
-    "description": "图床设置（登记原图的保存方式）",
+    "description": "图床设置（登记原图）",
     "type": "object",
-    "hint": "登记原图（/登记原图）时图片的上传/保存方式；日常查询不依赖图床。上方储存桶配置完整时，本组设置会被跳过。选择对应模式后，下方才会展开该模式的配置字段。",
+    "hint": "登记原图时的上传方式；储存桶配置完整时本组被跳过。",
     "items": {
       "mode": {
         "description": "【选填】图床模式",
         "type": "string",
-        "options": ["local", "generic_http", "cloudflare_imgbed"],
+        "options": [
+          "local",
+          "generic_http",
+          "cloudflare_imgbed"
+        ],
         "default": "local",
         "obvious_hint": true,
-        "hint": "local=原图副本保存到机器人数据目录（零配置）；generic_http=通过通用 HTTP 接口上传到自建图床（Lsky Pro、EasyImages、Chevereto 等）；cloudflare_imgbed=CloudFlare-ImgBed 自建图床（官方 REST API，POST /upload 上传，/溯源删除 可同步删除远端文件）。远程模式上传失败时自动回退本地副本。需要 R2/OCI 对象存储请改用上方「储存桶设置」。"
+        "hint": "local=只存服务器本地；cloudflare_imgbed / generic_http 各自展开对应字段。"
       },
       "api_url": {
         "description": "【generic_http 必填】图床上传接口地址",
@@ -545,10 +353,158 @@
       }
     }
   },
-  "random_media": {
-    "description": "随机图设置（CloudFlare-ImgBed 随机图接口）",
+  "storage_bucket": {
+    "description": "储存桶（可选，优先于图床）",
     "type": "object",
-    "hint": "通过图床随机图接口（GET /random）取图；/随机图、/随机视频、/原图 与 LLM 工具 sendRandomMedia 均依赖本组配置。前置条件：须先在 ImgBed 站点后台开启「随机图」功能，否则取图会失败（插件会给出对应提示）。图床默认须公网可达（插件出网经 SSRF 校验，不接受内网地址）；图床与 AstrBot 同机/同内网部署时可改用「内网直连地址」走内网。回传方式复用上方「图片回传设置」组，本组不重复配置。",
+    "hint": "登记原图时优先使用；mode=none 或字段不全时回退图床；上传失败自动回退本地副本。",
+    "items": {
+      "mode": {
+        "description": "【选填】储存桶模式",
+        "type": "string",
+        "options": [
+          "none",
+          "cloudflare_r2",
+          "oracle_oci"
+        ],
+        "default": "none",
+        "obvious_hint": true,
+        "hint": "none=不使用储存桶（登记原图走下方图床设置）；cloudflare_r2=Cloudflare R2 对象存储（官方 S3 兼容 API）；oracle_oci=甲骨文 OCI Object Storage（官方 S3 兼容 API）。选定后需把展开的全部【必填】项填齐，配置不完整时自动改用图床设置。"
+      },
+      "r2_account_id": {
+        "description": "【R2 必填】R2 账户 ID（Account ID）",
+        "type": "string",
+        "default": "",
+        "condition": {
+          "mode": "cloudflare_r2"
+        },
+        "hint": "Cloudflare 控制台 → R2 → 概览页右侧的「账户 ID」。"
+      },
+      "r2_access_key_id": {
+        "description": "【R2 必填】R2 Access Key ID",
+        "type": "string",
+        "default": "",
+        "condition": {
+          "mode": "cloudflare_r2"
+        },
+        "hint": "在 R2「管理 R2 API 令牌」页创建 API 令牌（权限需含对象读写）后获得的 Access Key ID。"
+      },
+      "r2_secret_access_key": {
+        "description": "【R2 必填】R2 Secret Access Key",
+        "type": "string",
+        "secret": true,
+        "default": "",
+        "condition": {
+          "mode": "cloudflare_r2"
+        },
+        "hint": "创建 API 令牌时与 Access Key ID 一同生成，仅显示一次。"
+      },
+      "r2_bucket": {
+        "description": "【R2 必填】R2 存储桶名称",
+        "type": "string",
+        "default": "",
+        "condition": {
+          "mode": "cloudflare_r2"
+        },
+        "hint": "要使用的 R2 存储桶名。"
+      },
+      "r2_endpoint": {
+        "description": "【R2 选填】R2 S3 endpoint",
+        "type": "string",
+        "default": "",
+        "condition": {
+          "mode": "cloudflare_r2"
+        },
+        "hint": "留空使用官方默认 https://<账户ID>.r2.cloudflarestorage.com；欧盟等司法区的存储桶按官方文档填 https://<账户ID>.eu.r2.cloudflarestorage.com。"
+      },
+      "r2_public_base_url": {
+        "description": "【R2 必填】R2 公开访问域名",
+        "type": "string",
+        "default": "",
+        "obvious_hint": true,
+        "condition": {
+          "mode": "cloudflare_r2"
+        },
+        "hint": "在 R2 存储桶「设置 → 公开访问」中开启 r2.dev 子域（如 https://pub-xxxx.r2.dev）或绑定自定义域名。溯源回图需要长期有效的直链，未配置时该储存桶视为配置不完整。"
+      },
+      "oci_namespace": {
+        "description": "【OCI 必填】OCI 对象存储命名空间",
+        "type": "string",
+        "default": "",
+        "condition": {
+          "mode": "oracle_oci"
+        },
+        "hint": "OCI 控制台「对象存储 → 存储桶」页面可见的 Object Storage Namespace 字符串。"
+      },
+      "oci_region": {
+        "description": "【OCI 必填】OCI 区域标识",
+        "type": "string",
+        "default": "",
+        "condition": {
+          "mode": "oracle_oci"
+        },
+        "hint": "如 ap-osaka-1、us-ashburn-1。"
+      },
+      "oci_access_key_id": {
+        "description": "【OCI 必填】OCI Access Key",
+        "type": "string",
+        "default": "",
+        "condition": {
+          "mode": "oracle_oci"
+        },
+        "hint": "OCI 控制台「用户设置 → Customer Secret Keys（客户密钥）」中生成的 Access Key（S3 兼容 API 凭据）。"
+      },
+      "oci_secret_access_key": {
+        "description": "【OCI 必填】OCI Secret Key",
+        "type": "string",
+        "secret": true,
+        "default": "",
+        "condition": {
+          "mode": "oracle_oci"
+        },
+        "hint": "生成 Customer Secret Key 时显示的 Secret Key，仅显示一次。"
+      },
+      "oci_bucket": {
+        "description": "【OCI 必填】OCI 存储桶名称",
+        "type": "string",
+        "default": "",
+        "condition": {
+          "mode": "oracle_oci"
+        },
+        "hint": "要使用的 OCI 存储桶名。"
+      },
+      "oci_endpoint": {
+        "description": "【OCI 选填】OCI S3 endpoint",
+        "type": "string",
+        "default": "",
+        "condition": {
+          "mode": "oracle_oci"
+        },
+        "hint": "留空使用官方标准格式 https://<命名空间>.compat.objectstorage.<区域>.oraclecloud.com，一般无需填写。"
+      },
+      "oci_public_bucket": {
+        "description": "【OCI 必填·二选一】存储桶已设为公共可读",
+        "type": "bool",
+        "default": false,
+        "condition": {
+          "mode": "oracle_oci"
+        },
+        "hint": "开启后直链使用官方对象 URL 格式 https://objectstorage.<区域>.oraclecloud.com/n/<命名空间>/b/<桶>/o/<对象名>；需先在 OCI 控制台将存储桶可见性设为 Public。开启或填写 oci_public_base_url 二选一，否则该储存桶视为配置不完整。"
+      },
+      "oci_public_base_url": {
+        "description": "【OCI 必填·二选一】自定义公开地址",
+        "type": "string",
+        "default": "",
+        "condition": {
+          "mode": "oracle_oci"
+        },
+        "hint": "优先于 oci_public_bucket 生效。可填自定义域名，或 OCI 控制台为存储桶创建的「带对象名前缀的预认证请求（PAR）」URL（以 /o/ 结尾），直链 = 该地址 + 对象名。"
+      }
+    }
+  },
+  "random_media": {
+    "description": "随机图",
+    "type": "object",
+    "hint": "通过图床 GET /random 接口取图；/随机图、/随机视频、/原图 与 LLM 工具均依赖本组。须先在 ImgBed 后台开启随机图。",
     "items": {
       "base_url": {
         "description": "【必填】图床站点地址",
@@ -561,7 +517,7 @@
         "description": "【选填】图床内网直连地址",
         "type": "string",
         "default": "",
-        "hint": "图床（或其反代）与 AstrBot 同机/同内网部署时可填内网地址（如 http://172.20.0.1:7658）。配置后随机图接口与后续取图直链都改走内网，绕开公网 DNS 与 CDN；该主机会加入插件 SSRF 白名单（仅允许它解析到内网地址，其他主机仍一律拒绝）。留空则始终使用上方图床站点地址。"
+        "hint": "图床与 AstrBot 同内网时的直连地址（如 http://172.20.0.1:7658），取图不走公网；该主机加入 SSRF 白名单。留空则用上方地址。"
       },
       "api_endpoint": {
         "description": "【选填】随机图接口路径",
@@ -606,92 +562,323 @@
         "default": true,
         "hint": "是否允许 LLM 通过 sendRandomMedia 工具请求随机图；关闭后仅可用 /随机图、/随机视频 命令，工具调用会提示已禁用。"
       },
-    "send_thumbnail": {
-      "description": "【选填】随机图发送缩略图（图片推送 · 形态层）",
-      "type": "bool",
-      "default": true,
-      "hint": "开启后 /随机图 先按图床取原图、再把它换成同一点的缩略图直链发出（文件小、协议端下载快、sendMsg 回执超时概率低），会话历史仍记录原图，故 /原图 仍返回全尺寸。缩略图由 img-indexer 预生成并写在 Qdrant 同一张图的 thumb_url 上；查不到替身时自动按原图发送。关闭则始终发原图。本项只管「发哪一份图」，与「QQ 官方机器人上传通道」（怎么送出去）互不影响。"
+      "send_thumbnail": {
+        "description": "【选填】随机图发送缩略图",
+        "type": "bool",
+        "default": true,
+        "hint": "发同一点的 720px 缩略图替身；会话历史仍记原图，/原图 不受影响。查不到替身时自动发原图。"
       }
     }
   },
+  "vector_search": {
+    "description": "向量检索",
+    "type": "object",
+    "hint": "Qdrant 里只存向量不存图，因此 /溯源 必须调用与图床入库侧相同的多模态向量 AI 生成查询向量。embed_base_url / embed_model 为必填。",
+    "items": {
+      "qdrant_url": {
+        "description": "【必填】Qdrant 服务地址",
+        "type": "string",
+        "default": "",
+        "obvious_hint": true,
+        "hint": "Qdrant REST 地址，如 http://<你的服务器IP>:6333。必须是公网可达的 http/https 地址（插件出网经 SSRF 校验，不接受内网地址）。"
+      },
+      "qdrant_api_key": {
+        "description": "【选填】Qdrant API Key",
+        "type": "string",
+        "secret": true,
+        "default": "",
+        "hint": "Qdrant 启动时通过 QDRANT__SERVICE__API_KEY 设置的密钥，留空则不带鉴权头。"
+      },
+      "collection_name": {
+        "description": "【选填】Qdrant 集合名",
+        "type": "string",
+        "default": "imgbed_images",
+        "hint": "向量点所在的集合，需与图床入库侧一致。"
+      },
+      "embed_base_url": {
+        "description": "【必填】多模态向量 AI 地址",
+        "type": "string",
+        "default": "",
+        "obvious_hint": true,
+        "hint": "OpenAI 兼容 embedding 服务的 base，如 https://<你的网关域名>/v1（不带尾斜杠），实际请求 POST {base}/embeddings。与图床入库侧填同一个地址。"
+      },
+      "embed_api_key": {
+        "description": "【选填】向量 AI API Key",
+        "type": "string",
+        "secret": true,
+        "default": "",
+        "hint": "embedding 请求的 Authorization: Bearer 密钥；网关未开启鉴权时可留空（留空则不带鉴权头）。"
+      },
+      "embed_model": {
+        "description": "【必填】多模态图片向量模型",
+        "type": "string",
+        "default": "",
+        "obvious_hint": true,
+        "hint": "接受图片输入的多模态 embedding 模型 ID（文本 embedding 模型无法对图片向量化），例如 Qwen/Qwen3-VL-Embedding-8B。必须与图床入库侧一致。"
+      },
+      "similarity_threshold": {
+        "description": "【选填】向量相似度阈值（0~1）",
+        "type": "float",
+        "default": 0.8,
+        "obvious_hint": true,
+        "hint": "Qdrant cosine 相似度达到该值判定命中（同一张图的压缩/裁剪变体通常 0.85+，不同图通常更低）。建议先用少量成对图片实测校准。"
+      },
+      "duplicate_vector_threshold": {
+        "description": "【选填】重复图片向量阈值（0~1）",
+        "type": "float",
+        "default": 0.995,
+        "hint": "向量命中候选之间的 cosine 相似度达到该值时视为同一张图，只回传相似度最高的一张并显示合并数量。Qdrant 未返回向量时仅按相同 src/image_url 去重。"
+      },
+      "vector_index_on_register": {
+        "description": "【选填】登记原图时同步写入向量库",
+        "type": "bool",
+        "default": true,
+        "hint": "/登记原图 上传成功后，把新图向量写入 Qdrant（cloudflare_imgbed 模式由图床侧钩子自动入库，插件不会重复写）。"
+      },
+      "embed_image_input": {
+        "description": "【选填】图片输入序列化格式",
+        "type": "string",
+        "options": [
+          "nemotron-vl",
+          "qwen-vl",
+          "dataurl",
+          "jina-image"
+        ],
+        "default": "nemotron-vl",
+        "hint": "向量模型接口的图片入参风格，需与图床入库侧一致；不一致则检索不到。不确定时保持默认，用 /向量自检 验证。",
+        "collapsed": true
+      },
+      "embed_input_type": {
+        "description": "【选填】NVIDIA 非对称模型 input_type",
+        "type": "string",
+        "options": [
+          "passage",
+          "query"
+        ],
+        "default": "passage",
+        "hint": "仅 nemotron-vl 模式相关：llama-nemotron-embed-vl 是非对称模型，图片只能走 passage 侧（query 侧拒绝图片）。本插件对图片固定使用 passage，此值仅供与图床入库侧核对一致性。",
+        "collapsed": true,
+        "condition": {
+          "embed_image_input": "nemotron-vl"
+        }
+      },
+      "top_k": {
+        "description": "【选填】向量检索返回候选数",
+        "type": "int",
+        "default": 5,
+        "hint": "每次从 Qdrant 取回的最相似点数：达到相似度阈值的命中会全部回传（按相似度降序），因此该值同时也是单次回传图片数量的上限；未命中时其中前 top_n 条作为候选列出。",
+        "collapsed": true
+      },
+      "request_timeout": {
+        "description": "【选填】请求超时（秒）",
+        "type": "int",
+        "default": 30,
+        "hint": "embedding 与 Qdrant 请求的超时时间。大模型 embedding 较慢时可调大。",
+        "collapsed": true
+      }
+    }
+  },
+  "limits": {
+    "description": "限制与缓存",
+    "type": "object",
+    "hint": "下载上限与图床哈希索引缓存。一般无需修改。",
+    "items": {
+      "max_download_mb": {
+        "description": "【选填】单张图片下载上限（MB）",
+        "type": "int",
+        "default": 20,
+        "hint": "超过即放弃下载。不作用于 QQ 官方分片通道（见其独立上限）。",
+        "collapsed": true
+      },
+      "remote_hash_enabled": {
+        "description": "【选填】图床哈希索引",
+        "type": "bool",
+        "default": true,
+        "hint": "启动时从图床拉取预置 pHash，使哈希引擎也能反查图床图片；需已配置向量引擎。"
+      },
+      "remote_hash_ttl": {
+        "description": "【选填】哈希缓存有效期（秒）",
+        "type": "int",
+        "default": 21600,
+        "hint": "超期后下次启动重建。",
+        "collapsed": true
+      },
+      "remote_hash_max_points": {
+        "description": "【选填】哈希拉取上限",
+        "type": "int",
+        "default": 0,
+        "hint": "0=不限；调试时设小值（如 50）先验证链路。",
+        "collapsed": true
+      }
+    }
+  },
+  "search_engine": {
+    "description": "（旧布局迁移用，请勿修改）【选填】检索引擎",
+    "type": "string",
+    "options": [
+      "auto",
+      "vector",
+      "hash"
+    ],
+    "default": "auto",
+    "obvious_hint": true,
+    "hint": "仅用于把旧版配置搬到 basic / limits，迁移后不再生效。",
+    "condition": {
+      "advanced_settings": "__legacy__"
+    },
+    "invisible": true
+  },
+  "scan_dirs": {
+    "description": "（旧布局迁移用，请勿修改）【按需必填】本地图库目录（原图片库 / 图床存储目录）",
+    "type": "list",
+    "default": [],
+    "obvious_hint": true,
+    "hint": "仅用于把旧版配置搬到 basic / limits，迁移后不再生效。",
+    "condition": {
+      "advanced_settings": "__legacy__"
+    },
+    "invisible": true
+  },
+  "similarity_threshold": {
+    "description": "（旧布局迁移用，请勿修改）【选填】相似度阈值（0~1，哈希引擎）",
+    "type": "float",
+    "default": 0.85,
+    "obvious_hint": true,
+    "hint": "仅用于把旧版配置搬到 basic / limits，迁移后不再生效。",
+    "condition": {
+      "advanced_settings": "__legacy__"
+    },
+    "invisible": true
+  },
+  "hash_size": {
+    "description": "（旧布局迁移用，请勿修改）【选填】感知哈希精度",
+    "type": "int",
+    "options": [
+      4,
+      8,
+      12,
+      16,
+      20,
+      24,
+      28,
+      32
+    ],
+    "default": 16,
+    "condition": {
+      "advanced_settings": "__legacy__"
+    },
+    "hint": "仅用于把旧版配置搬到 basic / limits，迁移后不再生效。",
+    "invisible": true
+  },
+  "top_n": {
+    "description": "（旧布局迁移用，请勿修改）【选填】未命中时提示的最接近候选数",
+    "type": "int",
+    "default": 3,
+    "condition": {
+      "advanced_settings": "__legacy__"
+    },
+    "hint": "仅用于把旧版配置搬到 basic / limits，迁移后不再生效。",
+    "invisible": true
+  },
+  "max_images_per_query": {
+    "description": "（旧布局迁移用，请勿修改）【选填】单次溯源最大处理图片数",
+    "type": "int",
+    "default": 3,
+    "condition": {
+      "advanced_settings": "__legacy__"
+    },
+    "hint": "仅用于把旧版配置搬到 basic / limits，迁移后不再生效。",
+    "invisible": true
+  },
   "ai_verify": {
-    "description": "【选填】AI 视觉复核",
+    "description": "（旧布局迁移用，请勿修改）【选填】AI 视觉复核",
     "type": "bool",
     "default": false,
     "obvious_hint": true,
-    "hint": "开启后，哈希命中的候选图会交给当前会话使用的视觉大模型二次确认“是否为同一张图”，回答不是则跳过该候选。需要已配置支持图片输入的 LLM 提供商，未配置时自动跳过复核，不影响正常使用。"
+    "hint": "仅用于把旧版配置搬到 basic / limits，迁移后不再生效。",
+    "condition": {
+      "advanced_settings": "__legacy__"
+    },
+    "invisible": true
   },
   "register_admin_only": {
-    "description": "【选填】仅管理员可登记原图",
+    "description": "（旧布局迁移用，请勿修改）【选填】仅管理员可登记原图",
     "type": "bool",
     "default": true,
-    "hint": "开启后 /登记原图 仅限 AstrBot 管理员（含群管理员）使用；关闭后所有用户可登记。"
-  },
-  "advanced_settings": {
-    "description": "显示进阶设置（面板收纳开关）",
-    "type": "bool",
-    "default": false,
-    "hint": "开启后才会显示下方进阶配置项（感知哈希精度、未命中候选数、单次图片数与大小上限）；不影响任何功能，一般保持关闭即可。"
-  },
-  "hash_size": {
-    "description": "【选填】感知哈希精度",
-    "type": "int",
-    "options": [4, 8, 12, 16, 20, 24, 28, 32],
-    "default": 16,
+    "hint": "仅用于把旧版配置搬到 basic / limits，迁移后不再生效。",
     "condition": {
-      "advanced_settings": true
+      "advanced_settings": "__legacy__"
     },
-    "hint": "pHash 精度：16 对应 256bit（区分度高，推荐），8 对应 64bit（速度更快）。取值必须为 4~32 之间 4 的倍数（其它取值会导致新旧数据无法比对、索引失效）。修改后请执行 /溯源重扫 force 重建图库。"
-  },
-  "top_n": {
-    "description": "【选填】未命中时提示的最接近候选数",
-    "type": "int",
-    "default": 3,
-    "condition": {
-      "advanced_settings": true
-    },
-    "hint": "没有图片达到相似度阈值时，回复图库中最接近的前 N 条（含相似度）。0 表示不提示。"
-  },
-  "max_images_per_query": {
-    "description": "【选填】单次溯源最大处理图片数",
-    "type": "int",
-    "default": 3,
-    "condition": {
-      "advanced_settings": true
-    },
-    "hint": "一条消息中最多处理的图片数量，防止消息包含多图时刷屏。"
+    "invisible": true
   },
   "max_download_mb": {
-    "description": "【选填】单张图片大小上限（MB）",
+    "description": "（旧布局迁移用，请勿修改）【选填】单张图片大小上限（MB）",
     "type": "int",
     "default": 20,
     "condition": {
-      "advanced_settings": true
+      "advanced_settings": "__legacy__"
     },
-    "hint": "超过该大小的图片拒绝处理，防止异常大图拖垮机器人。"
+    "hint": "仅用于把旧版配置搬到 basic / limits，迁移后不再生效。",
+    "invisible": true
   },
   "remote_hash_enabled": {
-    "description": "【选填】图床哈希索引",
+    "description": "（旧布局迁移用，请勿修改）【选填】图床哈希索引",
     "type": "bool",
     "default": true,
-    "hint": "开启后，插件会把图床侧（img-indexer）入库时算好的感知哈希整体拉到本地，使哈希检索也能反查图床里的图片（不依赖向量检索、无需联网推理）。需要图床已部署 img-indexer 并配置了 vector_search。关闭后哈希检索只覆盖本地 scan_dirs 扫描到的图。"
+    "hint": "仅用于把旧版配置搬到 basic / limits，迁移后不再生效。",
+    "condition": {
+      "advanced_settings": "__legacy__"
+    },
+    "invisible": true
   },
   "remote_hash_ttl": {
-    "description": "【选填】图床哈希缓存有效期（秒）",
+    "description": "（旧布局迁移用，请勿修改）【选填】图床哈希缓存有效期（秒）",
     "type": "int",
     "default": 21600,
     "condition": {
-      "advanced_settings": true
+      "advanced_settings": "__legacy__"
     },
-    "hint": "缓存超过该时长后，插件启动时会自动重新拉取全量哈希。默认 21600（6 小时）。调小可更快感知图床新增图片，但会增加启动时的拉取流量。"
+    "hint": "仅用于把旧版配置搬到 basic / limits，迁移后不再生效。",
+    "invisible": true
   },
   "remote_hash_max_points": {
-    "description": "【选填】图床哈希拉取上限",
+    "description": "（旧布局迁移用，请勿修改）【选填】图床哈希拉取上限",
     "type": "int",
     "default": 0,
     "condition": {
-      "advanced_settings": true
+      "advanced_settings": "__legacy__"
     },
-    "hint": "0 表示不限制（拉取全部）。调试时设为小数值（如 50）可只拉少量记录，用于先验证链路是否通畅、容器内 HEIC 能否正常解码，再放开全量。"
+    "hint": "仅用于把旧版配置搬到 basic / limits，迁移后不再生效。",
+    "invisible": true
+  },
+  "image_delivery": {
+    "description": "（旧布局迁移用，请勿修改）图片回传设置",
+    "type": "dict",
+    "default": {},
+    "condition": {
+      "advanced_settings": "__legacy__"
+    },
+    "hint": "仅用于把旧版配置搬到 delivery 组，迁移后不再生效。",
+    "invisible": true
+  },
+  "qq_upload": {
+    "description": "（旧布局迁移用，请勿修改）QQ 官方上传通道",
+    "type": "dict",
+    "default": {},
+    "condition": {
+      "advanced_settings": "__legacy__"
+    },
+    "hint": "仅用于把旧版配置搬到 delivery 组，迁移后不再生效。",
+    "invisible": true
+  },
+  "config_layout": {
+    "description": "（内部）配置布局版本",
+    "type": "string",
+    "default": "",
+    "condition": {
+      "advanced_settings": "__legacy__"
+    },
+    "hint": "记录配置已迁移到哪一版布局，避免重复迁移。",
+    "invisible": true
   }
 }

@@ -244,7 +244,7 @@ def qq_upload_settings(config: Any) -> tuple[str, int, int, str, int, str]:
           max_upload_bytes, on_failure)。
 
     各项默认值的依据：
-    - mode 与 image_delivery.mode 共用统一词表（auto/native/bytes/url/
+    - mode 与 delivery.napcat_mode 共用统一词表（auto/native/bytes/url/
       url-scaled），旧写法 direct/chunked 自动映射为 native/bytes。
     - direct_max_mb＝3：QQ 二进制直传硬限 5MB，base64 膨胀 4/3 后原图最多约
       3.75MB，取 3 留余量；填 0 表示从不直传（大图一律 url/bytes）。
@@ -465,7 +465,7 @@ def send_diagnosis(exc: BaseException) -> str:
                 "发送未确认：协议端 sendMsg 等待客户端回调超时（图片已上传但回执超时，"
                 "通常是图片较大或一次发送多张所致，非插件缺陷），已按「不重发」处理以免重复发图；"
                 f"{detail}。若频繁出现：升级 NapCat 至 4.7.8+ 并重启 QQ，"
-                "或调小 image_delivery.max_side / 开启 target_kb 降低单图体积"
+                "或调小 delivery.napcat_max_side / 开启压缩目标体积降低单图体积"
             )
         return (
             "发送未确认：请求已发出但等待响应超时，已按「不重发」处理以免重复发图；"
