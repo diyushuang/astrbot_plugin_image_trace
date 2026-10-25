@@ -86,6 +86,7 @@ try:
         prefer_inline_bytes,
         prefer_url_direct,
         prepare_image_bytes,
+        qq_upload_safe_image,
         send_diagnosis,
         sniff_image_format,
         upgrade_to_https,
@@ -105,7 +106,7 @@ try:
         strip_leading_decoration,
         swap_url_origin,
     )
-    from .url_guard import set_allowed_private_hosts
+    from .url_guard import read_limited_bytes, set_allowed_private_hosts
     from .vector_search import VectorEngine, VectorEngineError
 except ImportError:  # 兼容插件以独立模块方式加载
     from common import (  # type: ignore[no-redef]
@@ -158,6 +159,7 @@ except ImportError:  # 兼容插件以独立模块方式加载
         prefer_inline_bytes,
         prefer_url_direct,
         prepare_image_bytes,
+        qq_upload_safe_image,
         send_diagnosis,
         sniff_image_format,
         upgrade_to_https,
@@ -177,7 +179,10 @@ except ImportError:  # 兼容插件以独立模块方式加载
         strip_leading_decoration,
         swap_url_origin,
     )
-    from url_guard import set_allowed_private_hosts  # type: ignore[no-redef]
+    from url_guard import (  # type: ignore[no-redef]
+        read_limited_bytes,
+        set_allowed_private_hosts,
+    )
     from vector_search import VectorEngine, VectorEngineError  # type: ignore[no-redef]
 
 PLUGIN_NAME = "astrbot_plugin_image_trace"
@@ -911,14 +916,15 @@ class ImageTracePlugin(Star):
         return tuple(host for host in hosts if host)
 
     @staticmethod
-    def _video_url_fetched_offbox(event: AstrMessageEvent) -> bool:
-        """该平台发视频是否由第三方服务器按 URL 拉流（而非本机下载）。
+    def _media_url_fetched_offbox(event: AstrMessageEvent) -> bool:
+        """该平台发媒体是否由第三方服务器按 URL 拉流/转存（而非本机下载）。
 
-        QQ 官方机器人（qq_official / qqofficial_webhook）把视频 URL 原样交给
+        QQ 官方机器人（qq_official / qqofficial_webhook）：视频 URL 原样交给
         腾讯服务器下载，内网直连地址它访问不到，须回退公网直链（腾讯侧 DNS
-        不受本机解析影响）；aiocqhttp（NapCat，与 AstrBot 同机）等平台由
-        本机拉流，可安全走内网。图片不受此限：官方适配器发图是本机下载成
-        base64 再上传，内网可用。
+        不受本机解析影响）；图片虽是本机下载后 base64 上传，但字节会经腾讯
+        富媒体接口**转存**，格式必须满足其白名单（假 jpg 的 HEIF/AVIF 会被
+        打回「富媒体文件格式不支持」）。aiocqhttp（NapCat，与 AstrBot 同机）
+        等平台由本机拉流，无上述限制。
         """
         try:
             name = str(event.get_platform_name() or "").lower()
@@ -2893,7 +2899,7 @@ class ImageTracePlugin(Star):
         kind = media_kind(media_url, content_type)
         if kind == "video":
             send_url = media_url
-            if lan_hosts and self._video_url_fetched_offbox(event):
+            if lan_hosts and self._media_url_fetched_offbox(event):
                 # 官方机器人等平台把视频 URL 交给腾讯服务器拉流，内网地址它
                 # 访问不到，改写回公网直链（路径不变；且 /random 走内网时返回的
                 # 直链本身已是内网源，必须显式换源而不是“不替换”）
@@ -2949,6 +2955,24 @@ class ImageTracePlugin(Star):
             caption = self._random_caption(
                 original_url, "image", settings, display_name=original_name
             )
+            if self._media_url_fetched_offbox(event):
+                # 官方机器人富媒体上传只收标准 JPEG/PNG/GIF；图床里混有
+                # 扩展名 .jpg、实为 HEIF/AVIF 的文件（微博 live 图），原样
+                # 交付必被打回「富媒体文件格式不支持」。体检发现假格式时：
+                # 可转码 → 转码 JPEG 本地字节交付；不可转码 → 换发缩略图
+                # 替身直链。历史仍记原图直链，/原图 不受影响
+                outcome = await self._offbox_image_delivery(send_url, settings)
+                if outcome is not None:
+                    kind, value = outcome
+                    if kind == "path":
+                        self._remember_blocks(event, [{"url": original_url}])
+                        chain = self._mention_prefix(event)
+                        if caption:
+                            chain.append(Comp.Plain(caption))
+                        chain.append(Comp.Image.fromFileSystem(value))
+                        yield event.chain_result(chain)
+                        return
+                    send_url = value
             blocks = [
                 {
                     "url": send_url,
@@ -2981,6 +3005,83 @@ class ImageTracePlugin(Star):
         if index < 0:
             return ""
         return unquote(path[index + len(marker) :]).strip()
+
+    async def _offbox_image_delivery(
+        self, url: str, settings: dict
+    ) -> tuple[str, str] | None:
+        """qq_official 图片交付体检：返回 (方式, 值)；None 表示按原 URL 交付。
+
+        官方富媒体上传只收标准 JPEG/PNG/GIF；图床里存在扩展名 .jpg、实为
+        HEIF/AVIF/WEBP（微博 live 图等）的文件，原样交付必被打回「富媒体文件
+        格式不支持」。处置分两级：
+        - "path"：PIL 可解码的假格式 → 转码为 JPEG 落盘，本地字节交付；
+        - "url"：PIL 解不了的（如未装 pillow-heif 的 HEIC）→ 换发同一点的
+          缩略图替身直链（img-indexer 预生成的真 JPEG）。
+        文件头能放行、或两级兜底都失败时返回 None（按原样交付——体检是增强，
+        不能反过来挡住发送）。
+        """
+        try:
+            client = await self._get_http()
+            limit = max(1, self._int_cfg("max_download_mb", 20)) * 1024 * 1024
+            timeout = aiohttp.ClientTimeout(total=max(5.0, float(DOWNLOAD_TIMEOUT)))
+            async with await client.request("GET", url, timeout=timeout) as resp:
+                if not 200 <= resp.status < 300:
+                    return None
+                head = await resp.content.read(16)
+                if qq_upload_safe_image(head):
+                    return None
+                # 嗅探已消费前 16 字节：转码必须用完整字节，把 head 拼回去，
+                # 否则 PIL 拿到的是缺了文件头的残缺流，解码必败
+                rest = await read_limited_bytes(resp, limit - len(head))
+                data = head + rest
+        except Exception as exc:
+            logger.warning(f"qq_official 图片格式体检失败，按原样交付: {exc}")
+            return None
+        path = await asyncio.to_thread(self._write_transcoded_jpeg, bytes(data))
+        if path:
+            return ("path", path)
+        file_id = self._bed_file_id(url)
+        if file_id and self.vector.qdrant_ready:
+            try:
+                thumb = await self.vector.thumb_url_for(file_id)
+            except Exception:
+                thumb = None
+            if thumb:
+                lan_hosts = self._lan_url_hosts(settings)
+                if lan_hosts:
+                    # 图片由适配器本机下载，替身直链同样收进内网源
+                    thumb = swap_url_origin(
+                        thumb, str(settings.get("lan_base_url") or ""), lan_hosts
+                    )
+                logger.info(f"qq_official 假格式且不可转码，改发缩略图替身: {file_id}")
+                return ("url", thumb)
+        return None
+
+    def _write_transcoded_jpeg(self, data: bytes) -> str | None:
+        """把任意可解码图片字节转存为 JPEG 临时文件，返回路径；失败返回 None。"""
+        try:
+            import pillow_heif
+
+            pillow_heif.register_heif_opener()  # 幂等：让 Image.open 直解 HEIC
+        except ImportError:
+            pass
+        try:
+            from PIL import Image, ImageOps
+        except ImportError:
+            logger.warning("PIL 不可用，无法转码非标准格式图片，按原样交付")
+            return None
+        try:
+            with Image.open(io.BytesIO(data)) as image:
+                fixed = ImageOps.exif_transpose(image)
+                if fixed.mode not in ("RGB", "L"):
+                    fixed = fixed.convert("RGB")
+                path = os.path.join(self.tmp_dir, f"qqsafe_{secrets.token_hex(8)}.jpg")
+                fixed.save(path, format="JPEG", quality=92)
+            logger.info(f"qq_official 图片格式体检：已转码为 JPEG 交付 {path}")
+            return path
+        except Exception as exc:
+            logger.warning(f"图片转码失败，按原样交付: {exc}")
+            return None
 
     async def _random_send_url(self, media_url: str, settings: dict) -> str:
         """把随机到的原图换成它的缩略图直链；取不到替身就原样返回原图。
