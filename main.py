@@ -18,9 +18,12 @@ import asyncio
 import base64
 import io
 import os
+import random
 import secrets
 import time
 from collections.abc import AsyncGenerator
+from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import unquote, urlparse, urlsplit
 
 import aiohttp
@@ -74,6 +77,7 @@ try:
         build_imgbed_file_url,
         build_original_url,
         build_scaled_url,
+        choose_qq_upload_channel,
         classify_probe_status,
         classify_send_error,
         compression_evidence,
@@ -81,12 +85,14 @@ try:
         deduplicate_vector_hits,
         delivery_settings,
         is_napcat_parseable_url,
+        is_public_http_url,
         is_scaling_capability_rejection,
         is_scaling_needed,
         prefer_inline_bytes,
         prefer_url_direct,
         prepare_image_bytes,
         qq_upload_safe_image,
+        qq_upload_settings,
         send_diagnosis,
         sniff_image_format,
         upgrade_to_https,
@@ -147,6 +153,7 @@ except ImportError:  # 兼容插件以独立模块方式加载
         build_imgbed_file_url,
         build_original_url,
         build_scaled_url,
+        choose_qq_upload_channel,
         classify_probe_status,
         classify_send_error,
         compression_evidence,
@@ -154,12 +161,14 @@ except ImportError:  # 兼容插件以独立模块方式加载
         deduplicate_vector_hits,
         delivery_settings,
         is_napcat_parseable_url,
+        is_public_http_url,
         is_scaling_capability_rejection,
         is_scaling_needed,
         prefer_inline_bytes,
         prefer_url_direct,
         prepare_image_bytes,
         qq_upload_safe_image,
+        qq_upload_settings,
         send_diagnosis,
         sniff_image_format,
         upgrade_to_https,
@@ -187,6 +196,8 @@ except ImportError:  # 兼容插件以独立模块方式加载
 
 PLUGIN_NAME = "astrbot_plugin_image_trace"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".jfif", ".heic", ".heif"}
+# QQ 开放平台富媒体 file_type：1=图片、2=视频、3=语音、4=文件
+QQ_IMAGE_FILE_TYPE = 1
 
 
 def _describe_bad_image(path: str) -> tuple[str, str | None]:
@@ -607,9 +618,19 @@ class ImageTracePlugin(Star):
             "文件可能已损坏或格式不受当前服务端支持，详情见机器人日志。"
         )
 
-    async def _download(self, url: str) -> str:
+    async def _download(self, url: str, *, size_limit: int | None = None) -> str:
+        """下载到临时文件，返回路径。
+
+        size_limit 供「分片上传」这类明确知道上限的调用方覆盖默认值：QQ 分片
+        通道允许 200MB，而 max_download_mb（默认 20MB）是给回传兜底用的，按它
+        截断会把本可以发出去的大图判成「超过大小上限」。缺省 None 时仍按配置。
+        """
         client = await self._get_http()
-        size_limit = max(1, self._int_cfg("max_download_mb", 20)) * 1024 * 1024
+        limit = (
+            size_limit
+            if size_limit is not None and size_limit > 0
+            else max(1, self._int_cfg("max_download_mb", 20)) * 1024 * 1024
+        )
         timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)
         # 临时文件名完全不受外部输入影响（固定扩展名），
         # 图片解码由 Pillow 按内容判断，与扩展名无关
@@ -625,13 +646,13 @@ class ImageTracePlugin(Star):
             ) as resp:
                 resp.raise_for_status()
                 declared = resp.headers.get("Content-Length", "")
-                if declared.isdigit() and int(declared) > size_limit:
+                if declared.isdigit() and int(declared) > limit:
                     raise ValueError("图片超过大小上限")
                 received = 0
                 with open(path, "wb") as f:
                     async for chunk in resp.content.iter_chunked(DOWNLOAD_CHUNK_SIZE):
                         received += len(chunk)
-                        if received > size_limit:
+                        if received > limit:
                             raise ValueError("图片超过大小上限")
                         f.write(chunk)
         except Exception:
@@ -1451,6 +1472,10 @@ class ImageTracePlugin(Star):
         每张图各带一句配文。为假时一个字节都不碰 block——哈希 /随机图 /原图
         三处既有调用点行为与改造前一致（offbox 格式体检除外，见上）。
 
+        qq_official 例外：格式体检之后还会按 `qq_upload` 组做上传通道分流，
+        命中 url/chunked 时由 _qq_upload_takeover 自己上传并发消息（绕开
+        适配器「图片恒 base64 直传、5MB 上限」）。该分支返回即视为已投递。
+
         单次发送保证：同一批图片在一次调用里只发起一次发送。只有 OneBot 直发
         明确失败（FAILED）才允许换通道重发；结果未知（超时）一律就此打住——
         请求可能已经送达，再发一次用户就会收到两张一模一样的图。
@@ -1470,6 +1495,15 @@ class ImageTracePlugin(Star):
             # 这里只改写**发送**用的 block：可转码 → 本地 JPEG path；不可转码
             # → 缩略图替身 URL。溯源 / 随机图 / 原图 三条路径由此统一覆盖
             blocks = await self._offbox_rewrite_blocks(blocks)
+            # 上传通道分流（qq_upload 组）：direct 之外由插件自己按 url/chunked
+            # 上传并发消息，绕开适配器「图片恒 base64 直传、5MB 上限」那条路。
+            # 接管成功后必须标记已发送并 stop_event，否则 respond stage 会再发一遍
+            if await self._qq_upload_takeover(
+                event, header, blocks, mark_compressed=mark_compressed
+            ):
+                self._mark_event_sent(event)
+                event.stop_event()
+                return
         mode, max_side, quality, scaled_url_style = self._delivery_config()
         if mode_override is not None:
             mode = mode_override
@@ -3107,6 +3141,349 @@ class ImageTracePlugin(Star):
         except Exception as exc:
             logger.warning(f"图片转码失败，按原样交付: {exc}")
             return None
+
+    # ------------------------------------------------------------------
+    # QQ 官方机器人上传通道（url / chunked，与缩略图发送无关）
+    # ------------------------------------------------------------------
+
+    def _qq_upload_config(self) -> tuple[str, int, int, str, int, str]:
+        """qq_upload 配置组归一化，语义见 image_delivery.qq_upload_settings。"""
+        return qq_upload_settings(self._dict_cfg("qq_upload"))
+
+    @staticmethod
+    def _qq_send_target(event: AstrMessageEvent) -> tuple[str, str] | None:
+        """取 (会话类型, 目标 openid)：group→group_openid、c2c→user_openid。
+
+        botpy 的群消息自带 group_openid、C2C 消息在 author.user_openid 上。
+        都拿不到时退化为「session_id + 消息类型」；连类型都判不出就返回 None，
+        让调用方交回原回传逻辑——猜错会话类型会把图发到错误的聊天里，比不发
+        严重得多，所以这里宁可放弃接管。
+        """
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        group_openid = str(getattr(raw, "group_openid", "") or "").strip()
+        if group_openid:
+            return ("group", group_openid)
+        author = getattr(raw, "author", None)
+        user_openid = str(getattr(author, "user_openid", "") or "").strip()
+        if not user_openid:
+            user_openid = str(getattr(raw, "user_openid", "") or "").strip()
+        if user_openid:
+            return ("c2c", user_openid)
+        try:
+            session_id = str(event.get_session_id() or "").strip()
+        except Exception:
+            session_id = ""
+        if not session_id:
+            return None
+        try:
+            message_type = str(event.get_message_type() or "").upper()
+        except Exception:
+            message_type = ""
+        if "GROUP" in message_type:
+            return ("group", session_id)
+        if any(hint in message_type for hint in ("FRIEND", "C2C", "PRIVATE")):
+            return ("c2c", session_id)
+        return None
+
+    @staticmethod
+    def _qq_target_kwargs(target: tuple[str, str]) -> dict:
+        """把 (类型, openid) 转成适配器上传方法的收件人关键字参数。"""
+        kind, session_id = target
+        return {"group_openid": session_id} if kind == "group" else {"openid": session_id}
+
+    def _qq_public_url(self, url: str, settings: dict) -> str | None:
+        """把待发直链换成「腾讯侧能下载」的公网地址；换不出来返回 None。
+
+        判定不能只看 IP 段：本部署的内网直连地址是 `192.9.240.227`，它属于
+        **公网段**（RFC1918 私有段只有 10/8、172.16/12、192.168/16），句法检查
+        会把它当成公网地址放行，于是 URL 上传发给腾讯后必然下载失败。因此这里
+        以配置为准：
+
+        1. 命中内网直连主机（lan_base_url）→ 按 base_url 换回公网源；
+        2. 换完仍落在内网主机上（说明 base_url 本身就配成了内网）→ 不可用；
+        3. 与 base_url 同主机 → 视为公网直链（配置文件已声明它是公网站点）；
+        4. 其余第三方主机 → 退化为句法判断（公网域名/公网 IP 放行）。
+        """
+        if not url:
+            return None
+        base = str(settings.get("base_url") or "").strip()
+        lan_hosts = self._lan_url_hosts(settings)
+        candidate = swap_url_origin(url, base, lan_hosts) if lan_hosts else url
+        try:
+            host = (urlsplit(candidate).hostname or "").lower()
+        except ValueError:
+            return None
+        # 只与「内网地址的主机」比，不能与整个 _lan_url_hosts 比——后者里头还
+        # 包含公网 base 的主机（换源后正是要落到它上面）
+        lan_host = ""
+        lan_base = str(settings.get("lan_base_url") or "").strip()
+        if lan_base:
+            try:
+                lan_host = (urlsplit(lan_base).hostname or "").lower()
+            except ValueError:
+                lan_host = ""
+        if lan_host and host == lan_host:
+            # 换源后仍是内网主机：腾讯服务器访问不到，别发出一次必败的上传
+            return None
+        base_host = ""
+        if base:
+            try:
+                base_host = (urlsplit(base).hostname or "").lower()
+            except ValueError:
+                base_host = ""
+        if base_host and host == base_host:
+            return candidate
+        return candidate if is_public_http_url(candidate) else None
+
+    async def _qq_block_size(self, block: dict) -> int | None:
+        """该图体积：优先用命中条目自带的大小，未知时 HEAD 探一次。
+
+        探不出来返回 None（=未知），调用方据此避开「未知却当成小图直传」这个
+        5MB 陷阱；探测只读响应头，不产生下载流量。
+        """
+        known = self._known_bytes(block)
+        if known:
+            return known
+        url = str(block.get("url") or "")
+        if not url:
+            return None
+        exists, length = await self._probe_url(url)
+        return length if exists is not False else None
+
+    async def _qq_upload_takeover(
+        self,
+        event: AstrMessageEvent,
+        header: str,
+        blocks: list[dict],
+        *,
+        mark_compressed: bool = False,
+    ) -> bool:
+        """qqofficial 上传通道接管：返回 True 表示本批已由本方法处理完毕。
+
+        只在通道不是 direct 时才真正接管；一旦接管，图片由插件自己上传并发送
+        （post_group_message / post_c2c_message + msg_type=7），所以成功返回后
+        调用方必须标记已发送并 stop_event，否则 respond stage 会照原路（base64
+        直传）再发一次，那正是「上传文件大小超过限制」的来源。
+
+        失败语义两档（qq_upload.on_failure）：
+        - fallback（默认）：一张都还没发出去时返回 False，交回原有的本地压缩 /
+          缩略图降级链；只要已经发过就绝不再交回，避免同一张图发两遍。
+        - notify：不交回，改回一条文字说明失败原因。
+        """
+        mode, direct_max, url_max, auto_prefer, max_upload, on_failure = (
+            self._qq_upload_config()
+        )
+        if mode == "direct":
+            return False
+        target = self._qq_send_target(event)
+        bot = getattr(event, "bot", None)
+        if target is None or getattr(bot, "api", None) is None:
+            logger.debug("qq_official 上传通道：会话标识或 bot 未就绪，交回原回传逻辑")
+            return False
+        images = [block for block in blocks if block.get("url") or block.get("path")]
+        if not images:
+            return False
+
+        settings = self._random_settings()
+        plan: list[tuple[dict, str, str | None]] = []
+        for block in images:
+            # 固定 url/chunked 通道不依赖体积，省掉一次 HEAD 探测
+            size = None if mode in {"url", "chunked"} else await self._qq_block_size(block)
+            url = str(block.get("url") or "")
+            public_url = self._qq_public_url(url, settings) if url else None
+            channel = choose_qq_upload_channel(
+                mode=mode,
+                size_bytes=size,
+                direct_max_bytes=direct_max,
+                url_max_bytes=url_max,
+                url_usable=public_url is not None,
+                auto_prefer=auto_prefer,
+            )
+            if channel == "direct":
+                # 混批里只要有一张判定该直传，就整批交回原逻辑：拆成两次投递会
+                # 绕开「一次事件只投递一批图」的去重盾，用户可能收到重复图片
+                logger.debug("qq_official 上传通道：该批含直传图，交回原回传逻辑")
+                return False
+            if channel == "url" and public_url is None:
+                logger.warning(
+                    f"qq_official 固定 URL 通道但拿不到公网直链（图床地址疑似内网）: {url}"
+                )
+            plan.append((block, channel, public_url))
+
+        if mark_compressed:
+            # 本通道发的是原图（URL 原样 / 分片原始字节），配文按「原图」口径写，
+            # 不能沿用压缩证据——文字说已压缩而用户收到原图是这个仓库的老毛病
+            self._mark_compressed_captions(
+                blocks, [CompressionEvidence.ORIGINAL] * len(images)
+            )
+
+        prefix = [header] if header else []
+        sent_any = False
+        for index, (block, channel, public_url) in enumerate(plan):
+            own_text = str(block.get("text") or "").strip()
+            parts = (*prefix, own_text) if index == 0 else (own_text,)
+            content = "\n".join(part for part in parts if part)
+            try:
+                media = await self._qq_upload_block(
+                    event, block, channel, public_url, target, max_upload
+                )
+                await self._qq_post_media(event, target, content, media)
+            except Exception as exc:
+                detail = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    f"qq_official {channel} 通道上传/发送失败"
+                    f"（第 {index + 1}/{len(plan)} 张）: {detail}"
+                )
+                if not sent_any and on_failure == "fallback":
+                    logger.warning(
+                        "qq_official 上传通道不可用，交回原回传逻辑（本地压缩/缩略图）"
+                    )
+                    return False
+                await self._qq_notify(event, target, f"⚠️ 图片发送失败：{detail}")
+                return True
+            sent_any = True
+        return True
+
+    async def _qq_upload_block(
+        self,
+        event: AstrMessageEvent,
+        block: dict,
+        channel: str,
+        public_url: str | None,
+        target: tuple[str, str],
+        max_upload: int,
+    ):
+        """按通道上传一张图，返回 QQ 侧 Media。"""
+        if channel == "url":
+            if not public_url:
+                raise RuntimeError("没有公网直链，QQ 无法按 URL 拉取该图")
+            return await self._qq_upload_via_url(event, public_url, target)
+        path = str(block.get("path") or "")
+        temp = ""
+        try:
+            if not path:
+                temp = await self._download(
+                    str(block.get("url") or ""), size_limit=max_upload
+                )
+                path = temp
+            name = (
+                str(block.get("file_name") or "").strip()
+                or os.path.basename(path)
+                or "image.jpg"
+            )
+            return await self._qq_upload_via_chunked(event, path, name, target)
+        finally:
+            # 分片通道只为这一次上传落盘，发完即删；临时目录另有 TTL 清理兜底
+            self._remove_quiet(temp)
+
+    async def _qq_upload_via_url(
+        self, event: AstrMessageEvent, url: str, target: tuple[str, str]
+    ):
+        """URL 上传：只传 `url` 字段，由腾讯侧下载转存（图片软限 20MB）。
+
+        借适配器自身的通用媒体上传方法（它对「非本地路径」正是走 url 分支），
+        避免在插件里复刻 QQ 接口字段与错误码；AstrBot 发主动消息时也是用同样的
+        伪事件（只带 bot 属性）调用它。
+        """
+        try:
+            from astrbot.core.platform.sources.qqofficial.qqofficial_message_event import (
+                QQOfficialMessageEvent,
+            )
+        except ImportError as exc:  # 版本差异：模块或方法被改名
+            raise RuntimeError(
+                f"当前 AstrBot 版本缺少 qqofficial 媒体上传方法: {exc}"
+            ) from exc
+        helper = SimpleNamespace(bot=getattr(event, "bot", None))
+        return await QQOfficialMessageEvent.upload_group_and_c2c_media(
+            helper,
+            url,
+            QQ_IMAGE_FILE_TYPE,
+            srv_send_msg=False,
+            **self._qq_target_kwargs(target),
+        )
+
+    async def _qq_upload_via_chunked(
+        self, event: AstrMessageEvent, path: str, name: str, target: tuple[str, str]
+    ):
+        """分片上传：prepare → 并发 PUT 分片 → 逐片确认 → 合并（硬限 200MB）。
+
+        直接实例化适配器的分片器，而不是走 upload_group_and_c2c_media：后者只在
+        「本地文件 > 10MB」时才分片，5~10MB 仍会落回 base64 分支（照样撞 5MB）。
+        """
+        try:
+            from astrbot.core.platform.sources.qqofficial.qqofficial_chunked_upload import (
+                QQOfficialChunkedUploader,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                f"当前 AstrBot 版本缺少 qqofficial 分片上传器: {exc}"
+            ) from exc
+        uploader = QQOfficialChunkedUploader(event.bot.api._http)
+        kind, session_id = target
+        if kind == "group":
+            return await uploader.upload_group(
+                file_path=Path(path),
+                file_type=QQ_IMAGE_FILE_TYPE,
+                file_name=name,
+                group_openid=session_id,
+                srv_send_msg=False,
+            )
+        return await uploader.upload_c2c(
+            file_path=Path(path),
+            file_type=QQ_IMAGE_FILE_TYPE,
+            file_name=name,
+            user_openid=session_id,
+            srv_send_msg=False,
+        )
+
+    async def _qq_post_media(
+        self, event: AstrMessageEvent, target: tuple[str, str], content: str, media
+    ) -> None:
+        """自己发一条 media 消息（msg_type=7）。
+
+        不走 event.send：那条路会把图片重新解析成 base64 交给 file_data 直传，
+        正是本次要绕开的 5MB 限制。msg_seq 每条随机——被动回复中 (msg_id,
+        msg_seq) 组合重复会被平台判失败。
+        """
+        api = event.bot.api
+        message_id = str(
+            getattr(getattr(event, "message_obj", None), "message_id", "") or ""
+        ).strip()
+        payload = {
+            "msg_type": 7,
+            "media": media,
+            "content": content or None,
+            "msg_id": message_id or None,
+            "msg_seq": random.randint(1, 10000),
+        }
+        kind, session_id = target
+        if kind == "group":
+            await api.post_group_message(group_openid=session_id, **payload)
+        else:
+            await api.post_c2c_message(openid=session_id, **payload)
+
+    async def _qq_notify(
+        self, event: AstrMessageEvent, target: tuple[str, str], text: str
+    ) -> None:
+        """失败说明用纯文本回一条；这条发不出去也不影响主流程。"""
+        try:
+            api = event.bot.api
+            message_id = str(
+                getattr(getattr(event, "message_obj", None), "message_id", "") or ""
+            ).strip()
+            payload = {
+                "msg_type": 0,
+                "content": text,
+                "msg_id": message_id or None,
+                "msg_seq": random.randint(1, 10000),
+            }
+            kind, session_id = target
+            if kind == "group":
+                await api.post_group_message(group_openid=session_id, **payload)
+            else:
+                await api.post_c2c_message(openid=session_id, **payload)
+        except Exception as exc:
+            logger.debug(f"qq_official 失败说明发送失败（忽略）: {exc}")
 
     async def _random_send_url(self, media_url: str, settings: dict) -> str:
         """把随机到的原图换成它的缩略图直链；取不到替身就原样返回原图。

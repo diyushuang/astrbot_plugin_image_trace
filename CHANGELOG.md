@@ -1,5 +1,42 @@
 # 更新日志
 
+## 1.7.10（2026-10-25，QQ 官方机器人新增 URL / 分片上传通道）
+
+线上现象：qq_official 平台发送较大原图时，AstrBot 报
+`botpy.errors.ServerError: 上传文件大小超过限制`（链路
+`respond.stage` → `_post_send_one` → `upload_group_and_c2c_image`），图片完全
+发不出去。
+
+根因：适配器对**图片**只走 `file_data`（base64 二进制直传），而 QQ 开放平台
+规定「直接上传二进制数据，数据大小不能超过 5M」——图片 20MB 的软限只对 URL
+上传与分片上传生效；base64 再膨胀 4/3，原图超过约 3.75MB 即必失败。这个异常
+发生在 respond stage（插件 yield 之后），插件侧的事后重试根本捕获不到，只能
+在**发送前选对通道**。
+
+- `image_delivery.py`：新增上传通道纯决策层——`qq_upload_settings()` 归一化
+  配置；`choose_qq_upload_channel()` 选通道（固定通道不因体积改道；auto 按
+  体积/可达性分流；体积未知时不冒险直传）；`is_public_http_url()` 句法级公网
+  判定。
+- `main.py`：新增独立配置组 `qq_upload`（与 `random_media.send_thumbnail`
+  完全分开），并在 `_offbox_rewrite_blocks` 之后接管：`direct` 交回原生路径；
+  `url` / `chunked` 由插件自行上传 + `post_group_message` / `post_c2c_message`
+  （`msg_type=7`）并 `stop_event()`，否则 respond stage 会照原路再发一次。
+  url 通道借适配器 `upload_group_and_c2c_media` 的 url 分支；chunked 直接
+  实例化 `QQOfficialChunkedUploader`——它只在 >10MB 时才自动分片，5~10MB
+  仍会落回 base64 分支（照样撞 5MB）。
+- 失败语义：一张都没发出时按 `on_failure` 决定「交回原有降级链」还是「回一条
+  文字说明」；本批已经成功发出过就绝不再交回，避免同一张图发两遍。`/原图` 走
+  本通道也发原图（URL 原样 / 分片原始字节），配文按「原图」口径写，不谎称已
+  压缩。
+- 公网判定细节：内网直连地址可能是**公网段 IP**（实测 `192.9.240.227` 并不属
+  于 RFC1918 私有段），句法级检查分不出来。改为按 `lan_base_url` 把直链换回
+  `base_url` 公网源再比对主机，换完仍落在内网主机（`base_url` 也配成内网）才
+  判定不可用。
+- `_download()` 新增 `size_limit` 参数：分片通道按 `qq_upload.max_upload_mb`
+  （默认 100MB）下载，不再被全局 `max_download_mb`（默认 20MB）截断。
+- 测试：新增 `tests/test_qq_upload.py` 42 例——配置归一化、通道选择、公网
+  判定、接管发消息（群/C2C）、失败兜底、`stop_event` 防重发。
+
 ## 1.7.9（2026-10-25，官方文档口径对齐：webp/bmp 免转码直发）
 
 对照官方文档「富媒体使用说明」的展示格式清单（jpg/png/gif/webp/bmp 发送后

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import ipaddress
 import math
 from collections.abc import Mapping
 from enum import Enum
@@ -129,6 +130,144 @@ def delivery_settings(config: Any) -> tuple[str, int, int, str]:
     if style not in SCALED_URL_STYLES:
         style = "query"
     return mode, max_side, quality, style
+
+
+# ---------------------------------------------------------------------------
+# QQ 官方机器人上传通道选择（与缩略图发送是两件独立的事）
+# ---------------------------------------------------------------------------
+#
+# 背景：AstrBot 的 qqofficial 适配器对**图片**只走 `file_data`（base64 二进制
+# 直传），而 QQ 开放平台规定「直接上传二进制数据，数据大小不能超过 5M」——
+# 图片 20MB 的软限只对 URL 上传与分片上传生效。于是超过约 3.75MB 的原图
+# （base64 膨胀 4/3）必在适配器里报「上传文件大小超过限制」，而这个异常发生在
+# respond stage（插件 yield 之后），插件侧的事后重试根本捕获不到。唯一可行的
+# 做法是**发送前就选对通道**：
+#
+# - direct：仍交回适配器原生路径（≤5MB 直传，可叠加本地压缩）；
+# - url：上传接口改传 `url` 字段，由腾讯侧下载转存，免 base64 体积上限
+#   （图片软限 20MB，超过会被降级成「文件卡片」）；前提是图床公网可达；
+# - chunked：upload_prepare → 分片 PUT → upload_part_finish → 合并，保原图、
+#   上限 200MB，代价是多次往返与先落盘。
+#
+# 通道选择是纯决策，放本模块便于单测；网络请求与消息发送在 main.py。
+
+QQ_UPLOAD_MODES = frozenset({"auto", "direct", "url", "chunked"})
+QQ_UPLOAD_CHANNELS = frozenset({"direct", "url", "chunked"})
+QQ_AUTO_PREFER = frozenset({"chunked", "url"})
+QQ_UPLOAD_FAILURE_MODES = frozenset({"fallback", "notify"})
+QQ_DIRECT_MAX_DEFAULT_MB = 3
+QQ_URL_MAX_DEFAULT_MB = 20
+QQ_UPLOAD_MAX_DEFAULT_MB = 100
+_MB = 1024 * 1024
+# 单标签主机名（如 `astrbot`、`imgbed`）只在局域网内可解析，公网侧必然失败
+_PRIVATE_HOST_SUFFIXES = (".local", ".internal", ".lan", ".localhost")
+
+
+def qq_upload_settings(config: Any) -> tuple[str, int, int, str, int, str]:
+    """归一化 qq_upload 配置组。
+
+    返回 (mode, direct_max_bytes, url_max_bytes, auto_prefer,
+          max_upload_bytes, on_failure)。
+
+    各项默认值的依据：
+    - direct_max_mb＝3：QQ 二进制直传硬限 5MB，base64 膨胀 4/3 后原图最多约
+      3.75MB，取 3 留余量；填 0 表示从不直传（大图一律 url/chunked）。
+    - url_max_mb＝20：图片 URL 上传的软限，超过会被平台降级成文件卡片。
+    - auto_prefer＝chunked：URL 上传要腾讯侧反过来访问图床，公网不可达就必然
+      失败；分片不依赖任何外部可达性，做默认更稳，要更快可改 url。
+    - max_upload_mb＝100：分片路径要先把原图下到本地，这个上限独立于
+      max_download_mb（后者默认 20MB，装不下需要分片的大图）。
+    - on_failure＝fallback：通道失败后交回原有回传逻辑（本地压缩/缩略图），
+      而不是把错误直接抛给用户。
+    """
+    raw = config if isinstance(config, dict) else {}
+    mode = str(raw.get("mode") or "auto").strip().lower()
+    if mode not in QQ_UPLOAD_MODES:
+        mode = "auto"
+    prefer = str(raw.get("auto_prefer") or "chunked").strip().lower()
+    if prefer not in QQ_AUTO_PREFER:
+        prefer = "chunked"
+    failure = str(raw.get("on_failure") or "fallback").strip().lower()
+    if failure not in QQ_UPLOAD_FAILURE_MODES:
+        failure = "fallback"
+    # MB 上限统一夹在 0~1024：手改配置写成天文数字时，后面按它下载会一次读满磁盘
+    direct_max = bounded_int(raw.get("direct_max_mb"), QQ_DIRECT_MAX_DEFAULT_MB, 0, 1024) * _MB
+    url_max = bounded_int(raw.get("url_max_mb"), QQ_URL_MAX_DEFAULT_MB, 0, 1024) * _MB
+    max_upload = bounded_int(raw.get("max_upload_mb"), QQ_UPLOAD_MAX_DEFAULT_MB, 1, 1024) * _MB
+    return mode, direct_max, url_max, prefer, max_upload, failure
+
+
+def choose_qq_upload_channel(
+    *,
+    mode: str,
+    size_bytes: int | None,
+    direct_max_bytes: int = QQ_DIRECT_MAX_DEFAULT_MB * _MB,
+    url_max_bytes: int = QQ_URL_MAX_DEFAULT_MB * _MB,
+    url_usable: bool = False,
+    auto_prefer: str = "chunked",
+) -> str:
+    """选上传通道：direct / url / chunked。
+
+    mode 填了固定通道就原样返回、不因体积改道——用户显式钉死一条通道时，
+    失败与否由 on_failure 决定，不该被悄悄换成别的通道。
+
+    auto 的判定顺序：
+    1. 体积已知且 ≤ direct_max → direct（最快，走适配器原生路径，还能叠加
+       本地压缩）；
+    2. auto_prefer=url、且公网直链可用、且体积不超过 URL 软限 → url；
+    3. 其余 → chunked（不依赖图床公网可达，且保原图）。
+
+    size_bytes 为 None 表示体积未知：这时不判 direct（怕它其实是大图），按
+    2/3 的偏好继续走。url_usable=False 表示拿不到公网直链（内网直连，或直链
+    本身就指向私网），URL 上传必然失败，直接跳过该通道。
+    """
+    normalized = str(mode or "").strip().lower()
+    if normalized in QQ_UPLOAD_CHANNELS:
+        return normalized
+    if size_bytes is not None and 0 < size_bytes <= max(0, direct_max_bytes):
+        return "direct"
+    prefer = str(auto_prefer or "chunked").strip().lower()
+    # url_max_bytes ≤ 0 视为不限制（配置填 0 表示「软限不管」）
+    if (
+        prefer == "url"
+        and url_usable
+        and (size_bytes is None or url_max_bytes <= 0 or size_bytes <= url_max_bytes)
+    ):
+        return "url"
+    return "chunked"
+
+
+def is_public_http_url(url: str) -> bool:
+    """该 URL 是否「看起来能被第三方服务器访问」的公网 http(s) 地址。
+
+    QQ 的 URL 上传由腾讯侧下载，内网/回环地址它必然拉不到，而我们无法从本机
+    验证对端可达性——所以这里只做**句法级**判断：协议必须是 http(s)、必须有
+    主机名，且主机名不能是回环/私网/链路本地/保留的字面 IP，也不能是无点的
+    内网短名或 .local 之类。
+
+    判断为真不代表一定可达（域名可能已失效），判断为假则一定不可达。调用方
+    据此把 URL 上传降级到分片，而不是把一次必败的上传发出去。
+
+    注意这条检查**只能识别形如 10/172.16/192.168 的私有段与回环地址**：像
+    `192.9.240.227` 这种被拿来当内网用的地址其实属于公网段，句法上分不出来。
+    所以真正决定「图床直链能不能交给腾讯下载」的是配置里的内网/公网地址对比
+    （见 main._qq_public_url），本函数只兜住第三方的明显内网地址。
+    """
+    try:
+        parsed = urlsplit(str(url or "").strip())
+        host = (parsed.hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    if parsed.scheme not in {"http", "https"} or not host:
+        return False
+    if host == "localhost" or host.endswith(_PRIVATE_HOST_SUFFIXES):
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        # 非 IP 字面量：公网域名至少带一个点；单标签名通常只在内网解析
+        return "." in host
+    return address.is_global
 
 
 def _error_text(exc: BaseException) -> str:

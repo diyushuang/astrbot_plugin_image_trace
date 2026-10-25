@@ -197,6 +197,64 @@
       }
     }
   },
+  "qq_upload": {
+    "description": "QQ 官方机器人上传通道",
+    "type": "object",
+    "hint": "只对 QQ 官方机器人（qq_official）生效，与「随机图发送缩略图」互不影响。QQ 官方接口对图片有三种上传方式：① 二进制直传，上限 5MB（AstrBot 默认走这条，超过即报「上传文件大小超过限制」）；② URL 上传，把图床直链交给腾讯服务器下载转存，图片软限 20MB，要求直链公网可达；③ 分片上传，上限 200MB，保原图，但要多几次往返。插件据此在发送前选通道：direct 交回 AstrBot 原生路径（可叠加本地压缩），url/chunked 由插件自己上传并发消息。任一通道失败都按「失败处理」一档兜底。",
+    "items": {
+      "mode": {
+        "description": "【选填】上传通道",
+        "type": "string",
+        "options": [
+          "auto",
+          "direct",
+          "url",
+          "chunked"
+        ],
+        "default": "auto",
+        "obvious_hint": true,
+        "hint": "auto=按体积自动分流（推荐）；direct=始终交回 AstrBot 原生直传（维持原行为，超过 5MB 的图仍会报错）；url=始终走 URL 上传（要求图床公网直链可达，且超过 20MB 会被平台降级成文件卡片）；chunked=始终走分片上传（不依赖公网可达，保原图，大图会多花几秒）。固定通道不会因体积改道，失败与否取决于下方「失败处理」。"
+      },
+      "direct_max_mb": {
+        "description": "【选填】直传体积上限（MB）",
+        "type": "int",
+        "default": 3,
+        "hint": "auto 模式下不超过该体积的图仍走 AstrBot 原生直传（最快，还能叠加本地压缩）。二进制直传上限是 5MB，而 base64 会膨胀约 4/3，故原图最多约 3.75MB；默认 3 留余量。填 0 表示从不直传，大图一律走 url/chunked。"
+      },
+      "auto_prefer": {
+        "description": "【选填】auto 模式在直传之外的偏好",
+        "type": "string",
+        "options": [
+          "chunked",
+          "url"
+        ],
+        "default": "chunked",
+        "hint": "chunked=优先分片（默认，不依赖图床公网可达，失败率最低）；url=优先 URL 上传（更快、不占本机上行带宽，但要求腾讯服务器能访问图床公网直链，否则每次都会失败再兜底）。仅 auto 模式生效。"
+      },
+      "url_max_mb": {
+        "description": "【选填】URL 上传体积上限（MB）",
+        "type": "int",
+        "default": 20,
+        "hint": "QQ 图片 URL 上传的软限制。auto 模式下体积超过该值会跳过 URL 通道直接分片；填写 0 表示不限制（注意超过平台软限的图会被降级成「文件卡片」，接收方看到的不是图片）。仅与 URL 通道有关。"
+      },
+      "max_upload_mb": {
+        "description": "【选填】分片上传的下载体积上限（MB）",
+        "type": "int",
+        "default": 100,
+        "hint": "分片通道需要先把原图下到 AstrBot 本地再分片上传，这个上限独立于全局「单张图片大小上限」（max_download_mb，默认 20MB，装不下需要分片的大图）。超过本值会直接失败并按下方的「失败处理」兜底。分片上传本身硬限 200MB。"
+      },
+      "on_failure": {
+        "description": "【选填】通道失败后的处理",
+        "type": "string",
+        "options": [
+          "fallback",
+          "notify"
+        ],
+        "default": "fallback",
+        "hint": "fallback=交回原有回传逻辑（本地压缩 / 缩略图替身等降级链，仍可能失败但尽量把图发出去）；notify=不再尝试其他通道，直接回一条文字说明失败原因。注意：本批只要已经成功发出过一张图，无论选哪档都不会再交回，以免同一张图发两遍。"
+      }
+    }
+  },
   "similarity_threshold": {
     "description": "【选填】相似度阈值（0~1，哈希引擎）",
     "type": "float",

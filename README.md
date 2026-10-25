@@ -5,7 +5,7 @@
 
 **群聊里随手转发的一张图，一键找回它的原图。**
 
-[![version](https://img.shields.io/badge/version-1.7.4-blue?style=flat-square)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.7.10-blue?style=flat-square)](./CHANGELOG.md)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4?style=flat-square)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat-square)](./LICENSE)
@@ -202,6 +202,37 @@ flowchart LR
 - **回传计划只算一次**：URL 计划（含探测）在直发前算好，失败回退路径直接复用。
 - **本地压缩**：单次解码（不重复解码校验）、多图并发压缩（上限 3）、回退下载优先走内存（超过 8 MB 才落盘）。
 - **提示与图片并行**：OneBot 场景下命中提示与图片消息同时下发，首图不必等提示的整轮往返。
+
+</details>
+
+<a id="官方机器人上传"></a>
+
+<details>
+<summary><b>QQ 官方机器人上传通道（<code>qq_upload</code>，点击展开）</b></summary>
+
+QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条：
+
+| 通道 | 上限 | 说明 |
+| --- | --- | --- |
+| 二进制直传（`direct`） | **5MB** | 适配器把图片转 base64 走 `file_data`。超过即报「上传文件大小超过限制」，且异常发生在 AstrBot 的 respond stage，插件侧捕获不到 |
+| URL 上传（`url`） | 20MB | 上传接口只传 `url` 字段，由腾讯服务器下载转存。要求图床**公网可达**；超过 20MB 会被平台降级成「文件卡片」 |
+| 分片上传（`chunked`） | 200MB | `upload_prepare` → 并发 PUT 分片 → 逐片确认 → 合并。保原图，不依赖外部可达性，代价是先下到本地并多几次往返 |
+
+| 配置 | 默认 | 说明 |
+| --- | --- | --- |
+| `qq_upload.mode` | `auto` | `auto`=按体积分流；`direct`=始终交回 AstrBot 原生直传（维持原行为）；`url`=始终 URL 上传；`chunked`=始终分片。固定通道不因体积改道 |
+| `qq_upload.direct_max_mb` | `3` | `auto` 下不超过该体积走直传。直传硬限 5MB，base64 膨胀 4/3 后原图上限约 3.75MB，故默认留余量；填 `0` 表示从不直传 |
+| `qq_upload.auto_prefer` | `chunked` | `auto` 下直传之外优先哪条：`chunked`（不依赖公网可达，最稳）/ `url`（更快、不占本机上行，但要求腾讯能访问图床直链） |
+| `qq_upload.url_max_mb` | `20` | URL 通道软限；`auto` 下超过该值直接分片。填 `0` 表示不限制（注意超限会变成文件卡片） |
+| `qq_upload.max_upload_mb` | `100` | 分片通道的下载上限，独立于全局 `max_download_mb`（后者默认 20MB，装不下需要分片的大图） |
+| `qq_upload.on_failure` | `fallback` | 通道失败后：`fallback` 交回原有降级链（本地压缩/缩略图）；`notify` 直接回一条文字说明。**本批已成功发过图时无论哪档都不会再交回**，以免同一张图发两遍 |
+
+要点：
+
+- **与缩略图配置完全分开**：`random_media.send_thumbnail` 管的是「随机图要不要发 720px 替身」，`qq_upload` 管的是「这张图用什么方式送到 QQ」，两者互不影响。
+- **URL 通道的公网判定以配置为准**：内网直连地址可能是公网段 IP（如 `192.9.x.x` 并非 RFC1918 私有段），只靠 IP 判断分不出来。插件按 `random_media.lan_base_url` 换回 `base_url` 公网源；若 `base_url` 本身也是内网地址，则判定不可用并降级到分片。
+- **接管后由插件自己发消息**：命中 `url`/`chunked` 时，插件自行上传并 `post_group_message` / `post_c2c_message`（`msg_type=7`），随后 `stop_event()`——否则 respond stage 会照原路再发一次。
+- **`/原图` 语义不变**：本通道发的是原图（URL 原样 / 分片原始字节），不会把原图悄悄换成缩略图；配文按「原图」口径写。
 
 </details>
 
