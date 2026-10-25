@@ -589,11 +589,12 @@ def sniff_image_format(data: bytes) -> str | None:
 def qq_upload_safe_image(head: bytes) -> bool:
     """该文件头是否为 QQ 官方机器人富媒体上传接受的图片格式。
 
-    官方接口（POST /v2/{group|user}/files, file_type=1）只收标准 JPEG/PNG/GIF；
-    图床里存在扩展名是 .jpg、实际为 HEIF/AVIF/WEBP（微博 live 图等）的文件，
-    原样交给上传会被打回「富媒体文件格式不支持」。嗅探只需文件头 16 字节。
+    口径取自官方文档「富媒体使用说明」的展示格式清单：jpg/png/gif/webp/bmp
+    发送后直接展示为图片（webp 动图因此免转码、保留动画）；HEIC/AVIF/TIFF/
+    SVG 等不在清单内，原样上传会被打回「富媒体文件格式不支持」。嗅探只需
+    文件头 16 字节。
     """
-    return sniff_image_format(bytes(head)[:16]) in {"JPEG", "PNG", "GIF"}
+    return sniff_image_format(bytes(head)[:16]) in {"JPEG", "PNG", "GIF", "WEBP", "BMP"}
 
 
 def prepare_image_bytes(
