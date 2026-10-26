@@ -23,6 +23,7 @@ import random
 import secrets
 import time
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import unquote, urlparse, urlsplit
@@ -68,9 +69,11 @@ try:
         ImageFeatures,
         avif_available,
         compute_features,
+        compute_features_with_mime,
         heif_available,
         image_bytes_ok,
         image_file_ok,
+        image_mime,
         phash_hex_len,
     )
     from .hash_index import REMOTE_HASH_PAYLOAD_KEYS, HashIndex
@@ -151,9 +154,11 @@ except ImportError:  # 兼容插件以独立模块方式加载
         ImageFeatures,
         avif_available,
         compute_features,
+        compute_features_with_mime,
         heif_available,
         image_bytes_ok,
         image_file_ok,
+        image_mime,
         phash_hex_len,
     )
     from hash_index import REMOTE_HASH_PAYLOAD_KEYS, HashIndex  # type: ignore[no-redef]
@@ -293,6 +298,21 @@ def _describe_bad_image(path: str) -> tuple[str, str | None]:
         return "无法读取", None
     text = "".join(chr(b) if 32 <= b < 127 else "." for b in head)
     return f"{size} 字节, 头部 {text!r}", sniff_image_format(head)
+
+
+@dataclass
+class ResolvedImage:
+    """一次解析的产物：本地路径、临时文件标记、失败提示，以及可选的 MIME/特征。
+
+    MIME 与 features 只在调用方要求的探测模式下填充。带 features 的解析表示
+    “这一次解码已经完成格式校验 + 感知特征”，下游不得再为同一张图重复解码。
+    """
+
+    path: str = ""
+    is_tmp: bool = False
+    message: str = ""
+    mime: str = ""
+    features: ImageFeatures | None = None
 
 
 # 储存桶（对象存储）独立配置组；v1.2.x 曾作为 image_bed 的模式，迁移见
@@ -761,32 +781,50 @@ class ImageTracePlugin(Star):
                         push(sub)
         return found
 
-    async def _resolve_local_file(self, seg) -> tuple[str, bool, str]:
-        """把图片段解析为本地文件。返回 (路径, 是否临时文件, 失败提示)。
+    @staticmethod
+    def _probe_mime(path: str):
+        """解析探测：返回 (None, mime) 表示有效，None 表示无效；不抛错。"""
+        mime = image_mime(path)
+        return (None, mime) if mime else None
 
-        优先走 AstrBot 内置媒体解析 convert_to_file_path()，产物先经
-        image_file_ok 校验。校验失败时分两种情况：
+    async def _resolve_local(self, seg, *, probe) -> ResolvedImage:
+        """把图片段解析为本地文件，并顺带执行 probe 的一次解码。
 
-        - 认不出任何图片容器（多半是图床返回的几十~几百字节错误体、或
-          rkey 过期/防盗链拦下的响应）→ 才值得走自带下载兜底；
-        - 已经认得出容器却解不开（典型是缺解码器的 HEIC、被截断的文件）
-          → 内容本身有问题，链接指向同一张图，重下不会有不同结果，直接带
-          具体原因返回，省掉一次注定失败的请求与一对误导性日志。
+        probe(path) 成功时返回 (features|None, mime)，无效时返回 None 或抛错
+        （两者都按“无效”处理）。这样「格式校验」与「特征计算」可以共用一次
+        Image.open()：需要特征的调用方传 compute_features_with_mime，只需要
+        MIME 的调用方传 _probe_mime。
 
-        失败提示为空串表示解析成功。
+        解析失败时的分诊与旧实现一致：
+        - 认不出任何图片容器（错误体/防盗链响应）→ 才走自带下载兜底；
+        - 认得出容器却解不开（缺解码器的 HEIC、截断文件）→ 直接返回具体原因，
+          不再为同一内容白发一次下载。
         """
+        def probe_path(path: str, is_tmp: bool) -> ResolvedImage | None:
+            try:
+                result = probe(path)
+            except Exception:
+                return None
+            if not result:
+                return None
+            features, mime = result
+            return ResolvedImage(
+                path=path, is_tmp=is_tmp, mime=mime or "", features=features
+            )
+
         try:
             path = await seg.convert_to_file_path()
             if path and os.path.isfile(path):
-                if await asyncio.to_thread(image_file_ok, path):
-                    return path, False, ""
+                resolved = await asyncio.to_thread(probe_path, path, False)
+                if resolved is not None:
+                    return resolved
                 summary, sniffed = await asyncio.to_thread(_describe_bad_image, path)
                 if sniffed is not None:
                     logger.warning(
                         f"内置解析产物无法解码（{summary}，容器格式 {sniffed}），"
                         "链接指向同一内容，跳过兜底下载"
                     )
-                    return "", False, self._decode_fail_message(sniffed)
+                    return ResolvedImage(message=self._decode_fail_message(sniffed))
                 logger.warning(f"内置解析产物不是有效图片（{summary}），改走兜底下载")
         except Exception as e:
             logger.debug(f"convert_to_file_path 失败，尝试兜底下载: {e}")
@@ -797,15 +835,21 @@ class ImageTracePlugin(Star):
                 path = await self._download(str(url))
             except Exception as e:
                 logger.warning(f"图片兜底下载失败: {e}")
-                return "", False, self._download_fail_message()
-            if await asyncio.to_thread(image_file_ok, path):
-                return path, True, ""
+                return ResolvedImage(message=self._download_fail_message())
+            resolved = await asyncio.to_thread(probe_path, path, True)
+            if resolved is not None:
+                return resolved
             summary, _ = await asyncio.to_thread(_describe_bad_image, path)
             logger.warning(
                 f"兜底下载内容不是有效图片（{summary}），链接可能已过期或被防盗链拦截"
             )
             self._remove_quiet(path)
-        return "", False, self._download_fail_message()
+        return ResolvedImage(message=self._download_fail_message())
+
+    async def _resolve_local_file(self, seg) -> tuple[str, bool, str]:
+        """兼容入口：返回 (路径, 是否临时文件, 失败提示)。"""
+        resolved = await self._resolve_local(seg, probe=self._probe_mime)
+        return resolved.path, resolved.is_tmp, resolved.message
 
     @staticmethod
     def _download_fail_message() -> str:
@@ -1954,29 +1998,31 @@ class ImageTracePlugin(Star):
             return note
         return (getattr(match, "file_name", "") or "").strip()
 
-    async def _trace_hash(self, event: AstrMessageEvent, seg, resolved=None) -> AsyncGenerator:
+    async def _trace_hash(
+        self, event: AstrMessageEvent, seg, resolved: ResolvedImage | None = None
+    ) -> AsyncGenerator:
         """哈希检索；resolved 供 auto 引擎复用已解析的本地文件（含清理责任）。
 
-        resolved 为 (路径, 是否临时文件, 失败提示)；传了它表示调用方已解析过
-        这张图，本方法不负责删除临时文件（由调用方统一清理）。
+        resolved 为 ResolvedImage（可能已带 features/MIME）；传了它表示调用方
+        已解析过这张图，本方法不负责删除临时文件（由调用方统一清理）。
         """
         threshold = self.hash_threshold
         top_n = self.top_n
-        local_path = ""
-        is_tmp = False
         owns_temp = resolved is None
+        if resolved is None:
+            resolved = await self._resolve_local(
+                seg,
+                probe=lambda path: compute_features_with_mime(path, self.hash_size),
+            )
+        local_path = resolved.path
         try:
-            if resolved is None:
-                local_path, is_tmp, fail_message = await self._resolve_local_file(seg)
-            else:
-                local_path, is_tmp, fail_message = resolved
             if not local_path:
-                yield event.plain_result(fail_message)
+                yield event.plain_result(resolved.message)
                 return
 
-            feats: ImageFeatures = await asyncio.to_thread(
-                compute_features, local_path, self.hash_size
-            )
+            feats = resolved.features
+            if feats is None:
+                feats = await asyncio.to_thread(compute_features, local_path, self.hash_size)
             # 至少取回 5 条候选：即便 top_n 配置为 0/较小值，AI 复核也需要
             # 足够的候选池才能剔除误报
             hits, candidate_lines = await asyncio.to_thread(
@@ -2000,8 +2046,8 @@ class ImageTracePlugin(Star):
             logger.error(f"图片溯源处理失败: {e}", exc_info=True)
             yield event.plain_result("⚠️ 处理图片时出错，详情请查看机器人日志。")
         finally:
-            if owns_temp and is_tmp:
-                self._remove_quiet(local_path)
+            if owns_temp and resolved is not None and resolved.is_tmp:
+                self._remove_quiet(resolved.path)
 
     async def _hash_hit_result(self, event: AstrMessageEvent, best) -> AsyncGenerator:
         """把一条哈希命中渲染成回复（本地腿与图床腿共用）。
@@ -2044,26 +2090,24 @@ class ImageTracePlugin(Star):
     # 向量引擎
     # ------------------------------------------------------------------
 
-    async def _vector_search_one(self, event, seg, resolved=None):
+    async def _vector_search_one(self, event, seg, resolved: ResolvedImage | None = None):
         """单图向量检索。返回 (kind, item)：hit / miss / nofile / error。
 
         hit/miss/nofile 时 item 为可直接 yield 的结果对象；error 时 item 为错误说明字符串。
 
-        resolved 供 auto 引擎复用已解析的本地文件：传了它（(路径, 是否临时文件,
-        失败提示)）就不再重复下载/解码，且临时文件由调用方统一清理。
+        resolved 供 auto 引擎复用已解析的本地文件：传了它（ResolvedImage）就不再
+        重复下载/解码，且临时文件由调用方统一清理；其中的 MIME 会直接交给
+        embed_file，省掉为同一张图再取一次格式的解码。
         """
         top_n = self.top_n
-        local_path = ""
-        is_tmp = False
         owns_temp = resolved is None
+        if resolved is None:
+            resolved = await self._resolve_local(seg, probe=self._probe_mime)
         try:
-            if resolved is None:
-                local_path, is_tmp, fail_message = await self._resolve_local_file(seg)
-            else:
-                local_path, is_tmp, fail_message = resolved
-            if not local_path:
-                return "nofile", event.plain_result(fail_message)
-            vector = await self.vector.embed_file(local_path)
+            if not resolved.path:
+                return "nofile", event.plain_result(resolved.message)
+            local_path = resolved.path
+            vector = await self.vector.embed_file(local_path, mime=resolved.mime or None)
             hits = await self.vector.search(
                 vector, limit=self.vector.top_k, with_vector=True
             )
@@ -2097,8 +2141,8 @@ class ImageTracePlugin(Star):
             logger.error("向量检索异常", exc_info=True)
             return "error", "内部错误（详见机器人日志）"
         finally:
-            if owns_temp and is_tmp:
-                self._remove_quiet(local_path)
+            if owns_temp and resolved.is_tmp:
+                self._remove_quiet(resolved.path)
 
     async def _trace_vector(self, event: AstrMessageEvent, seg) -> AsyncGenerator:
         """严格向量引擎：只用向量库，出错直接提示。"""
@@ -2114,15 +2158,17 @@ class ImageTracePlugin(Star):
     async def _trace_auto(self, event: AstrMessageEvent, seg) -> AsyncGenerator:
         """auto 引擎：向量优先，未命中或引擎不可用时回退哈希。
 
-        图片只解析一次：向量检索与哈希回退共用同一份本地文件，避免在“向量未
-        命中”这条最常见的路径上重复下载与完整解码。临时文件由这里的 finally
-        统一清理（两个下游方法在收到 resolved 时都不再负责删除）。
+        图片只解析一次：解析时用 compute_features_with_mime 同时完成格式校验与
+        感知特征，向量腿拿 MIME、哈希腿拿 features，两边都不再为同一张图重复
+        解码。临时文件由这里的 finally 统一清理（下游收到 resolved 时不再删除）。
         """
-        local_path, is_tmp, fail_message = await self._resolve_local_file(seg)
-        if not local_path:
-            yield event.plain_result(fail_message)
+        resolved = await self._resolve_local(
+            seg,
+            probe=lambda path: compute_features_with_mime(path, self.hash_size),
+        )
+        if not resolved.path:
+            yield event.plain_result(resolved.message)
             return
-        resolved = (local_path, is_tmp, "")
         try:
             kind, item = await self._vector_search_one(event, seg, resolved=resolved)
             if kind == "hit":
@@ -2151,8 +2197,8 @@ class ImageTracePlugin(Star):
             async for it in self._trace_hash(event, seg, resolved=resolved):
                 yield it
         finally:
-            if is_tmp:
-                self._remove_quiet(local_path)
+            if resolved.is_tmp:
+                self._remove_quiet(resolved.path)
 
     async def _vector_hits_delivery(
         self, event: AstrMessageEvent, hits: list
@@ -2341,7 +2387,15 @@ class ImageTracePlugin(Star):
         stored = None
         db_saved = False
         try:
-            local_path, is_tmp, fail_message = await self._resolve_local_file(seg)
+            resolved = await self._resolve_local(
+                seg,
+                probe=lambda path: compute_features_with_mime(path, self.hash_size),
+            )
+            local_path, is_tmp, fail_message = (
+                resolved.path,
+                resolved.is_tmp,
+                resolved.message,
+            )
             if not local_path:
                 yield event.plain_result(fail_message)
                 return
@@ -2350,7 +2404,9 @@ class ImageTracePlugin(Star):
                 yield event.plain_result("⚠️ 图片超过大小上限，已取消登记。")
                 return
 
-            feats = await asyncio.to_thread(compute_features, local_path, self.hash_size)
+            feats = resolved.features
+            if feats is None:
+                feats = await asyncio.to_thread(compute_features, local_path, self.hash_size)
             dup = self.library.find_by_phash(feats.phash)
             if dup is not None:
                 yield event.plain_result(self._dup_message(dup))
@@ -2408,6 +2464,7 @@ class ImageTracePlugin(Star):
                             feats.width,
                             feats.height,
                             src=self.bed.src_path_for(stored.url),
+                            mime=resolved.mime,
                         )
                         lines.append("已同步至 Qdrant 向量库")
                     except Exception as e:

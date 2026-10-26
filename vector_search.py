@@ -460,8 +460,14 @@ class VectorEngine:
         # 因此这里无需再做一遍 O(dim) 的二次校验。
         return emb
 
-    async def embed_file(self, path: str) -> list:
-        mime = await asyncio.to_thread(image_mime, path)
+    async def embed_file(self, path: str, *, mime: str | None = None) -> list:
+        """把本地图片向量化；mime 由调用方提供时不再重复探测。
+
+        mime 来自同一张图刚完成的一次解码（compute_features_with_mime 或
+        image_mime），传进来即可省掉 embed_file 自己的 `image_mime()` 解码。
+        """
+        if not mime:
+            mime = await asyncio.to_thread(image_mime, path)
         if mime is None:
             raise VectorEngineError("图片内容无效（下载不完整、链接已过期或格式不受支持）")
         data = await asyncio.to_thread(read_bytes, path)
@@ -1101,20 +1107,25 @@ class VectorEngine:
         width: int | None,
         height: int | None,
         src: str = "",
+        *,
+        mime: str = "",
     ) -> None:
         """写入/覆盖一个向量点。
 
         point_key 为内容指纹（调用方用 pHash 派生）：同图同 ID、与图床 URL
         规则解耦，任何能给出公开直链的图床模式都能同步且幂等。
         src 仅用于兼容图床侧的 payload 约定，插件自身只读 image_url。
+        mime 由调用方在同一次解码里取得时传入，避免 embed_file 与 payload
+        各再解一次图。
         """
-        vector = await self.embed_file(path)
+        # mime 为空时保持单参调用，兼容既有调用方/测试对 embed_file(path) 的替换
+        vector = await (self.embed_file(path, mime=mime) if mime else self.embed_file(path))
         file_name = os.path.basename(urlparse(image_url).path) or os.path.basename(path)
         payload = {
             "src": src or image_url,
             "image_url": image_url,
             "file_name": file_name,
-            "mime": _mime_for(path),
+            "mime": mime or _mime_for(path),
             "size_bytes": int(file_size or 0),
             "width": width,
             "height": height,

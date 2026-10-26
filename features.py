@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 from dataclasses import dataclass
-from functools import cache
+from functools import cache, lru_cache
 
 import numpy as np
 from PIL import Image, ImageOps
@@ -84,10 +85,19 @@ def _dct_matrix(n: int) -> np.ndarray:
     return mat
 
 
-def _load_rgb(path: str) -> Image.Image:
+def _load_rgb_info(path: str, *, require_supported: bool) -> tuple[Image.Image, str | None]:
+    """打开图片并完整解码，同时返回其 MIME（可选要求属于受支持格式）。
+
+    把「解码一次」的产物同时用于格式校验与特征计算，调用方不必再为了拿
+    MIME 或校验而二次 `Image.open()`。require_supported=True 时，格式不在
+    `_MIME_BY_FORMAT` 白名单内直接拒绝（与 image_file_ok 判据一致）。
+    """
     with Image.open(path) as src:  # with 退出时释放原文件句柄
         if src.width * src.height > _MAX_LOAD_PIXELS:
             raise ValueError(f"图片像素数 {src.width}x{src.height} 超过上限 {_MAX_LOAD_PIXELS}")
+        mime = _supported_mime(src)
+        if require_supported and mime is None:
+            raise ValueError(f"不受支持的图片格式: {src.format or '未知'}")
         im = src
         if getattr(im, "is_animated", False):  # 动图先取首帧，再处理方向
             im.seek(0)
@@ -98,7 +108,11 @@ def _load_rgb(path: str) -> Image.Image:
         elif im is src:
             im = src.copy()  # 不向外返回依赖文件句柄的原对象
         im.load()  # 像素读入内存，返回后不再依赖任何文件句柄
-        return im
+        return im, mime
+
+
+def _load_rgb(path: str) -> Image.Image:
+    return _load_rgb_info(path, require_supported=False)[0]
 
 
 def _bits_to_hex(bits: np.ndarray) -> str:
@@ -163,13 +177,27 @@ def _mime_if_decodable(image) -> str | None:
     return mime
 
 
-def image_mime(path: str) -> str | None:
-    """按真实内容识别受支持的图片格式，并完整解码以拒绝截断文件。"""
+@lru_cache(maxsize=64)
+def _image_mime_cached(path: str, _mtime_ns: int, _size: int) -> str | None:
     try:
         with Image.open(path) as image:
             return _mime_if_decodable(image)
     except Exception:
         return None
+
+
+def image_mime(path: str) -> str | None:
+    """按真实内容识别受支持的图片格式，并完整解码以拒绝截断文件。
+
+    结果按 (路径, mtime_ns, size) 缓存：同一次请求里「解析校验 → 取 MIME →
+    登记同步」会对同一张图连续问两三次，每次都完整解码纯属浪费。文件被替换
+    时 mtime/size 变化，缓存自然失效；条目上限 64，不会长期占用内存。
+    """
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return _image_mime_cached(path, stat.st_mtime_ns, stat.st_size)
 
 
 def image_bytes_ok(data: bytes) -> bool:
@@ -214,15 +242,14 @@ def image_file_ok(path: str) -> bool:
     return image_mime(path) is not None
 
 
-def compute_features(path: str, hash_size: int = 16) -> ImageFeatures:
-    """计算图片的感知特征。
-
-    对压缩、缩放、轻微水印有较强鲁棒性；EXIF 方向会自动转正，动图取首帧。
-    """
-    hash_size = int(hash_size)
-    if not 4 <= hash_size <= 32:
+def _validate_hash_size(hash_size: int) -> int:
+    size = int(hash_size)
+    if not 4 <= size <= 32:
         raise ValueError("hash_size 仅支持 4~32")
-    im = _load_rgb(path)
+    return size
+
+
+def _features_from_image(im: Image.Image, hash_size: int) -> ImageFeatures:
     gray = im if im.mode == "L" else im.convert("L")
     return ImageFeatures(
         phash=_phash(gray, hash_size),
@@ -231,3 +258,27 @@ def compute_features(path: str, hash_size: int = 16) -> ImageFeatures:
         width=im.width,
         height=im.height,
     )
+
+
+def compute_features(path: str, hash_size: int = 16) -> ImageFeatures:
+    """计算图片的感知特征。
+
+    对压缩、缩放、轻微水印有较强鲁棒性；EXIF 方向会自动转正，动图取首帧。
+    """
+    size = _validate_hash_size(hash_size)
+    return _features_from_image(_load_rgb(path), size)
+
+
+def compute_features_with_mime(
+    path: str, hash_size: int = 16
+) -> tuple[ImageFeatures, str]:
+    """一次解码同时完成「格式校验 + 感知特征」。
+
+    查询图/登记图的解析与特征计算共用这一次 `Image.open()`：调用方拿到
+    MIME 后可直接传给向量引擎，不必再为同一张图重复解码一次。
+    """
+    size = _validate_hash_size(hash_size)
+    im, mime = _load_rgb_info(path, require_supported=True)
+    if mime is None:
+        raise ValueError("不受支持的图片格式")
+    return _features_from_image(im, size), mime
