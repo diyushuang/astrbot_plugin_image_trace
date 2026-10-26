@@ -67,6 +67,10 @@ RESCAN_BATCH_SIZE = 500
 # 重扫的进度汇报间隔（张数）
 RESCAN_PROGRESS_EVERY = 200
 
+# 重扫的并发解码上限。Pillow 解码期间释放 GIL，线程并行确有收益；取 2 是为了
+# 压住大图（单图最高 50MP）并发时的内存峰值，24k 级图库仍约有一倍提速。
+SCAN_CONCURRENCY = 2
+
 # 字符串型布尔值的真值表；"0"/"false"/"no"/"off" 等一律按假处理
 _TRUTHY = frozenset({"1", "true", "yes", "on", "开"})
 

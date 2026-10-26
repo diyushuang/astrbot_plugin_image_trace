@@ -54,6 +54,7 @@ try:
         RESCAN_BATCH_SIZE,
         RESCAN_PROGRESS_EVERY,
         SCALED_VERIFY_COOLDOWN_SECONDS,
+        SCAN_CONCURRENCY,
         TMP_MAX_AGE_SECONDS,
         as_float,
         as_int,
@@ -65,6 +66,7 @@ try:
     )
     from .features import (
         ImageFeatures,
+        avif_available,
         compute_features,
         heif_available,
         image_bytes_ok,
@@ -135,6 +137,7 @@ except ImportError:  # 兼容插件以独立模块方式加载
         RESCAN_BATCH_SIZE,
         RESCAN_PROGRESS_EVERY,
         SCALED_VERIFY_COOLDOWN_SECONDS,
+        SCAN_CONCURRENCY,
         TMP_MAX_AGE_SECONDS,
         as_float,
         as_int,
@@ -146,6 +149,7 @@ except ImportError:  # 兼容插件以独立模块方式加载
     )
     from features import (  # type: ignore[no-redef]
         ImageFeatures,
+        avif_available,
         compute_features,
         heif_available,
         image_bytes_ok,
@@ -206,7 +210,21 @@ except ImportError:  # 兼容插件以独立模块方式加载
     from vector_search import VectorEngine, VectorEngineError  # type: ignore[no-redef]
 
 PLUGIN_NAME = "astrbot_plugin_image_trace"
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".jfif", ".heic", ".heif"}
+# 扫描目录认可的图片扩展名。TIFF 由 Pillow 原生支持；AVIF 只有 Pillow 11.3+
+# 能解码，旧环境收进来只会让每张 AVIF 都记一条「扫描失败」，故按能力开关。
+IMAGE_EXTS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".webp",
+    ".bmp",
+    ".jfif",
+    ".heic",
+    ".heif",
+    ".tif",
+    ".tiff",
+} | ({".avif"} if avif_available() else set())
 # QQ 开放平台富媒体 file_type：1=图片、2=视频、3=语音、4=文件
 QQ_IMAGE_FILE_TYPE = 1
 
@@ -393,12 +411,28 @@ class ImageTracePlugin(Star):
         return self._bool_cfg("remote_hash_enabled", True) and self.vector.enabled
 
     def _remote_hash_ttl(self) -> int:
-        """缓存最长有效期（秒）。超过后启动时无条件重建，避免长期吃旧快照。"""
+        """缓存最长有效期（秒）。缓存新鲜时启动/溯源都不重新拉取。"""
         return max(300, self._int_cfg("remote_hash_ttl", 21600))
 
     def _remote_hash_max_points(self) -> int:
         """拉取上限（0 = 不限）。用于先小样本验证链路，再放开全量。"""
         return max(0, self._int_cfg("remote_hash_max_points", 0))
+
+    def _remote_hash_cache_fresh(self) -> bool:
+        """本地缓存是否仍在 remote_hash_ttl 有效期内。"""
+        built_at = float(getattr(self.remote_hash, "built_at", 0.0) or 0.0)
+        return built_at > 0 and (time.time() - built_at) < self._remote_hash_ttl()
+
+    def _maybe_start_remote_hash_refresh(self) -> None:
+        """缓存过期或缺失时才启动刷新。
+
+        此前 /溯源 每次都调 start_remote_hash_refresh，而任务完成后 done() 为真，
+        于是刷新完的下一次溯源又会翻一遍全量 Qdrant（2.4 万点/47 页）。用 TTL
+        收口后：缓存新鲜就不刷；过期后由重启或下一次 /溯源 触发一次重建。
+        """
+        if not self.remote_hash_on() or self._remote_hash_cache_fresh():
+            return
+        self.start_remote_hash_refresh()
 
     async def _refresh_remote_hash(self) -> None:
         """从 Qdrant 拉全量 pHash 重建本地索引。异常不出后台任务。"""
@@ -424,6 +458,9 @@ class ImageTracePlugin(Star):
 
     def start_remote_hash_refresh(self) -> None:
         """启动后台刷新任务（幂等）：已有一个在跑就不再起第二个。
+
+        直接调用表示“此刻就刷”；常规入口应走 _maybe_start_remote_hash_refresh，
+        由 remote_hash_ttl 决定要不要刷。
 
         启动即刷新 vs 按需刷新：刷新要翻 ~47 页（2.4 万点），耗时数秒到数十秒。
         放在启动后台跑，首次 /溯源 就能命中；若拖到首次查询再拉，用户会先吃到
@@ -1814,7 +1851,7 @@ class ImageTracePlugin(Star):
     @filter.command("溯源", alias={"找原图"})
     async def trace(self, event: AstrMessageEvent):
         """发送或引用一张图片，按当前引擎（hash/vector/auto）找出相似的原图并回传"""
-        self.start_remote_hash_refresh()  # 兜底周期刷新（幂等）
+        self._maybe_start_remote_hash_refresh()  # 缓存过期才兜底刷新（幂等）
         images = self._extract_images(event)
         if not images:
             yield event.plain_result(self._usage())
@@ -2522,46 +2559,74 @@ class ImageTracePlugin(Star):
             await event.send(
                 event.plain_result(f"开始扫描 {len(valid_dirs)} 个目录，共 {total} 张图片…")
             )
-            for i, path in enumerate(files, 1):
-                if os.path.normcase(path) in known_paths:
-                    skipped += 1
+            concurrency = max(1, SCAN_CONCURRENCY)
+            processed = 0
+            next_report = RESCAN_PROGRESS_EVERY
+            for start in range(0, total, concurrency):
+                batch_paths = files[start : start + concurrency]
+                compute_paths = []
+                for path in batch_paths:
+                    if os.path.normcase(path) in known_paths:
+                        skipped += 1
+                    else:
+                        compute_paths.append(path)
+                if compute_paths:
+                    results = await asyncio.gather(
+                        *(
+                            asyncio.to_thread(compute_features, path, self.hash_size)
+                            for path in compute_paths
+                        ),
+                        return_exceptions=True,
+                    )
                 else:
+                    results = []
+                for path, result in zip(compute_paths, results, strict=True):
+                    if isinstance(result, asyncio.CancelledError):
+                        raise result
+                    if isinstance(result, BaseException):
+                        failed += 1
+                        logger.warning(f"扫描图片失败 {path}: {result}")
+                        continue
+                    feats = result
+                    if feats.phash in known_phashes:
+                        skipped += 1
+                        continue
                     try:
-                        feats = await asyncio.to_thread(compute_features, path, self.hash_size)
-                        if feats.phash in known_phashes:
-                            skipped += 1
-                        else:
-                            known_phashes.add(feats.phash)
-                            pending.append(
-                                {
-                                    "phash": feats.phash,
-                                    "dhash": feats.dhash,
-                                    "ahash": feats.ahash,
-                                    "width": feats.width,
-                                    "height": feats.height,
-                                    "file_size": os.path.getsize(path),
-                                    "file_path": path,
-                                    "source": "scan",
-                                    "note": os.path.basename(path),
-                                }
-                            )
-                            # 批量写入（单事务），避免逐条提交拖慢扫描
-                            if len(pending) >= RESCAN_BATCH_SIZE:
-                                batch = list(pending)
-                                pending.clear()
-                                added += await asyncio.to_thread(
-                                    self.library.add_many, batch, reload_cache=False
-                                )
-                    except Exception as e:
+                        size_bytes = os.path.getsize(path)
+                    except OSError as e:
                         failed += 1
                         logger.warning(f"扫描图片失败 {path}: {e}")
-                if i % RESCAN_PROGRESS_EVERY == 0:
+                        continue
+                    known_phashes.add(feats.phash)
+                    pending.append(
+                        {
+                            "phash": feats.phash,
+                            "dhash": feats.dhash,
+                            "ahash": feats.ahash,
+                            "width": feats.width,
+                            "height": feats.height,
+                            "file_size": size_bytes,
+                            "file_path": path,
+                            "source": "scan",
+                            "note": os.path.basename(path),
+                        }
+                    )
+                    # 批量写入（单事务），避免逐条提交拖慢扫描
+                    if len(pending) >= RESCAN_BATCH_SIZE:
+                        batch = list(pending)
+                        pending.clear()
+                        added += await asyncio.to_thread(
+                            self.library.add_many, batch, reload_cache=False
+                        )
+                processed += len(batch_paths)
+                if processed >= next_report:
                     await event.send(
                         event.plain_result(
-                            f"进度：{i}/{total}，新增 {added + len(pending)}，"
+                            f"进度：{processed}/{total}，新增 {added + len(pending)}，"
                             f"跳过 {skipped}，失败 {failed}"
                         )
                     )
+                    next_report = processed + RESCAN_PROGRESS_EVERY
             if pending:
                 batch = list(pending)
                 pending.clear()
@@ -3853,14 +3918,14 @@ class ImageTracePlugin(Star):
         """AstrBot 在事件循环起来后调用；此时才可以安全创建后台任务。
 
         图床哈希索引的刷新必须在这里启动，不能在 __init__：那会儿还没有运行中
-        的事件循环，asyncio.create_task 会直接抛错。缓存为空时也照常刷新——
-        首次启动后第一次 /溯源 不该因为「索引还没拉」而报未命中。
+        的事件循环，asyncio.create_task 会直接抛错。缓存缺失或超过
+        remote_hash_ttl 时才刷新；缓存新鲜则跳过，避免每次重启都翻一遍全量
+        Qdrant。
         """
         # 提前注册内网直连主机白名单：/原图 可能先于任何随机图命令运行，
         # 而它要取的直链可能是历史里记下的内网地址
         self._random_settings()
-        if self.remote_hash_on():
-            self.start_remote_hash_refresh()
+        self._maybe_start_remote_hash_refresh()
 
     async def terminate(self):
         errors: list[str] = []

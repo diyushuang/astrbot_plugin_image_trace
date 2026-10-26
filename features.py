@@ -20,6 +20,7 @@ from functools import cache
 
 import numpy as np
 from PIL import Image, ImageOps
+from PIL import features as pil_features
 
 try:  # iPhone 默认相册格式 HEIC/HEIF 的解码支持；可选依赖，缺失时按不支持处理
     import pillow_heif
@@ -190,6 +191,18 @@ def image_bytes_ok(data: bytes) -> bool:
 def heif_available() -> bool:
     """服务端是否具备 HEIC/HEIF 解码能力（未装 pillow-heif 时为 False）。"""
     return _HEIF_AVAILABLE
+
+
+def avif_available() -> bool:
+    """服务端 Pillow 是否带 AVIF 解码器（11.3+ 才有）。
+
+    扫描目录据此决定要不要把 `.avif` 纳入图片扩展名：旧版 Pillow 能识别
+    文件头却解不开，收进来只会让每张 AVIF 都记一条「扫描失败」。
+    """
+    try:
+        return bool(pil_features.check("avif"))
+    except Exception:
+        return False
 
 
 def image_file_ok(path: str) -> bool:
