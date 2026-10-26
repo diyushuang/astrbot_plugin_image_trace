@@ -22,7 +22,6 @@ import base64
 import json
 import math
 import os
-import re
 import time
 import uuid
 from typing import Any
@@ -38,18 +37,20 @@ except Exception:  # 兼容独立模块加载/本地自测环境
     logger = logging.getLogger("vector_search")
 
 try:
-    from .common import as_float, as_int
+    from .common import as_float, as_int, read_bytes
     from .features import image_mime
     from .http_client import HttpClientGetter
+    from .random_media import strip_thumbnail_prefix
     from .url_guard import (
         ResponseTooLargeError,
         UrlBlockedError,
         read_limited_text,
     )
 except ImportError:  # 兼容插件以独立模块方式加载
-    from common import as_float, as_int  # type: ignore[no-redef]
+    from common import as_float, as_int, read_bytes  # type: ignore[no-redef]
     from features import image_mime  # type: ignore[no-redef]
     from http_client import HttpClientGetter  # type: ignore[no-redef]
+    from random_media import strip_thumbnail_prefix  # type: ignore[no-redef]
     from url_guard import (  # type: ignore[no-redef]
         ResponseTooLargeError,
         UrlBlockedError,
@@ -121,11 +122,6 @@ def _invalid_json_context(text: str, exc: InvalidEmbeddingJSON) -> str:
 
 def _mime_for(path: str) -> str:
     return image_mime(path) or "image/jpeg"
-
-
-def _read_bytes(path: str) -> bytes:
-    with open(path, "rb") as f:
-        return f.read()
 
 
 def thumb_path_key(url) -> str:
@@ -460,21 +456,15 @@ class VectorEngine:
                 detail=f"embedding 响应解析失败: {e}",
             ) from e
 
-        if not isinstance(emb, list) or not emb:
-            raise VectorEngineError("embedding 响应缺少 data[0].embedding")
-        for n in emb:
-            if not isinstance(n, (int, float)):
-                raise VectorEngineError("embedding 结果含非数值元素")
-        vector = [float(n) for n in emb]
-        if any(not math.isfinite(value) for value in vector):
-            raise VectorEngineError("向量服务返回了非有限数值")
-        return vector
+        # parse_embedding_response 已保证：非空 list[float]、逐元素为数值且有限，
+        # 因此这里无需再做一遍 O(dim) 的二次校验。
+        return emb
 
     async def embed_file(self, path: str) -> list:
         mime = await asyncio.to_thread(image_mime, path)
         if mime is None:
             raise VectorEngineError("图片内容无效（下载不完整、链接已过期或格式不受支持）")
-        data = await asyncio.to_thread(_read_bytes, path)
+        data = await asyncio.to_thread(read_bytes, path)
         return await self.embed_bytes(data, mime)
 
     # ------------------------------------------------------------------
@@ -694,14 +684,8 @@ class VectorEngine:
         target = str(thumb_url or "").strip()
         if not target:
             return None
-        if not self.qdrant_ready:
-            self._debug_disabled("按缩略图直链反查原图直链")
-            return None
-        payload = await self._payload_by_thumb(target)
-        if payload is None:
-            return None
-        original = str(payload.get("image_url") or "").strip()
-        return original or None
+        info = await self.original_info_for_thumb(target)
+        return info["url"] if info else None
 
     async def original_info_for_thumb(self, thumb_url: str) -> dict | None:
         """按缩略图直链取回**整个原图点**的信息：{"url": …, "file_name": …}。
@@ -774,9 +758,9 @@ class VectorEngine:
         name = unquote(raw.rsplit("/", 1)[-1]).strip()
         if not name or "." not in name:
             return None
-        # 与 random_media.THUMBNAIL_PREFIX_PATTERN 保持同一口径：只剥起始的
-        # 「10 位以上数字 + 下划线」，不做任何猜测性还原（`@`→`_` 不可逆）
-        stripped = re.sub(r"^\d{10,}_", "", name).strip()
+        # 与 random_media 共用同一份清洗口径：只剥起始的「10 位以上数字 + 下划线」，
+        # 不做任何猜测性还原（`@`→`_` 不可逆）
+        stripped = strip_thumbnail_prefix(name).strip()
         if not stripped:
             return None
         query_filter = {"must": [{"key": "thumb_url", "match": {"text": stripped}}]}
@@ -793,7 +777,7 @@ class VectorEngine:
             # 剥掉毫秒前缀（`strip_leading_decoration` 就会剥），而库里存的
             # `thumb_url` 一定带前缀——只比原始形态会漏掉这种最常见的情形
             # （实测：带前缀的名字能命中，剥掉前缀后命中数直接从 1 掉到 0）。
-            base_stripped = re.sub(r"^\d{10,}_", "", base).strip()
+            base_stripped = strip_thumbnail_prefix(base).strip()
             if base in (name, stripped) or base_stripped in (name, stripped):
                 hits.append(payload)
         if not hits:
@@ -1008,7 +992,9 @@ class VectorEngine:
         target = str(thumb_url or "").strip()
         if not target:
             return None
-        for candidate in (target, target.rstrip("/")):
+        # 无尾斜杠时 rstrip 的结果与 target 相同：用 dict.fromkeys 保序去重，
+        # 避免把同一条精确查询连发两遍（落空时白花一次 count 请求）。
+        for candidate in dict.fromkeys((target, target.rstrip("/"))):
             payload = await self._payload_by_thumb_exact(candidate)
             if payload is not None:
                 return payload

@@ -115,6 +115,36 @@ class MediaHistory:
         """该会话当前记录的历史键数（0 表示尚未回传过任何图片）。"""
         return len(self._history.get(self._key(session)) or {})
 
+    def repair_keys(self, cleaner) -> int:
+        """把带装饰前缀的历史键改名成 cleaner 处理后的干净形态，返回条数。
+
+        做的是**改名而非删除**：URL 是好的，脏的只是键。逐会话处理并保持
+        原有的 LRU 语义（清理后的键移到末尾、同键去重、超限裁剪），同时
+        回收被清空的会话，避免长期运行下沉淀空 OrderedDict。
+
+        与 `forget` 的区别：`forget` 是按谓词跨会话删除；这里只处理“cleaner
+        能改变名字”的键，并且改名后仍保留在原会话里。
+        """
+        repaired = 0
+        for session_key in list(self._history):
+            history = self._history[session_key]
+            dirty: list[tuple[str, str, str]] = []
+            for name, url in history.items():
+                cleaned = cleaner(name)
+                if cleaned and cleaned != name:
+                    dirty.append((name, cleaned, url))
+            for name, _cleaned, _url in dirty:
+                del history[name]
+            for _name, cleaned, url in dirty:
+                history.pop(cleaned, None)
+                history[cleaned] = url
+                repaired += 1
+            while len(history) > self._max_per_session:
+                history.popitem(last=False)
+            if not history:
+                self._history.pop(session_key, None)
+        return repaired
+
     def forget(self, matcher) -> int:
         """删除**所有会话**中满足 matcher(name) 的历史键，返回删除条数。
 

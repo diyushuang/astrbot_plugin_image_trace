@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import io
 import os
 import random
@@ -56,8 +57,10 @@ try:
         TMP_MAX_AGE_SECONDS,
         as_float,
         as_int,
+        bool_or,
         is_blank,
         is_qq_image_bed_host,
+        read_bytes,
         truthy,
     )
     from .features import (
@@ -135,8 +138,10 @@ except ImportError:  # 兼容插件以独立模块方式加载
         TMP_MAX_AGE_SECONDS,
         as_float,
         as_int,
+        bool_or,
         is_blank,
         is_qq_image_bed_host,
+        read_bytes,
         truthy,
     )
     from features import (  # type: ignore[no-redef]
@@ -434,11 +439,6 @@ class ImageTracePlugin(Star):
     # 配置读取
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _is_blank(value) -> bool:
-        """未配置：None 或空白字符串（0 是合法取值，不能按假值处理）。"""
-        return is_blank(value)
-
     def _dict_cfg(self, key: str) -> dict:
         """取对象型配置；手工改坏配置（非 dict）时退化为空 dict 而不是抛错。"""
         value = self.config.get(key)
@@ -473,10 +473,7 @@ class ImageTracePlugin(Star):
 
     def _bool_cfg(self, key: str, default: bool) -> bool:
         """布尔配置：未配置（缺键/空串/null）时取默认值，与数值配置口径一致。"""
-        value = self._cfg(key)
-        if self._is_blank(value):
-            return default
-        return truthy(value)
+        return bool_or(self._cfg(key), default)
 
     def _migrate_config_layout(self) -> None:
         """把旧布局搬进 basic / delivery / limits（一次性，带版本标记）。
@@ -625,12 +622,12 @@ class ImageTracePlugin(Star):
         if mode not in BUCKET_MODES:
             return None
         missing = [
-            f"storage_bucket.{k}" for k in BUCKET_REQUIRED[mode] if self._is_blank(raw.get(k))
+            f"storage_bucket.{k}" for k in BUCKET_REQUIRED[mode] if is_blank(raw.get(k))
         ]
         if (
             mode == "oracle_oci"
             and not truthy(raw.get("oci_public_bucket"))
-            and self._is_blank(raw.get("oci_public_base_url"))
+            and is_blank(raw.get("oci_public_base_url"))
         ):
             missing.append(
                 "storage_bucket.oci_public_bucket / oci_public_base_url（公开直链二选一）"
@@ -674,7 +671,7 @@ class ImageTracePlugin(Star):
 
     def _vector_index_on_register(self) -> bool:
         value = self._dict_cfg("vector_search").get("vector_index_on_register")
-        if self._is_blank(value):
+        if is_blank(value):
             return True
         return truthy(value)
 
@@ -793,6 +790,35 @@ class ImageTracePlugin(Star):
             "文件可能已损坏或格式不受当前服务端支持，详情见机器人日志。"
         )
 
+    def _download_limit_bytes(self) -> int:
+        """回传兜底下载的大小上限（字节）：limits.max_download_mb。"""
+        return max(1, self._int_cfg("max_download_mb", 20)) * 1024 * 1024
+
+    @staticmethod
+    def _download_timeout() -> aiohttp.ClientTimeout:
+        """兜底下载/格式体检统一的出网超时。"""
+        return aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)
+
+    async def _stream_response_to_temp(self, resp, limit: int) -> str:
+        """把已打开的响应流式写入临时文件，返回路径；超限或失败即删文件。
+
+        临时文件名完全不受外部输入影响（固定扩展名），图片解码由 Pillow
+        按内容判断，与扩展名无关。
+        """
+        path = os.path.join(self.tmp_dir, f"q_{secrets.token_hex(8)}.jpg")
+        try:
+            received = 0
+            with open(path, "wb") as file:
+                async for chunk in resp.content.iter_chunked(DOWNLOAD_CHUNK_SIZE):
+                    received += len(chunk)
+                    if received > limit:
+                        raise ValueError("图片超过大小上限")
+                    file.write(chunk)
+        except Exception:
+            self._remove_quiet(path)
+            raise
+        return path
+
     async def _download(self, url: str, *, size_limit: int | None = None) -> str:
         """下载到临时文件，返回路径。
 
@@ -804,62 +830,45 @@ class ImageTracePlugin(Star):
         limit = (
             size_limit
             if size_limit is not None and size_limit > 0
-            else max(1, self._int_cfg("max_download_mb", 20)) * 1024 * 1024
+            else self._download_limit_bytes()
         )
-        timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)
-        # 临时文件名完全不受外部输入影响（固定扩展名），
-        # 图片解码由 Pillow 按内容判断，与扩展名无关
-        path = os.path.join(self.tmp_dir, f"q_{secrets.token_hex(8)}.jpg")
-        try:
-            async with await client.request(
-                "GET",
-                url,
-                # prepare 契约为三参（url, method, cross_origin），签名不符
-                # 会在请求发出前就 TypeError
-                prepare=self._image_download_headers,
-                timeout=timeout,
-            ) as resp:
-                resp.raise_for_status()
-                declared = resp.headers.get("Content-Length", "")
-                if declared.isdigit() and int(declared) > limit:
-                    raise ValueError("图片超过大小上限")
-                received = 0
-                with open(path, "wb") as f:
-                    async for chunk in resp.content.iter_chunked(DOWNLOAD_CHUNK_SIZE):
-                        received += len(chunk)
-                        if received > limit:
-                            raise ValueError("图片超过大小上限")
-                        f.write(chunk)
-        except Exception:
-            self._remove_quiet(path)
-            raise
-        return path
+        async with await client.request(
+            "GET",
+            url,
+            # prepare 契约为三参（url, method, cross_origin），签名不符
+            # 会在请求发出前就 TypeError
+            prepare=self._image_download_headers,
+            timeout=self._download_timeout(),
+        ) as resp:
+            resp.raise_for_status()
+            declared = resp.headers.get("Content-Length", "")
+            if declared.isdigit() and int(declared) > limit:
+                raise ValueError("图片超过大小上限")
+            return await self._stream_response_to_temp(resp, limit)
 
     async def _download_bytes(self, url: str) -> bytes:
-        """下载到内存；声明体积超过内存阈值时退回落盘实现再读回。
+        """下载到内存；声明体积超过内存阈值时退回落盘读回。
 
-        回退交付只需要字节（压缩、发送都在内存里完成），落盘再读回纯属多余
-        的两次文件操作。内存占用由两道闸门控制：声明长度超过
-        MEMORY_DOWNLOAD_MAX_BYTES 时直接改走落盘；声明长度未知（分块传输）时
-        仍读内存，但受 max_download_mb 上限约束——阈值取 8MB 而非上限值，正是
-        为了让「未知长度」这种情况也留在可控范围内（并发上限 3，最坏约 24MB）。
+        回退交付只需要字节（压缩、发送都在内存里完成）。内存占用由两道闸门
+        控制：声明长度超过 MEMORY_DOWNLOAD_MAX_BYTES 时改走落盘；声明长度未知
+        （分块传输）时仍读内存，但受 max_download_mb 上限约束——阈值取 8MB 而非
+        上限值，正是为了让「未知长度」这种情况也留在可控范围内（并发上限 3，
+        最坏约 24MB）。大图分支直接复用当前已打开的响应落盘，不再发第二次 GET。
         """
         client = await self._get_http()
-        size_limit = max(1, self._int_cfg("max_download_mb", 20)) * 1024 * 1024
-        timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)
+        size_limit = self._download_limit_bytes()
         async with await client.request(
-            "GET", url, prepare=self._image_download_headers, timeout=timeout
+            "GET", url, prepare=self._image_download_headers, timeout=self._download_timeout()
         ) as resp:
             resp.raise_for_status()
             declared = resp.headers.get("Content-Length", "")
             if declared.isdigit() and int(declared) > size_limit:
                 raise ValueError("图片超过大小上限")
             if declared.isdigit() and int(declared) > MEMORY_DOWNLOAD_MAX_BYTES:
-                # 大图不冒险占内存：交回落盘实现
-                await resp.release()
-                path = await self._download(url)
+                # 大图不冒险占内存：复用当前响应落盘后读回
+                path = await self._stream_response_to_temp(resp, size_limit)
                 try:
-                    return await asyncio.to_thread(self._read_file_bytes, path)
+                    return await asyncio.to_thread(read_bytes, path)
                 finally:
                     self._remove_quiet(path)
             buffer = io.BytesIO()
@@ -1108,9 +1117,9 @@ class ImageTracePlugin(Star):
             "default_dir": str(raw.get("default_dir") or "").strip(),
             "timeout": timeout,
             "retry_count": bounded_int(raw.get("retry_count"), 3, 0, 10),
-            "show_file_info": self._random_bool(raw.get("show_file_info"), True),
-            "enable_llm": self._random_bool(raw.get("enable_llm"), True),
-            "send_thumbnail": self._random_bool(raw.get("send_thumbnail"), True),
+            "show_file_info": bool_or(raw.get("show_file_info"), True),
+            "enable_llm": bool_or(raw.get("enable_llm"), True),
+            "send_thumbnail": bool_or(raw.get("send_thumbnail"), True),
         }
 
     @staticmethod
@@ -1145,13 +1154,6 @@ class ImageTracePlugin(Star):
         return delivery_target(
             platform, has_bot=getattr(event, "bot", None) is not None
         )
-
-    @staticmethod
-    def _random_bool(value, default: bool) -> bool:
-        """random_media 组的布尔取值：未配置取默认，其余按真值表解释。"""
-        if is_blank(value):
-            return default
-        return truthy(value)
 
     def _random_client(self) -> RandomMediaClient:
         """惰性构造随机图客户端；配置在插件加载时读入，改动后重载生效。"""
@@ -1210,11 +1212,6 @@ class ImageTracePlugin(Star):
         except Exception:
             return []
         return [Comp.At(qq=sender)] if sender else []
-
-    @staticmethod
-    def _read_file_bytes(path: str) -> bytes:
-        with open(path, "rb") as file:
-            return file.read()
 
     @staticmethod
     def _event_already_sent(event: AstrMessageEvent) -> bool:
@@ -1402,7 +1399,7 @@ class ImageTracePlugin(Star):
                 return None
             if validate and not await asyncio.to_thread(image_file_ok, path):
                 return None
-            return await asyncio.to_thread(self._read_file_bytes, path)
+            return await asyncio.to_thread(read_bytes, path)
         except Exception as exc:
             logger.warning(f"读取回传图片失败: {exc}")
             return None
@@ -1920,13 +1917,22 @@ class ImageTracePlugin(Star):
             return note
         return (getattr(match, "file_name", "") or "").strip()
 
-    async def _trace_hash(self, event: AstrMessageEvent, seg) -> AsyncGenerator:
+    async def _trace_hash(self, event: AstrMessageEvent, seg, resolved=None) -> AsyncGenerator:
+        """哈希检索；resolved 供 auto 引擎复用已解析的本地文件（含清理责任）。
+
+        resolved 为 (路径, 是否临时文件, 失败提示)；传了它表示调用方已解析过
+        这张图，本方法不负责删除临时文件（由调用方统一清理）。
+        """
         threshold = self.hash_threshold
         top_n = self.top_n
         local_path = ""
         is_tmp = False
+        owns_temp = resolved is None
         try:
-            local_path, is_tmp, fail_message = await self._resolve_local_file(seg)
+            if resolved is None:
+                local_path, is_tmp, fail_message = await self._resolve_local_file(seg)
+            else:
+                local_path, is_tmp, fail_message = resolved
             if not local_path:
                 yield event.plain_result(fail_message)
                 return
@@ -1957,7 +1963,7 @@ class ImageTracePlugin(Star):
             logger.error(f"图片溯源处理失败: {e}", exc_info=True)
             yield event.plain_result("⚠️ 处理图片时出错，详情请查看机器人日志。")
         finally:
-            if is_tmp:
+            if owns_temp and is_tmp:
                 self._remove_quiet(local_path)
 
     async def _hash_hit_result(self, event: AstrMessageEvent, best) -> AsyncGenerator:
@@ -2001,16 +2007,23 @@ class ImageTracePlugin(Star):
     # 向量引擎
     # ------------------------------------------------------------------
 
-    async def _vector_search_one(self, event, seg):
+    async def _vector_search_one(self, event, seg, resolved=None):
         """单图向量检索。返回 (kind, item)：hit / miss / nofile / error。
 
         hit/miss/nofile 时 item 为可直接 yield 的结果对象；error 时 item 为错误说明字符串。
+
+        resolved 供 auto 引擎复用已解析的本地文件：传了它（(路径, 是否临时文件,
+        失败提示)）就不再重复下载/解码，且临时文件由调用方统一清理。
         """
         top_n = self.top_n
         local_path = ""
         is_tmp = False
+        owns_temp = resolved is None
         try:
-            local_path, is_tmp, fail_message = await self._resolve_local_file(seg)
+            if resolved is None:
+                local_path, is_tmp, fail_message = await self._resolve_local_file(seg)
+            else:
+                local_path, is_tmp, fail_message = resolved
             if not local_path:
                 return "nofile", event.plain_result(fail_message)
             vector = await self.vector.embed_file(local_path)
@@ -2047,7 +2060,7 @@ class ImageTracePlugin(Star):
             logger.error("向量检索异常", exc_info=True)
             return "error", "内部错误（详见机器人日志）"
         finally:
-            if is_tmp:
+            if owns_temp and is_tmp:
                 self._remove_quiet(local_path)
 
     async def _trace_vector(self, event: AstrMessageEvent, seg) -> AsyncGenerator:
@@ -2062,33 +2075,47 @@ class ImageTracePlugin(Star):
             yield item
 
     async def _trace_auto(self, event: AstrMessageEvent, seg) -> AsyncGenerator:
-        """auto 引擎：向量优先，未命中或引擎不可用时回退哈希。"""
-        kind, item = await self._vector_search_one(event, seg)
-        if kind == "hit":
-            async for result in item:
-                yield result
+        """auto 引擎：向量优先，未命中或引擎不可用时回退哈希。
+
+        图片只解析一次：向量检索与哈希回退共用同一份本地文件，避免在“向量未
+        命中”这条最常见的路径上重复下载与完整解码。临时文件由这里的 finally
+        统一清理（两个下游方法在收到 resolved 时都不再负责删除）。
+        """
+        local_path, is_tmp, fail_message = await self._resolve_local_file(seg)
+        if not local_path:
+            yield event.plain_result(fail_message)
             return
-        if kind == "nofile":
-            yield item
-            return
-        hash_empty = self._hash_pool_size() == 0
-        if kind == "miss":
-            yield item
-            if hash_empty:
-                yield event.plain_result("（哈希图库为空，无兜底可执行）")
+        resolved = (local_path, is_tmp, "")
+        try:
+            kind, item = await self._vector_search_one(event, seg, resolved=resolved)
+            if kind == "hit":
+                async for result in item:
+                    yield result
                 return
-            yield event.plain_result("尝试哈希比对：")
-        else:  # error
-            logger.info(f"auto 引擎回退哈希：{item}")
-            if hash_empty:
-                yield event.plain_result(
-                    "⚠️ 向量引擎不可用，且哈希图库为空，无兜底可执行。"
-                    "可发送 /登记原图 或执行 /溯源重扫 建库。"
-                )
+            if kind == "nofile":
+                yield item
                 return
-            yield event.plain_result("⚠️ 向量引擎不可用，改用哈希比对：")
-        async for it in self._trace_hash(event, seg):
-            yield it
+            hash_empty = self._hash_pool_size() == 0
+            if kind == "miss":
+                yield item
+                if hash_empty:
+                    yield event.plain_result("（哈希图库为空，无兜底可执行）")
+                    return
+                yield event.plain_result("尝试哈希比对：")
+            else:  # error
+                logger.info(f"auto 引擎回退哈希：{item}")
+                if hash_empty:
+                    yield event.plain_result(
+                        "⚠️ 向量引擎不可用，且哈希图库为空，无兜底可执行。"
+                        "可发送 /登记原图 或执行 /溯源重扫 建库。"
+                    )
+                    return
+                yield event.plain_result("⚠️ 向量引擎不可用，改用哈希比对：")
+            async for it in self._trace_hash(event, seg, resolved=resolved):
+                yield it
+        finally:
+            if is_tmp:
+                self._remove_quiet(local_path)
 
     async def _vector_hits_delivery(
         self, event: AstrMessageEvent, hits: list
@@ -2174,11 +2201,19 @@ class ImageTracePlugin(Star):
             prompt_task = asyncio.create_task(self._send_prompt(event, header))
         else:
             yield event.plain_result(header)
-        async for result in self._yield_delivery(event, "", blocks, mark_compressed=True):
-            yield result
-        if prompt_task is not None:
-            # 只为 stop_event 决策等待提示结果；图片可能已经交付，不再回滚。
-            prompt_via_onebot = await prompt_task
+        try:
+            async for result in self._yield_delivery(event, "", blocks, mark_compressed=True):
+                yield result
+            if prompt_task is not None:
+                # 只为 stop_event 决策等待提示结果；图片可能已经交付，不再回滚。
+                prompt_via_onebot = await prompt_task
+                prompt_task = None
+        finally:
+            # 投递层异常或消费者提前退出时回收提示任务，避免留下悬挂任务。
+            if prompt_task is not None:
+                prompt_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await prompt_task
         # 提示用 OneBot 原生发出（图片那条未必）时，仍按旧语义停事件；若图片
         # 那条也走了 OneBot，_yield_delivery 已停过，这里重复调用无副作用。
         # 放在 yield 之后：第二条消息已经交付，停事件不会把它吞掉。
@@ -2273,8 +2308,8 @@ class ImageTracePlugin(Star):
             if not local_path:
                 yield event.plain_result(fail_message)
                 return
-            size_limit = max(1, self._int_cfg("max_download_mb", 20)) * 1024 * 1024
-            if os.path.getsize(local_path) > size_limit:
+            size_bytes = os.path.getsize(local_path)
+            if size_bytes > self._download_limit_bytes():
                 yield event.plain_result("⚠️ 图片超过大小上限，已取消登记。")
                 return
 
@@ -2291,7 +2326,7 @@ class ImageTracePlugin(Star):
                 "ahash": feats.ahash,
                 "width": feats.width,
                 "height": feats.height,
-                "file_size": os.path.getsize(local_path),
+                "file_size": size_bytes,
                 "image_url": stored.url or "",
                 "file_path": stored.file_path or "",
                 "source": "register",
@@ -2332,7 +2367,7 @@ class ImageTracePlugin(Star):
                             # 内容指纹作为 point id：同图同 ID，与图床 URL 规则无关
                             f"phash:{feats.phash}",
                             stored.url,
-                            os.path.getsize(local_path),
+                            size_bytes,
                             feats.width,
                             feats.height,
                             src=self.bed.src_path_for(stored.url),
@@ -2687,11 +2722,11 @@ class ImageTracePlugin(Star):
     def _first_image_candidate(cls, event: AstrMessageEvent) -> str:
         """从本条消息/被引用消息的图片段里取一个**原始**文件名或直链。
 
-        与 _first_image_name 的区别：这里**不做任何清洗**，原样返回。这一点是
-        必须的——调用方要先用 is_thumbnail_url 判定它是否指向缩略图，而那个
-        判据依赖路径里的 `thumbnails/` 段；若先清洗成"裸文件名"，路径信息就
-        丢了，判定会失效（实测：清洗后的名字 is_thumbnail_url 返回 False，
-        于是缩略图检查形同虚设）。
+        这里**不做任何清洗**，原样返回。这一点是必须的——调用方要先用
+        is_thumbnail_url 判定它是否指向缩略图，而那个判据依赖路径里的
+        `thumbnails/` 段；若先清洗成"裸文件名"，路径信息就丢了，判定会失效
+        （实测：清洗后的名字 is_thumbnail_url 返回 False，于是缩略图检查形同
+        虚设）。需要干净展示名时由调用方再走 clean_display_name。
 
         取不到返回空串。
         """
@@ -2702,19 +2737,6 @@ class ImageTracePlugin(Star):
                     return raw
         return ""
 
-    @classmethod
-    def _first_image_name(cls, event: AstrMessageEvent) -> str:
-        """从本条消息/被引用消息的图片段里取一个适合直查图床的**干净文件名**。
-
-        供无参 /原图 在会话历史为空时退化为直查：引用一张图发 /原图，即按
-        该图文件名去图床找原图。
-
-        取到的名字可能是**缩略图改名后的形态**（图床给缩略图前置了毫秒时间戳、
-        把 `@` 换成 `_`），故这里只做**清洗**（去时间戳前缀）供展示与去重；
-        是否指向缩略图由调用方用 _first_image_candidate + is_thumbnail_url 判定。
-        """
-        return clean_display_name(cls._first_image_candidate(event)) or ""
-
     @staticmethod
     def _original_usage() -> str:
         return (
@@ -2723,6 +2745,28 @@ class ImageTracePlugin(Star):
             "· /原图 —— 取本会话最近回传过的图片的原图\n"
             "· 引用一张图发送 /原图 —— 按该图文件名到图床取原图"
         )
+
+    async def _reverse_original(self, fetch, *, action: str, level: str = "warning") -> tuple[str, str]:
+        """执行一次原图反查，返回 (payload 原名, 还原后的原图直链)。
+
+        三个反查入口（缩略图直链 / 缩略图名 / 裸文件名）共用这段“不可用判定 →
+        调用 → 异常只记日志 → 取 url → 按原图口径剥离处理参数”的骨架；各自的
+        展示名回退顺序不同，留在调用点处理，避免把三种文案揉进一个函数。
+        查不到/不可用一律返回 ("", "")，永不抛错。
+        """
+        if not self.vector.qdrant_ready:
+            return "", ""
+        try:
+            info = await fetch()
+        except Exception as exc:  # 反查方法自身已兜错，这里再保一层
+            getattr(logger, level)(f"{action}失败: {exc}")
+            return "", ""
+        if not isinstance(info, dict):
+            return "", ""
+        original = str(info.get("url") or "").strip()
+        if not original:
+            return "", ""
+        return str(info.get("file_name") or "").strip(), build_original_url(original)
 
     async def _original_from_thumbnail(self, thumb_ref: str) -> tuple[str, str]:
         """把「指向缩略图的直链或名字」换成它对应的原图 (名称, 直链)。
@@ -2765,25 +2809,16 @@ class ImageTracePlugin(Star):
             return "", ""
         # 关键：还原到**原始未编码**形态（payload.thumb_url 就是这么存的），
         # 同时去掉可能残留的处理参数（width/height/fit/fallback）
-        thumb_url = unquote(build_original_url(full)) if "?" in full else unquote(full)
-        info = None
-        try:
-            info = await self.vector.original_info_for_thumb(thumb_url)
-        except Exception as exc:  # original_info_for_thumb 已兜错，这里再保一层
-            logger.warning(f"缩略图反查原图失败: {exc}")
-            info = None
-        if not info or not info.get("url"):
-            return "", ""
-        # 展示名**必须**取 payload 里的 file_name：缩略图名的 `@`→`_` 不可逆，
-        # 光清洗缩略图名还原不出真名（实测 payload.file_name 才是原始名）
-        display = (
-            str(info.get("file_name") or "").strip()
-            or clean_display_name(info["url"])
-            or clean_display_name(reference)
-            or ""
+        thumb_url = unquote(build_original_url(full))
+        display, url = await self._reverse_original(
+            lambda: self.vector.original_info_for_thumb(thumb_url),
+            action="缩略图反查原图",
         )
-        # 反查到的原图直链可能带处理参数（图床缓存过的形态），按原图口径还原
-        return display, build_original_url(info["url"])
+        if not url:
+            return "", ""
+        # 展示名**必须**优先取 payload 里的 file_name：缩略图名的 `@`→`_` 不可逆，
+        # 光清洗缩略图名还原不出真名（实测 payload.file_name 才是原始名）
+        return display or clean_display_name(url) or clean_display_name(reference) or "", url
 
     async def _original_from_thumb_name(self, name: str) -> tuple[str, str]:
         """按「缩略图改名后的文件名」反查原图 (名称, 直链)；查不到返回 ("", "")。
@@ -2801,19 +2836,14 @@ class ImageTracePlugin(Star):
         query = str(name or "").strip()
         if not query:
             return "", ""
-        try:
-            info = await self.vector.original_info_for_thumb_name(query)
-        except Exception as exc:  # original_info_for_thumb_name 已兜错，再保一层
-            logger.debug(f"按缩略图名反查原图失败: {exc}")
-            info = None
-        if not info or not info.get("url"):
-            return "", ""
-        display = (
-            str(info.get("file_name") or "").strip()
-            or clean_display_name(info["url"])
-            or query
+        display, url = await self._reverse_original(
+            lambda: self.vector.original_info_for_thumb_name(query),
+            action="按缩略图名反查原图",
+            level="debug",
         )
-        return display, build_original_url(info["url"])
+        if not url:
+            return "", ""
+        return display or clean_display_name(url) or query, url
 
     async def _lookup_imgbed_file(self, name: str, *, quoted: str = "") -> tuple[str, str, str]:
         """按文件名到图床直查原图，返回 (名称, 直链, 失败提示)。
@@ -2953,16 +2983,13 @@ class ImageTracePlugin(Star):
         query = str(name or "").strip()
         if not query or "/" in query or not self.vector.qdrant_ready:
             return "", ""
-        try:
-            info = await self.vector.original_by_file_name(query)
-        except Exception as exc:  # original_by_file_name 已兜错，这里再保一层
-            logger.warning(f"按文件名反查原图失败: {exc}")
+        display, url = await self._reverse_original(
+            lambda: self.vector.original_by_file_name(query),
+            action="按文件名反查原图",
+        )
+        if not url:
             return "", ""
-        if not info or not info.get("url"):
-            return "", ""
-        display = str(info.get("file_name") or "").strip() or query
-        # 反查到的直链可能带图床处理参数，按原图口径还原（剥离 width/height 等）
-        return display, build_original_url(info["url"])
+        return display or query, url
 
     @filter.command("原图修复")
     async def original_repair(self, event: AstrMessageEvent):
@@ -2999,23 +3026,10 @@ class ImageTracePlugin(Star):
         """把会话历史里带装饰前缀的键改名成干净形态；返回处理条数。
 
         做的是**改名而非删除**：URL 是好的，脏的只是键。直接删会让用户白白
-        丢掉一条本来可用的历史，改名则让它立刻变成可命中的干净键。
-        新旧键只差前缀时用 `remember` 重写（它自带去重与 LRU 归位）；若该键
-        已被清理过（改名后与既有键重合），`remember` 的「先删后插」正好完成合并。
+        丢掉一条本来可用的历史，改名则让它立刻变成可命中的干净键。改名与
+        LRU 归位由 MediaHistory.repair_keys 统一处理（不再访问其私有结构）。
         """
-        history = getattr(self.history, "_history", None)
-        if not isinstance(history, dict):
-            return 0
-        dirty: list[tuple[str, str, str]] = []
-        for session_key, entries in list(history.items()):
-            for key, url in list(entries.items()):
-                cleaned = clean_display_name(key)
-                if cleaned and cleaned != key:
-                    dirty.append((session_key, key, url))
-        for session_key, key, url in dirty:
-            self.history.forget(lambda name, _k=key: name == _k)
-            self.history.remember(session_key, url, display_name=clean_display_name(key))
-        return len(dirty)
+        return self.history.repair_keys(clean_display_name)
 
     @filter.command("原图")
     async def original_image(self, event: AstrMessageEvent):
@@ -3302,9 +3316,10 @@ class ImageTracePlugin(Star):
         """
         try:
             client = await self._get_http()
-            limit = max(1, self._int_cfg("max_download_mb", 20)) * 1024 * 1024
-            timeout = aiohttp.ClientTimeout(total=max(5.0, float(DOWNLOAD_TIMEOUT)))
-            async with await client.request("GET", url, timeout=timeout) as resp:
+            limit = self._download_limit_bytes()
+            async with await client.request(
+                "GET", url, timeout=self._download_timeout()
+            ) as resp:
                 if not 200 <= resp.status < 300:
                     return None
                 head = await resp.content.read(16)

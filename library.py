@@ -258,23 +258,21 @@ class ImageLibrary:
         """重建内存哈希矩阵；批量插入完成后调用一次即可。"""
         self._reload_cache()
 
-    def delete(self, entry_id: int) -> bool:
+    def _delete_where(self, sql: str, params: tuple) -> int:
+        """按条件删除记录，返回删除条数；有删除时重建内存索引。"""
         with self._lock:
-            cursor = self._conn.execute("DELETE FROM images WHERE id = ?", (entry_id,))
-            self._conn.commit()
-            deleted = cursor.rowcount > 0
-        if deleted:
-            self._reload_cache()
-        return deleted
-
-    def delete_by_source(self, source: str) -> int:
-        with self._lock:
-            cursor = self._conn.execute("DELETE FROM images WHERE source = ?", (source,))
+            cursor = self._conn.execute(sql, params)
             self._conn.commit()
             deleted = cursor.rowcount
         if deleted:
             self._reload_cache()
         return deleted
+
+    def delete(self, entry_id: int) -> bool:
+        return self._delete_where("DELETE FROM images WHERE id = ?", (entry_id,)) > 0
+
+    def delete_by_source(self, source: str) -> int:
+        return self._delete_where("DELETE FROM images WHERE source = ?", (source,))
 
     def prune_scan_missing(self, keep_paths: set, scanned_dirs: set | None = None) -> int:
         """删除来源为 scan、文件路径不在 keep_paths 中的条目，返回删除数量。

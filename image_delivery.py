@@ -224,7 +224,6 @@ def delivery_target(platform: str, *, has_bot: bool = True) -> DeliveryTarget:
 #
 # 通道选择是纯决策，放本模块便于单测；网络请求与消息发送在 main.py。
 
-QQ_UPLOAD_CHANNELS = frozenset({"native", "bytes", "url", "url-scaled"})
 QQ_AUTO_PREFER = frozenset({"bytes", "url"})
 # auto 偏好的旧写法（统一命名前叫 chunked）
 LEGACY_AUTO_PREFER = {"chunked": "bytes"}
@@ -533,6 +532,32 @@ def _requote_imgbed_path(file_path: str) -> str:
     return quote(file_path, safe="/:")
 
 
+def _imgbed_query_pairs(parsed) -> list[tuple[str, str]]:
+    """保留查询串中所有非 ImgBed 处理参数，供 build_scaled/original 共用。
+
+    width/height/fit/fallback 由图床按处理参数解释，缩放版要重写、原图版要
+    剥离；其余参数（签名、版本号等）必须原样保留。
+    """
+    return [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key.lower() not in IMGBED_MANAGED_QUERY_KEYS
+    ]
+
+
+def _rebuild_imgbed_url(parsed, file_path: str, query: list[tuple[str, str]]) -> str:
+    """用统一的路径重编码与查询串重建 ImgBed 直链。"""
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            _requote_imgbed_path(file_path),
+            urlencode(query),
+            parsed.fragment,
+        )
+    )
+
+
 def build_scaled_url(url: str, max_side: int, quality: int = 85, style: str = "query") -> str:
     """构造 ImgBed 等比缩放 URL；非 ImgBed URL 原样返回。
 
@@ -556,15 +581,9 @@ def build_scaled_url(url: str, max_side: int, quality: int = 85, style: str = "q
         return urlunsplit((parsed.scheme, parsed.netloc, new_path, parsed.query, parsed.fragment))
 
     # query 风格：在查询串里追加 width/height/fallback
-    query = [
-        (key, value)
-        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
-        if key.lower() not in IMGBED_MANAGED_QUERY_KEYS
-    ]
+    query = _imgbed_query_pairs(parsed)
     query.extend([("width", str(side)), ("height", str(side)), ("fallback", "original")])
-    return urlunsplit(
-        (parsed.scheme, parsed.netloc, _requote_imgbed_path(file_path), urlencode(query), parsed.fragment)
-    )
+    return _rebuild_imgbed_url(parsed, file_path, query)
 
 
 def build_original_url(url: str) -> str:
@@ -582,14 +601,7 @@ def build_original_url(url: str) -> str:
     file_path = _extract_imgbed_file_path(parsed.path)
     if not file_path:
         return url
-    query = [
-        (key, value)
-        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
-        if key.lower() not in IMGBED_MANAGED_QUERY_KEYS
-    ]
-    return urlunsplit(
-        (parsed.scheme, parsed.netloc, _requote_imgbed_path(file_path), urlencode(query), parsed.fragment)
-    )
+    return _rebuild_imgbed_url(parsed, file_path, _imgbed_query_pairs(parsed))
 
 
 def is_scaling_needed(image_size, max_side) -> bool | None:

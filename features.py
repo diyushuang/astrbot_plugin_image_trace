@@ -146,18 +146,27 @@ def _supported_mime(image) -> str | None:
     return _MIME_BY_FORMAT.get(image.format or "")
 
 
+def _mime_if_decodable(image) -> str | None:
+    """对已打开的图片执行统一判据：像素上限 → 格式白名单 → 完整解码。
+
+    image_mime（路径）与 image_bytes_ok（内存字节）都必须走这一份判据，
+    否则「落盘校验通过、内存校验不通过」这类差异会让回退逻辑在不同入口
+    表现不一。解压炸弹闸门与完整解码要求也在此一并收口。
+    """
+    if image.width * image.height > _MAX_LOAD_PIXELS:
+        return None
+    mime = _supported_mime(image)
+    if mime is None:
+        return None
+    image.load()
+    return mime
+
+
 def image_mime(path: str) -> str | None:
     """按真实内容识别受支持的图片格式，并完整解码以拒绝截断文件。"""
     try:
         with Image.open(path) as image:
-            # 与 _load_rgb 同一防解压炸弹闸门：load() 前按头部尺寸拒绝
-            if image.width * image.height > _MAX_LOAD_PIXELS:
-                return None
-            mime = _supported_mime(image)
-            if mime is None:
-                return None
-            image.load()
-            return mime
+            return _mime_if_decodable(image)
     except Exception:
         return None
 
@@ -173,12 +182,7 @@ def image_bytes_ok(data: bytes) -> bool:
         return False
     try:
         with Image.open(io.BytesIO(data)) as image:
-            if image.width * image.height > _MAX_LOAD_PIXELS:
-                return False
-            if _supported_mime(image) is None:
-                return False
-            image.load()
-            return True
+            return _mime_if_decodable(image) is not None
     except Exception:
         return False
 

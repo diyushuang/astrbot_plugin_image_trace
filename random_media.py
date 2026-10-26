@@ -294,13 +294,17 @@ def swap_url_origin(url, origin_base, allowed_hosts) -> str:
     return urlunsplit((origin.scheme, origin.netloc, target.path, target.query, target.fragment))
 
 
+def _decoded_path(url) -> str:
+    """取 URL 的路径部分并还原百分号编码；畸形 URL 返回空串。"""
+    try:
+        return unquote(urlsplit(str(url or "")).path)
+    except Exception:
+        return ""
+
+
 def media_filename(url) -> str | None:
     """从媒体 URL 提取文件名；末段不含点号（不像文件名）时返回 None。"""
-    try:
-        path = unquote(urlsplit(str(url or "")).path)
-    except Exception:
-        return None
-    segments = [segment for segment in path.split("/") if segment]
+    segments = [segment for segment in _decoded_path(url).split("/") if segment]
     if segments and "." in segments[-1]:
         return segments[-1]
     return None
@@ -312,11 +316,7 @@ def is_thumbnail_url(url) -> bool:
     判据是 URL 路径里存在 `thumbnails` 这一整段，而不是子串包含：
     `mythumbnails/`、`thumbnails-old/` 这类目录名不得被误判成缩略图。
     """
-    try:
-        path = unquote(urlsplit(str(url or "")).path)
-    except Exception:
-        return False
-    return THUMBNAIL_DIR in [segment for segment in path.split("/") if segment]
+    return THUMBNAIL_DIR in [segment for segment in _decoded_path(url).split("/") if segment]
 
 
 def strip_thumbnail_prefix(name) -> str:
@@ -445,7 +445,7 @@ def media_kind(url, hint=None) -> str | None:
     normalized = str(hint or "").strip().lower()
     if normalized in CONTENT_TYPES:
         return normalized
-    path = unquote(urlsplit(str(url or "")).path).lower()
+    path = _decoded_path(url).lower()
     if any(path.endswith(extension) for extension in IMAGE_EXTENSIONS):
         return "image"
     if any(path.endswith(extension) for extension in VIDEO_EXTENSIONS):

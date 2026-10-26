@@ -92,6 +92,21 @@ def is_blank(value: Any) -> bool:
     return value is None or (isinstance(value, str) and not value.strip())
 
 
+def bool_or(value: Any, default: bool) -> bool:
+    """布尔配置：未配置（None/空白）时取默认，其余按真值表解释。
+
+    与 ``value or default`` 的区别：0 / False 是合法配置，不能被当成未配置；
+    这条口径原先在 main._bool_cfg 与随机图布尔解析里各写一份。
+    """
+    return default if is_blank(value) else truthy(value)
+
+
+def read_bytes(path: str) -> bytes:
+    """读取整个文件；同步 IO，异步调用方应走 asyncio.to_thread。"""
+    with open(path, "rb") as file:
+        return file.read()
+
+
 def as_int(value: Any, default: int) -> int:
     """配置取整型；未配置或类型不合法时返回默认值。"""
     if is_blank(value):

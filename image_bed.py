@@ -39,12 +39,12 @@ from urllib.parse import quote, unquote, urlencode, urlparse
 import aiohttp
 
 try:
-    from .common import USER_AGENT, as_int, truthy
+    from .common import USER_AGENT, as_int, read_bytes, truthy
     from .http_client import GuardedHttpClient
     from .s3_store import S3CompatClient
     from .url_guard import read_limited_text
 except ImportError:  # 兼容插件以独立模块方式加载
-    from common import USER_AGENT, as_int, truthy  # type: ignore[no-redef]
+    from common import USER_AGENT, as_int, read_bytes, truthy  # type: ignore[no-redef]
     from http_client import GuardedHttpClient  # type: ignore[no-redef]
     from s3_store import S3CompatClient  # type: ignore[no-redef]
     from url_guard import read_limited_text  # type: ignore[no-redef]
@@ -115,11 +115,6 @@ def _same_origin(a, b) -> bool:
     return _host_port(a) == _host_port(b)
 
 
-def _read_bytes(path: str) -> bytes:
-    with open(path, "rb") as f:
-        return f.read()
-
-
 class ImageBedClient:
     def __init__(
         self,
@@ -139,42 +134,24 @@ class ImageBedClient:
 
     async def store(self, src_path: str) -> StoreResult:
         """登记原图的落库：优先上传图床/对象存储，失败回退本地副本。"""
-        if self.mode == MODE_HTTP:
+        uploaders = {
+            MODE_HTTP: (self._upload, "图床上传失败", "已上传至图床"),
+            MODE_CFB: (self._upload_cf, "CloudFlare-ImgBed 上传失败", "已上传至 CloudFlare-ImgBed"),
+            MODE_R2: (self._upload_object, "Cloudflare R2上传失败", "已上传至Cloudflare R2"),
+            MODE_OCI: (self._upload_object, "OCI 对象存储上传失败", "已上传至OCI 对象存储"),
+        }
+        entry = uploaders.get(self.mode)
+        if entry is not None:
+            upload, failure, ok_message = entry
             try:
-                url = await self._upload(src_path)
-                return StoreResult(ok=True, url=url, message="已上传至图床")
+                return StoreResult(ok=True, url=await upload(src_path), message=ok_message)
             except Exception as e:
-                logger.warning(f"图床上传失败: {e}", exc_info=True)
+                logger.warning(f"{failure}: {e}", exc_info=True)
                 local = await self._copy_local(src_path)
                 return StoreResult(
                     ok=True,
                     file_path=local,
-                    message="图床上传失败，已保存本地副本（详情见日志）",
-                )
-        if self.mode == MODE_CFB:
-            try:
-                url = await self._upload_cf(src_path)
-                return StoreResult(ok=True, url=url, message="已上传至 CloudFlare-ImgBed")
-            except Exception as e:
-                logger.warning(f"CloudFlare-ImgBed 上传失败: {e}", exc_info=True)
-                local = await self._copy_local(src_path)
-                return StoreResult(
-                    ok=True,
-                    file_path=local,
-                    message="CloudFlare-ImgBed 上传失败，已保存本地副本（详情见日志）",
-                )
-        if self.mode in (MODE_R2, MODE_OCI):
-            provider = "Cloudflare R2" if self.mode == MODE_R2 else "OCI 对象存储"
-            try:
-                url = await self._upload_object(src_path)
-                return StoreResult(ok=True, url=url, message=f"已上传至{provider}")
-            except Exception as e:
-                logger.warning(f"{provider}上传失败: {e}", exc_info=True)
-                local = await self._copy_local(src_path)
-                return StoreResult(
-                    ok=True,
-                    file_path=local,
-                    message=f"{provider}上传失败，已保存本地副本（详情见日志）",
+                    message=f"{failure}，已保存本地副本（详情见日志）",
                 )
         local = await self._copy_local(src_path)
         if self.mode != MODE_LOCAL:
@@ -304,6 +281,18 @@ class ImageBedClient:
         await asyncio.to_thread(shutil.copyfile, src_path, dest)
         return dest
 
+    def _timeout(self) -> aiohttp.ClientTimeout:
+        """图床 HTTP 请求的统一超时（配置缺失或非法时取 30 秒）。"""
+        return aiohttp.ClientTimeout(total=max(5, as_int(self.config.get("timeout"), 30)))
+
+    async def _upload_file(self, src_path: str) -> tuple[bytes, str, str]:
+        """读取待上传文件并生成 (字节, 文件名, Content-Type)，供两种上传共用。"""
+        ext = os.path.splitext(src_path)[1].lower() or ".jpg"
+        filename = f"trace_{time.strftime('%Y%m%d')}_{secrets.token_hex(8)}{ext}"
+        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        file_bytes = await asyncio.to_thread(read_bytes, src_path)
+        return file_bytes, filename, content_type
+
     async def _upload(self, src_path: str) -> str:
         """按配置调用通用 HTTP 上传接口，成功返回图片直链。"""
         api_url = str(self.config.get("api_url") or "").strip()
@@ -322,11 +311,7 @@ class ImageBedClient:
         if auth_header and token:
             auth_value = f"{self.config.get('auth_prefix') or ''}{token}"
 
-        ext = os.path.splitext(src_path)[1].lower() or ".jpg"
-        filename = f"trace_{time.strftime('%Y%m%d')}_{secrets.token_hex(8)}{ext}"
-        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-
-        file_bytes = await asyncio.to_thread(_read_bytes, src_path)
+        file_bytes, filename, content_type = await self._upload_file(src_path)
 
         def prepare(_url: str, method: str, cross_origin: bool = False) -> dict:
             headers = {"User-Agent": USER_AGENT}
@@ -342,9 +327,10 @@ class ImageBedClient:
             form.add_field(field, file_bytes, filename=filename, content_type=content_type)
             return {"data": form, "headers": headers}
 
-        timeout = aiohttp.ClientTimeout(total=max(5, as_int(self.config.get("timeout"), 30)))
         client = await self._http_getter()
-        async with await client.request("POST", api_url, prepare=prepare, timeout=timeout) as resp:
+        async with await client.request(
+            "POST", api_url, prepare=prepare, timeout=self._timeout()
+        ) as resp:
             body = await read_limited_text(resp)
             if not 200 <= resp.status < 300:
                 raise RuntimeError(f"图床返回 HTTP {resp.status}: {body[:500]}")
@@ -404,11 +390,7 @@ class ImageBedClient:
         if params:
             api_url = f"{api_url}?{urlencode(params)}"
 
-        ext = os.path.splitext(src_path)[1].lower() or ".jpg"
-        filename = f"trace_{time.strftime('%Y%m%d')}_{secrets.token_hex(8)}{ext}"
-        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-
-        file_bytes = await asyncio.to_thread(_read_bytes, src_path)
+        file_bytes, filename, content_type = await self._upload_file(src_path)
 
         def prepare(_url: str, method: str, cross_origin: bool = False) -> dict:
             headers = {"User-Agent": USER_AGENT}
@@ -421,9 +403,10 @@ class ImageBedClient:
             form.add_field("file", file_bytes, filename=filename, content_type=content_type)
             return {"data": form, "headers": headers}
 
-        timeout = aiohttp.ClientTimeout(total=max(5, as_int(self.config.get("timeout"), 30)))
         client = await self._http_getter()
-        async with await client.request("POST", api_url, prepare=prepare, timeout=timeout) as resp:
+        async with await client.request(
+            "POST", api_url, prepare=prepare, timeout=self._timeout()
+        ) as resp:
             body = await read_limited_text(resp)
             if not 200 <= resp.status < 300:
                 raise RuntimeError(f"CloudFlare-ImgBed 返回 HTTP {resp.status}: {body[:500]}")
@@ -459,7 +442,7 @@ class ImageBedClient:
                 "headers": {**headers, "Content-Type": "application/json"},
             }
 
-        timeout = aiohttp.ClientTimeout(total=max(5, as_int(self.config.get("timeout"), 30)))
+        timeout = self._timeout()
         client = await self._http_getter()
         async with await client.request("POST", api_url, prepare=prepare, timeout=timeout) as resp:
             resp_body = await read_limited_text(resp)
@@ -643,6 +626,13 @@ class ImageBedClient:
                         return key, True
         return "", False
 
+    async def _put_object_bytes(self, client: S3CompatClient, bucket: str, src_path: str) -> str:
+        """把文件上传为新的对象名，返回对象键（R2/OCI 共用）。"""
+        key, ctype = self._object_name(src_path)
+        data = await asyncio.to_thread(read_bytes, src_path)
+        await client.put_object(bucket, key, data, ctype)
+        return key
+
     async def _upload_object(self, src_path: str) -> str:
         """上传到 R2 / OCI 对象存储，返回长期有效的公开直链。"""
         if self.mode == MODE_R2:
@@ -654,14 +644,8 @@ class ImageBedClient:
                     " r2.dev 公开访问或绑定自定义域名，https:// 开头），溯源回图"
                     "需要长期有效的直链"
                 )
-            key, ctype = self._object_name(src_path)
-            data = await asyncio.to_thread(_read_bytes, src_path)
-            await client.put_object(bucket, key, data, ctype)
-            return _public_url(public_base, key)
+            return _public_url(public_base, await self._put_object_bytes(client, bucket, src_path))
 
         # MODE_OCI
         client, bucket = self._oci_client()
-        key, ctype = self._object_name(src_path)
-        data = await asyncio.to_thread(_read_bytes, src_path)
-        await client.put_object(bucket, key, data, ctype)
-        return self._oci_public_url(key)
+        return self._oci_public_url(await self._put_object_bytes(client, bucket, src_path))
