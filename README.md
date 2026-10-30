@@ -5,7 +5,7 @@
 
 **群聊里随手转发的一张图，一键找回它的原图。**
 
-[![version](https://img.shields.io/badge/version-1.7.14-blue?style=flat-square)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.7.15-blue?style=flat-square)](./CHANGELOG.md)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4?style=flat-square)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat-square)](./LICENSE)
@@ -46,6 +46,7 @@ _An AstrBot plugin that traces a reposted, compressed or cropped image back to i
 | 🧩 **一次一条** | 向量命中的多张相似图合并为**一条**消息，配文集中在开头（带 `1.`/`2.` 序号）、图片连续排在末尾，避免 QQ 把图片裁成正方形缩略图 |
 | 🗂️ **多种存储** | 图床副本 / 通用 HTTP 图床（Lsky Pro、EasyImages、Chevereto…）/ CloudFlare-ImgBed / Cloudflare R2 / 甲骨文 OCI |
 | 🎲 **随机图** | `/随机图`、`/随机视频` 从图床随机接口取图回传，并可被 LLM 工具 `sendRandomMedia` 调用 |
+| 📅 **每日签到** | `/签到` 每人每天一次，回传一张随机缩略图；默认本地合成「边框 + 下方随机语句」卡片，也支持轻量模式与任意在线语句接口 |
 | 🖼️ **`/原图` 直取** | 从会话历史找回原图，或按文件名直接到图床取；均为原图 URL 直传，不下载、不本地中转 |
 | 🧹 **名字自动净化** | 配文前缀（`🖼️`/`🎬`/序号）与图床改名痕迹（毫秒时间戳、`@`→`_`）在展示与直查前统一剥净，复制配文当文件名也能取到图 |
 | 🛡️ **安全加固** | 全部出网经 SSRF 防护（逐跳校验 + IP 钉扎 + 响应限长）；密钥字段在配置面板标记为 secret |
@@ -109,6 +110,7 @@ flowchart LR
 | `/原图修复` | - | 清理会话历史里带配文前缀（`🖼️` / `🎬` / 序号）的旧记录，修复后 `/原图` 才能命中 | 所有人 |
 | `/随机图 [目录]` | `/随机图片` | 从图床随机图接口取一张随机图片并回传 | 所有人 |
 | `/随机视频 [目录]` | - | 从图床随机图接口取一段随机视频并回传 | 所有人 |
+| `/签到` | `/打卡` | 每日签到：每人每天一次，回传带边框与随机语句的随机缩略图 | 所有人 |
 | `/溯源状态` | - | 查看图库统计与配置摘要 | 所有人 |
 | `/溯源重扫 [force]` | - | 扫描 `scan_dirs` 目录建立/更新索引；`force` 重建全部 | 管理员 |
 | `/溯源删除 <编号>` | - | 按 ID 删除图库条目（同步清理插件侧写入的向量点、远端对象与本地副本） | 管理员 |
@@ -135,7 +137,7 @@ flowchart LR
 > [!NOTE]
 > 面板标签里的【必填】= 启用对应功能后必须填写；【R2 必填】【OCI 必填】【generic_http 必填】【imgbed 必填】= 仅在所选模式下必填；【按需必填】= 取决于使用方式；【选填】= 可留空保持默认。
 >
-> **面板分组**：`basic`（基础）/ `delivery`（图片推送）/ `image_bed`（图床）/ `storage_bucket`（储存桶）/ `random_media`（随机图）/ `vector_search`（向量检索）/ `limits`（限制与缓存）。
+> **面板分组**：`basic`（基础）/ `delivery`（图片推送）/ `image_bed`（图床）/ `storage_bucket`（储存桶）/ `random_media`（随机图）/ `checkin`（每日签到）/ `vector_search`（向量检索）/ `limits`（限制与缓存）。
 >
 > **按需显隐与折叠**：储存桶组选择 `cloudflare_r2` / `oracle_oci` 后才展开对应字段，图床组选择 `generic_http` / `cloudflare_imgbed` 后才展开；进阶项收在各组的「更多配置」折叠区（WebUI 原生 `collapsed`），默认收起。被隐藏字段的已填值保留，切换模式不丢失。
 >
@@ -187,6 +189,16 @@ flowchart LR
 | `random_media.timeout` / `retry_count` | `10` / `3` | 单次请求超时（秒）/ 失败重试次数（指数退避，403 不重试） |
 | `random_media.show_file_info` / `enable_llm` | `true` / `true` | 回传是否附带文件名 / 是否允许 LLM 工具调用 |
 | `random_media.send_thumbnail` | `true` | `/随机图` 发 720px 缩略图替身；会话历史仍记原图，`/原图` 不受影响；查不到替身时发原图 |
+| `checkin.enabled` | `true` | 启用每日签到；关闭后 `/签到` 只提示功能已关闭 |
+| `checkin.render_mode` | `card` | `card`=本地合成「边框 + 语句」卡片（单条图文）/ `simple`=缩略图 + 文字语句（不下载、不合成） |
+| `checkin.border_px` | `0` | 卡片边框宽度；`0`=按图片宽度自动（约 4.5%，最小 12px） |
+| `checkin.utc_offset_hours` | `8` | 签到日期按该 UTC 偏移计算（默认北京时间，每天 0 点刷新） |
+| `checkin.quote_source` | `builtin` | `builtin`=只用本地 `quotes.txt` / `api`=优先在线语句接口，任何失败自动回退本地 |
+| `checkin.quote_api_url` | 一言 | 任意 http(s) GET 语句接口，可自带查询参数；示例见[常见问题](#常见问题) |
+| `checkin.quote_json_path` | `hitokoto` | 语句所在 JSON 点路径（如 `data.content`）；留空自动探测，非 JSON 响应按纯文本取首行 |
+| `checkin.quote_api_headers` | `{}` | 在线语句接口的附加请求头（需 Token / Referer 的服务用这里） |
+| `checkin.quote_timeout` | `5` | 语句接口超时（秒），超时回退本地语句库 |
+| `checkin.font_path` | - | 自定义中文字体绝对路径；留空自动查找系统字体，找不到时自动用 `simple` 模式 |
 | — | — | 进阶项在各组「更多配置」里，无需额外开关 |
 
 <a id="图片推送三层结构"></a>
@@ -446,7 +458,7 @@ QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条
 ## 项目结构与开发
 
 <details>
-<summary><b>模块职责与关键约束（13 个模块，点击展开）</b></summary>
+<summary><b>模块职责与关键约束（15 个模块，点击展开）</b></summary>
 
 依赖方向单向：`main` → 各子模块；子模块 → `common` / `http_client` / `url_guard`。
 
@@ -460,6 +472,8 @@ QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条
 | `image_bed.py` | 图床与储存桶各模式的上传、直链反解、远端删除 | 上传失败一律回退本地副本，登记流程不中断 |
 | `image_delivery.py` | URL 缩放/原图还原、本地压缩、压缩证据三态、直发结果分类、图床直链拼装、向量命中去重的纯函数 | 不直接访问网络或 AstrBot 事件，便于独立测试 |
 | `random_media.py` | ImgBed 随机图接口客户端与响应解析纯函数；缩略图判定与改名痕迹清洗 | 出网经共享 HTTP 客户端；403 特判不重试；只取直链、不落地字节；前缀清理只认 `^\d{10,}_` 实测形态 |
+| `checkin_store.py` | 每日签到 SQLite 记录：按用户每日一次、连续/累计天数 | 日期由调用方按配置时区算好（本模块只做字符串比较）；写路径持锁；同日重复只读不写 |
+| `checkin_card.py` | 签到语句库（内置 `quotes.txt` + 任意在线接口）与 Pillow 拍立得卡片合成 | 在线失败一律回退本地；无中文字体返回 `None` 交主流程降级；不打包字体 |
 | `media_history.py` | 会话级原图历史（LRU + 别名键） | 按会话/会话数封顶；主键与展示名双索引 |
 | `s3_store.py` | 纯标准库 AWS SigV4 签名 + 最小 S3 兼容客户端 | 签名与 URL/方法绑定，被重定向即报错而非复用签名 |
 | `vector_search.py` | Qdrant 检索 + OpenAI 兼容 embeddings 客户端；`thumb_url` → 原图反查 | embed 三值须与图床入库侧一致；错误统一归为 `VectorEngineError`；反查命中数必须恰为 1 且**永不抛错** |
@@ -489,7 +503,7 @@ QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条
 - 配置解析使用 `common.as_int` / `as_float` / `truthy` / `is_blank`，不要写 `value or default`（会把合法的 0 / False 吞掉）；
 - 涉及 SQLite 或大文件复制的调用若出现在 async 上下文，应包 `asyncio.to_thread`；
 - 群聊回复文案保持脱敏：含内网地址 / Key 的错误细节只进日志，不进群聊；
-- 发布包按白名单打包 **20 个文件**（13 个 `.py` + `README.md` / `CHANGELOG.md` / `metadata.yaml` / `requirements.txt` / `_conf_schema.json` / `LICENSE` / `logo.png`），不含 `.git`、`data/` 与会话状态目录；**新增模块必须登记进 `scripts/build_release.py` 的 `PLUGIN_FILES`**，否则安装后会 `ImportError`；
+- 发布包按白名单打包 **22 个文件**（15 个 `.py` + `README.md` / `CHANGELOG.md` / `metadata.yaml` / `requirements.txt` / `_conf_schema.json` / `LICENSE` / `logo.png`），不含 `.git`、`data/` 与会话状态目录；**新增模块必须登记进 `scripts/build_release.py` 的 `PLUGIN_FILES`**，否则安装后会 `ImportError`；
 - 提交前确认 `metadata.yaml` 的 `version` 使用无 `v` 前缀的 SemVer，并与 `CHANGELOG.md`、README 徽章一致。
 
 </details>
@@ -501,6 +515,16 @@ QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条
 
 - **误报**：提高 `similarity_threshold`，或开启 `ai_verify` 让视觉大模型复核。
 - **漏报**：图片若被严重裁剪、拼贴，感知哈希对大幅构图变化不敏感，可适当降低阈值试试；另外确认 `hash_size` 与建库时一致（不一致请 `/溯源重扫 force`）。
+
+</details>
+
+<details>
+<summary><b>签到卡片里的字是方框 / 变成了「缩略图 + 文字」？</b></summary>
+
+- 卡片需要中文字体。插件依次查找 Windows（微软雅黑/黑体）、Linux（Noto CJK/文泉驿）、macOS（苹方）；Docker 等精简环境常没有中文字体，可执行 `apt install fonts-wqy-microhei`（或挂载字体目录），也可在 `checkin.font_path` 填字体文件绝对路径。
+- 找不到任何可用中文字体时不会输出豆腐块，而是自动退回 `simple` 模式（缩略图 + 文字语句）。
+- 想改语句：编辑 `data/plugin_data/astrbot_plugin_image_trace/quotes.txt`（一行一句，`#` 开头为注释）；首次运行会自动生成内置语句。
+- 想换在线语句服务：把 `checkin.quote_source` 设为 `api`，`quote_api_url` 填接口地址，`quote_json_path` 按返回填路径——一言 `hitokoto`、今日诗词 `data.content`、纯文本接口留空；需要 Token/Referer 时用 `checkin.quote_api_headers`。接口失败会自动回退本地语句库，不影响签到。
 
 </details>
 

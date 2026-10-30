@@ -570,6 +570,98 @@
       }
     }
   },
+  "checkin": {
+    "description": "每日签到",
+    "type": "object",
+    "hint": "每人每天一次 /签到，回传一张随机缩略图。默认本地合成「边框 + 随机语句」卡片；字体缺失或下载失败自动退化为「缩略图 + 文字」。依赖「随机图」组的图床地址。",
+    "items": {
+      "enabled": {
+        "description": "【选填】启用每日签到",
+        "type": "bool",
+        "default": true,
+        "obvious_hint": true,
+        "hint": "关闭后 /签到 只提示功能已关闭。"
+      },
+      "render_mode": {
+        "description": "【选填】图文呈现方式",
+        "type": "string",
+        "options": [
+          "card",
+          "simple"
+        ],
+        "default": "card",
+        "obvious_hint": true,
+        "hint": "card=本地合成带边框+语句的卡片（单条图文，需下载缩略图）；simple=缩略图 + 文字语句（不下载、不合成）。"
+      },
+      "border_px": {
+        "description": "【选填】卡片边框宽度（像素）",
+        "type": "int",
+        "default": 0,
+        "hint": "0=按图片宽度自动（约 4.5%，最小 12px）；仅在 card 模式生效，范围 0~200。"
+      },
+      "utc_offset_hours": {
+        "description": "【选填】签到时区（UTC 偏移小时）",
+        "type": "int",
+        "default": 8,
+        "obvious_hint": true,
+        "hint": "默认 8=北京时间，每天 0 点刷新；范围 -12~14。"
+      },
+      "quote_source": {
+        "description": "【选填】语句来源",
+        "type": "string",
+        "options": [
+          "builtin",
+          "api"
+        ],
+        "default": "builtin",
+        "obvious_hint": true,
+        "hint": "builtin=只用本地语句库（data 目录下 quotes.txt，可自行增删）；api=优先请求下方接口，任何失败自动回退本地语句库。"
+      },
+      "quote_api_url": {
+        "description": "【选填】语句接口地址",
+        "type": "string",
+        "default": "https://v1.hitokoto.cn/?encode=json&c=d&c=i&c=k",
+        "condition": {
+          "quote_source": "api"
+        },
+        "hint": "任意 http(s) GET 接口，可自带查询参数。示例：一言 https://v1.hitokoto.cn/?encode=json；今日诗词 https://v1.jinrishici.com/all.json；纯文本接口直接填 URL。留空等同 builtin。"
+      },
+      "quote_json_path": {
+        "description": "【选填】语句 JSON 字段路径",
+        "type": "string",
+        "default": "hitokoto",
+        "condition": {
+          "quote_source": "api"
+        },
+        "hint": "点号路径，如 hitokoto、data.content、data.hitokoto；留空则自动探测 hitokoto/sentence/content/text 等常见字段。响应非 JSON 时按纯文本取首行。"
+      },
+      "quote_api_headers": {
+        "description": "【选填】语句接口请求头",
+        "type": "dict",
+        "default": {},
+        "condition": {
+          "quote_source": "api"
+        },
+        "collapsed": true,
+        "hint": "需要 Token / Referer 的接口在此填写，如 {\"Authorization\": \"Bearer xxx\"}；该项不是 secret 字段，请勿在公开配置中留存凭证。"
+      },
+      "quote_timeout": {
+        "description": "【选填】语句接口超时（秒）",
+        "type": "int",
+        "default": 5,
+        "condition": {
+          "quote_source": "api"
+        },
+        "hint": "超时即回退本地语句库，不影响签到。"
+      },
+      "font_path": {
+        "description": "【选填】中文字体文件路径",
+        "type": "string",
+        "default": "",
+        "hint": "绝对路径（.ttf/.ttc/.otf）。留空自动查找系统字体（Windows 微软雅黑/黑体、Linux Noto CJK/文泉驿、macOS 苹方）；全部找不到时自动使用 simple 模式。"
+      }
+    }
+  },
   "vector_search": {
     "description": "向量检索",
     "type": "object",

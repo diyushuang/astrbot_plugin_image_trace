@@ -24,6 +24,7 @@ import secrets
 import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import unquote, urlparse, urlsplit
@@ -41,6 +42,8 @@ from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 try:
+    from .checkin_card import QuoteLibrary, compose_poster
+    from .checkin_store import CheckinStore
     from .common import (
         AI_VERIFY_MAX_CANDIDATES,
         COMPRESS_CONCURRENCY,
@@ -126,6 +129,8 @@ try:
     from .url_guard import read_limited_bytes, set_allowed_private_hosts
     from .vector_search import VectorEngine, VectorEngineError
 except ImportError:  # 兼容插件以独立模块方式加载
+    from checkin_card import QuoteLibrary, compose_poster  # type: ignore[no-redef]
+    from checkin_store import CheckinStore  # type: ignore[no-redef]
     from common import (  # type: ignore[no-redef]
         AI_VERIFY_MAX_CANDIDATES,
         COMPRESS_CONCURRENCY,
@@ -400,6 +405,9 @@ class ImageTracePlugin(Star):
         # 回传过的原图直链的历史（供 /原图 找回）；随机图客户端惰性构造
         self.history = MediaHistory()
         self._random_media_client: RandomMediaClient | None = None
+        # 每日签到：独立 SQLite 记录（按用户全局一天一次）与语句库（首次取句时构造）
+        self.checkin_store = CheckinStore(os.path.join(self.data_dir, "checkin.db"))
+        self._quote_library_cache: QuoteLibrary | None = None
         # 图床缩放能力冷却截止时刻（time.monotonic 口径，0 表示未观测到拒绝）。
         # 探测到 API 级拒绝（405/501 等）后的一段时间内不再探测缩放版。
         self._scaled_verify_unsupported_until = 0.0
@@ -1241,6 +1249,51 @@ class ImageTracePlugin(Star):
         if self._random_media_client is None:
             self._random_media_client = RandomMediaClient(self._random_settings(), self._get_http)
         return self._random_media_client
+
+    def _checkin_settings(self) -> dict:
+        """归一化每日签到配置（checkin 组）。
+
+        所有取值都做范围收敛：面板被手改成离谱数字（如边框 9999、时区 99）时，
+        按边界值生效而不是把非法值传进合成/日期计算。
+        """
+        raw = self._dict_cfg("checkin")
+        headers = raw.get("quote_api_headers")
+        return {
+            "enabled": bool_or(raw.get("enabled"), True),
+            "render_mode": "simple"
+            if str(raw.get("render_mode") or "").strip().lower() == "simple"
+            else "card",
+            "border_px": max(0, min(200, as_int(raw.get("border_px"), 0))),
+            "utc_offset_hours": max(-12, min(14, as_int(raw.get("utc_offset_hours"), 8))),
+            "quote_source": "api"
+            if str(raw.get("quote_source") or "").strip().lower() == "api"
+            else "builtin",
+            "quote_api_url": str(raw.get("quote_api_url") or "").strip(),
+            "quote_json_path": str(raw.get("quote_json_path") or "").strip(),
+            "quote_api_headers": headers if isinstance(headers, dict) else {},
+            "quote_timeout": max(1, min(30, as_int(raw.get("quote_timeout"), 5))),
+            "font_path": str(raw.get("font_path") or "").strip(),
+        }
+
+    @staticmethod
+    def _checkin_today(offset_hours: int) -> date:
+        """按配置的 UTC 偏移算出「今天」，与服务器本地时区无关。"""
+        return datetime.now(timezone(timedelta(hours=offset_hours))).date()
+
+    def _quote_library(self) -> QuoteLibrary:
+        """惰性构造语句库；语句文件缺失时由 QuoteLibrary 用内置语句初始化。"""
+        if self._quote_library_cache is None:
+            settings = self._checkin_settings()
+            self._quote_library_cache = QuoteLibrary(
+                os.path.join(self.data_dir, "quotes.txt"),
+                source=settings["quote_source"],
+                api_url=settings["quote_api_url"],
+                json_path=settings["quote_json_path"],
+                headers=settings["quote_api_headers"],
+                timeout=settings["quote_timeout"],
+                http_getter=self._get_http,
+            )
+        return self._quote_library_cache
 
     @staticmethod
     def _session_key(event: AstrMessageEvent) -> str:
@@ -2793,6 +2846,7 @@ class ImageTracePlugin(Star):
             "· /溯源删除 <编号> —— 删除图库条目（管理员）\n"
             "· /随机图 [目录] —— 从图床随机取一张图片并回传\n"
             "· /随机视频 [目录] —— 从图床随机取一个视频并回传\n"
+            "· /签到 —— 每日签到领取一张带边框与随机语句的随机缩略图（每人每天一次，可 /打卡）\n"
             "· /原图 [文件名] —— 取原图：带文件名时直接到图床按名取（无需先回传），"
             "不带文件名取本会话最近回传的原图\n"
             "· /原图修复 —— 清理会话历史里带配文前缀（🖼️ / 🎬 / 序号）的旧记录\n"
@@ -2823,6 +2877,12 @@ class ImageTracePlugin(Star):
         async for result in self._random_media_delivery(
             event, directory, parsed_type or "video", settings
         ):
+            yield result
+
+    @filter.command("签到", alias={"打卡"})
+    async def checkin(self, event: AstrMessageEvent):
+        """每日签到，领取一张带边框与随机语句的随机缩略图"""
+        async for result in self._checkin_flow(event):
             yield result
 
     def _imgbed_base(self) -> str:
@@ -3284,48 +3344,9 @@ class ImageTracePlugin(Star):
             yield event.chain_result([Comp.Plain(caption), Comp.Video.fromURL(send_url)])
             return
         if kind == "image":
-            # 发送用缩略图替身、历史留原图：QQ 侧下载小图更快，sendMsg 回执超时
-            # 概率显著下降；而 /原图 仍能凭历史里的原图直链取回全尺寸文件。
-            #
-            # 边界：图床的 /random 若被指到 thumbnails/ 目录（default_dir 配错或
-            # 用户显式传了该目录），media_url 本身就是缩略图。此时别再查替身
-            # （缩略图没有替身），并把「原图」口径定为反查结果，避免历史里记进
-            # 缩略图直链、导致 /原图 之后只能拿回小图。
-            original_url = media_url
-            original_name = ""
-            if is_thumbnail_url(media_url):
-                info = None
-                try:
-                    normalized = unquote(build_original_url(media_url))
-                    info = await self.vector.original_info_for_thumb(normalized)
-                except Exception as exc:  # 反查失败不影响发送，按原样处理
-                    logger.debug(f"随机图反查原图失败（按原样处理）: {exc}")
-                if info and info.get("url"):
-                    original_url = info["url"]
-                    if lan_hosts:
-                        # Qdrant 反查回的是公网直链，内网直连模式下同样改写
-                        original_url = swap_url_origin(
-                            original_url, settings["lan_base_url"], lan_hosts
-                        )
-                    # 真名取自 payload.file_name（图床没改过名的原始名）
-                    original_name = str(info.get("file_name") or "").strip()
-                else:
-                    # 2026-10-20 排查实录：反查失败的原因有多种——引擎未配置、
-                    # Qdrant 请求失败、数据未命中——后两者各有 DEBUG 记录（线上
-                    # 默认 INFO 看不到），而「引擎未配置」历史上完全静默，导致
-                    # warning 里看不出任何线索、跨实例排查只能逐台实测。把引擎
-                    # 状态直接写进 warning：未配置 → 给配置指引；缺 embed（此时
-                    # 反查仍可用）→ 说明只影响以图搜图；配置齐全 → 指向 DEBUG。
-                    if not self.vector.qdrant_ready:
-                        hint = "向量引擎未配置，请在插件配置 vector_search 一节补齐"
-                    elif not self.vector.enabled:
-                        hint = "向量引擎缺 embed 配置（反查仍可用，仅以图搜图不可用）"
-                    else:
-                        hint = "原因见 DEBUG 日志"
-                    logger.warning(
-                        f"随机图命中的是缩略图且反查不到原图（{hint}）: {media_url}"
-                    )
-            send_url = await self._random_send_url(original_url, settings)
+            send_url, original_url, original_name = await self._random_image_from_media(
+                media_url, settings
+            )
             # 配文一律用**原图**名并清洗掉图床改名的前缀（时间戳 + `@` 换 `_`），
             # 显示缩略图名对用户没有意义
             caption = self._random_caption(
@@ -3349,6 +3370,198 @@ class ImageTracePlugin(Star):
                 yield result
             return
         yield event.plain_result(f"随机媒体获取成功：{media_url}")
+
+    async def _random_image_candidate(
+        self, directory, settings: dict
+    ) -> tuple[str, str, str]:
+        """取一张随机图并归一为 (发送直链, 原图直链, 原图权威名)。
+
+        /签到 与 /随机图 共用这段「取图 → 内网改写/HTTPS 升级 → 缩略图反查 →
+        选发送态」链路。抽出来是为了让「发缩略图、历史留原图」的口径只存在
+        一份：任何一处改动都不会让两条命令各自漂移。
+
+        失败抛 RandomMediaError，由调用方给出可读提示。
+        """
+        # 未指定目录时回退到配置的 default_dir 池：图床若设置了
+        # randomImageAPI.allowedDir，不带 dir 的裸 /random 会被判为「目录不允许」
+        # 而 403，故由客户端补一个目录；池有多项时随机取其一，以尽量覆盖整库。
+        target_dir = str(directory or "").strip() or pick_default_directory(settings)
+        media_url = await self._random_client().fetch(target_dir, "image")
+        lan_hosts = self._lan_url_hosts(settings)
+        if lan_hosts:
+            # 内网直连：床内直链统一改写为内网源（/random 直链可能已是内网源，
+            # 改写幂等；公网域名形式的直链也一并收进来），后续取字节不出公网
+            media_url = swap_url_origin(media_url, settings["lan_base_url"], lan_hosts)
+        media_url = upgrade_to_https(media_url, settings["base_url"])
+        return await self._random_image_from_media(media_url, settings)
+
+    async def _random_image_from_media(
+        self, media_url: str, settings: dict
+    ) -> tuple[str, str, str]:
+        """把随机到的图片直链归一为 (发送直链, 原图直链, 原图权威名)。
+
+        发送用缩略图替身、历史留原图：QQ 侧下载小图更快，sendMsg 回执超时
+        概率显著下降；而 /原图 仍能凭历史里的原图直链取回全尺寸文件。
+
+        边界：图床的 /random 若被指到 thumbnails/ 目录（default_dir 配错或
+        用户显式传了该目录），media_url 本身就是缩略图。此时别再查替身
+        （缩略图没有替身），并把「原图」口径定为反查结果，避免历史里记进
+        缩略图直链、导致 /原图 之后只能拿回小图。
+        """
+        lan_hosts = self._lan_url_hosts(settings)
+        original_url = media_url
+        original_name = ""
+        if is_thumbnail_url(media_url):
+            info = None
+            try:
+                normalized = unquote(build_original_url(media_url))
+                info = await self.vector.original_info_for_thumb(normalized)
+            except Exception as exc:  # 反查失败不影响发送，按原样处理
+                logger.debug(f"随机图反查原图失败（按原样处理）: {exc}")
+            if info and info.get("url"):
+                original_url = info["url"]
+                if lan_hosts:
+                    # Qdrant 反查回的是公网直链，内网直连模式下同样改写
+                    original_url = swap_url_origin(
+                        original_url, settings["lan_base_url"], lan_hosts
+                    )
+                # 真名取自 payload.file_name（图床没改过名的原始名）
+                original_name = str(info.get("file_name") or "").strip()
+            else:
+                # 2026-10-20 排查实录：反查失败的原因有多种——引擎未配置、
+                # Qdrant 请求失败、数据未命中——后两者各有 DEBUG 记录（线上
+                # 默认 INFO 看不到），而「引擎未配置」历史上完全静默，导致
+                # warning 里看不出任何线索、跨实例排查只能逐台实测。把引擎
+                # 状态直接写进 warning：未配置 → 给配置指引；缺 embed（此时
+                # 反查仍可用）→ 说明只影响以图搜图；配置齐全 → 指向 DEBUG。
+                if not self.vector.qdrant_ready:
+                    hint = "向量引擎未配置，请在插件配置 vector_search 一节补齐"
+                elif not self.vector.enabled:
+                    hint = "向量引擎缺 embed 配置（反查仍可用，仅以图搜图不可用）"
+                else:
+                    hint = "原因见 DEBUG 日志"
+                logger.warning(f"随机图命中的是缩略图且反查不到原图（{hint}）: {media_url}")
+        send_url = await self._random_send_url(original_url, settings)
+        return send_url, original_url, original_name
+
+    # ------------------------------------------------------------------
+    # 指令：每日签到（随机缩略图 + 边框语句卡片）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _write_bytes(path: str, data: bytes) -> None:
+        """写临时文件；同步 IO，调用方走 asyncio.to_thread。"""
+        with open(path, "wb") as handle:
+            handle.write(data)
+
+    async def _checkin_card_path(
+        self, image_url: str, quote: str, footer: str, settings: dict
+    ) -> str | None:
+        """下载缩略图 → 合成卡片 → 落临时文件，返回路径；任一步失败返回 None。
+
+        合成放进 to_thread：Pillow 解码/绘制/编码是 CPU 活，放事件循环里会
+        阻塞其它消息处理；实测 720px 卡片整段约 10ms、1440px 约 25ms。
+        """
+        try:
+            data = await self._download_bytes(image_url)
+        except Exception as exc:
+            logger.warning(f"签到卡片下载图片失败，改用轻量模式: {exc}")
+            return None
+        image_bytes = await asyncio.to_thread(
+            compose_poster,
+            data,
+            quote=quote,
+            footer=footer,
+            font_path=settings["font_path"],
+            border_px=settings["border_px"],
+        )
+        if not image_bytes:
+            return None
+        path = os.path.join(self.tmp_dir, f"c_{secrets.token_hex(8)}.jpg")
+        try:
+            await asyncio.to_thread(self._write_bytes, path, image_bytes)
+        except OSError as exc:
+            logger.warning(f"签到卡片写入临时文件失败: {exc}")
+            return None
+        return path
+
+    async def _checkin_flow(self, event: AstrMessageEvent):
+        """签到主流程：判定 → 取图 → 取句 → 卡片/轻量交付。
+
+        签到记录先落库、再取图：取图失败不回收当天资格，避免接口抖动时用户
+        反复重试刷图；提示文案会明确说明「已签到但取图失败」。
+        """
+        settings = self._checkin_settings()
+        if not settings["enabled"]:
+            yield event.plain_result("每日签到功能已在插件配置中关闭。")
+            return
+        user_id = str(event.get_sender_id() or "").strip()
+        if not user_id:
+            yield event.plain_result("无法识别发送者，签到失败。")
+            return
+
+        today = self._checkin_today(settings["utc_offset_hours"])
+        try:
+            outcome = await asyncio.to_thread(self.checkin_store.check_in, user_id, today)
+        except Exception as exc:
+            logger.error(f"签到记录写入失败: {exc}")
+            yield event.plain_result("签到记录写入失败，请稍后再试。")
+            return
+        if outcome.already:
+            yield event.plain_result(
+                f"📅 今天已经签到过啦\n"
+                f"🔥 连续签到 {outcome.streak} 天 · 累计 {outcome.total} 天\n"
+                "明天再来领一张～"
+            )
+            return
+
+        random_settings = self._random_settings()
+        try:
+            send_url, original_url, original_name = await self._random_image_candidate(
+                "", random_settings
+            )
+        except Exception as exc:
+            # RandomMediaError 之外还可能有网络/解析等未预期异常：签到不能因此
+            # 把异常抛回 AstrBot 事件管线，统一降级为可读提示
+            logger.warning(f"签到取图失败: {exc}")
+            yield event.plain_result(
+                f"✅ 签到成功（连续 {outcome.streak} 天），但取图失败：{exc}"
+            )
+            return
+
+        quote = await self._quote_library().pick()
+        header = f"✅ 签到成功 · 连续 {outcome.streak} 天（累计 {outcome.total} 天）"
+        footer = f"连续签到 {outcome.streak} 天 · 累计 {outcome.total} 天"
+        block_name = original_name or clean_display_name(original_url) or "今日签到"
+
+        if settings["render_mode"] == "card":
+            path = await self._checkin_card_path(send_url, quote, footer, settings)
+            if path:
+                try:
+                    async for result in self._yield_delivery(
+                        event,
+                        header,
+                        [{"path": path, "file_name": block_name}],
+                        # 卡片已是成品 JPEG：交给适配器原样发送，避免 auto/bytes
+                        # 再压一次把文字压糊
+                        mode_override="native",
+                        allow_local_fallback=False,
+                        remember_blocks=[{"url": original_url, "file_name": block_name}],
+                    ):
+                        yield result
+                finally:
+                    # 生成器消费完表示回传已结束（或本就未发送），此时删安全
+                    self._remove_quiet(path)
+                return
+            logger.warning("签到卡片合成失败，改用轻量模式")
+
+        async for result in self._yield_delivery(
+            event,
+            f"{header}\n💬 {quote}",
+            [{"url": send_url, "file_name": block_name}],
+            remember_blocks=[{"url": original_url, "file_name": block_name}],
+        ):
+            yield result
 
     @staticmethod
     def _bed_file_id(url: str) -> str:
@@ -4006,6 +4219,10 @@ class ImageTracePlugin(Star):
             self.library.close()
         except Exception as e:
             errors.append(f"图库数据库: {e}")
+        try:
+            self.checkin_store.close()
+        except Exception as e:
+            errors.append(f"签到数据库: {e}")
         if errors:
             logger.error("图片溯源插件卸载时部分资源清理失败: " + "；".join(errors))
         logger.info("图片溯源插件已卸载。")
