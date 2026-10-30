@@ -1258,6 +1258,7 @@ class ImageTracePlugin(Star):
         """
         raw = self._dict_cfg("checkin")
         headers = raw.get("quote_api_headers")
+        source = str(raw.get("quote_source") or "").strip().lower()
         return {
             "enabled": bool_or(raw.get("enabled"), True),
             "render_mode": "simple"
@@ -1265,9 +1266,8 @@ class ImageTracePlugin(Star):
             else "card",
             "border_px": max(0, min(200, as_int(raw.get("border_px"), 0))),
             "utc_offset_hours": max(-12, min(14, as_int(raw.get("utc_offset_hours"), 8))),
-            "quote_source": "api"
-            if str(raw.get("quote_source") or "").strip().lower() == "api"
-            else "builtin",
+            "quote_source": source if source in {"api", "mixed"} else "builtin",
+            "quote_local_text": str(raw.get("quote_local_text") or ""),
             "quote_api_url": str(raw.get("quote_api_url") or "").strip(),
             "quote_json_path": str(raw.get("quote_json_path") or "").strip(),
             "quote_api_headers": headers if isinstance(headers, dict) else {},
@@ -1281,11 +1281,12 @@ class ImageTracePlugin(Star):
         return datetime.now(timezone(timedelta(hours=offset_hours))).date()
 
     def _quote_library(self) -> QuoteLibrary:
-        """惰性构造语句库；语句文件缺失时由 QuoteLibrary 用内置语句初始化。"""
+        """惰性构造语句库；文本框留空时读取 quotes.txt，缺失则用内置语句初始化。"""
         if self._quote_library_cache is None:
             settings = self._checkin_settings()
             self._quote_library_cache = QuoteLibrary(
                 os.path.join(self.data_dir, "quotes.txt"),
+                local_text=settings["quote_local_text"],
                 source=settings["quote_source"],
                 api_url=settings["quote_api_url"],
                 json_path=settings["quote_json_path"],
@@ -2846,7 +2847,7 @@ class ImageTracePlugin(Star):
             "· /溯源删除 <编号> —— 删除图库条目（管理员）\n"
             "· /随机图 [目录] —— 从图床随机取一张图片并回传\n"
             "· /随机视频 [目录] —— 从图床随机取一个视频并回传\n"
-            "· /签到 —— 每日签到领取一张带边框与随机语句的随机缩略图（每人每天一次，可 /打卡）\n"
+            "· /签到 —— 每日签到领取一张带边框与随机语句的随机缩略图（每天首次计入天数，同日重复只换图不涨天数，可 /打卡）\n"
             "· /原图 [文件名] —— 取原图：带文件名时直接到图床按名取（无需先回传），"
             "不带文件名取本会话最近回传的原图\n"
             "· /原图修复 —— 清理会话历史里带配文前缀（🖼️ / 🎬 / 序号）的旧记录\n"
@@ -3489,7 +3490,8 @@ class ImageTracePlugin(Star):
         """签到主流程：判定 → 取图 → 取句 → 卡片/轻量交付。
 
         签到记录先落库、再取图：取图失败不回收当天资格，避免接口抖动时用户
-        反复重试刷图；提示文案会明确说明「已签到但取图失败」。
+        反复重试刷图；提示文案会明确说明「已签到但取图失败」。同一天重复签到
+        不再累加天数，但仍重新取图取句，让每次都有新内容。
         """
         settings = self._checkin_settings()
         if not settings["enabled"]:
@@ -3508,12 +3510,13 @@ class ImageTracePlugin(Star):
             yield event.plain_result("签到记录写入失败，请稍后再试。")
             return
         if outcome.already:
-            yield event.plain_result(
-                f"📅 今天已经签到过啦\n"
-                f"🔥 连续签到 {outcome.streak} 天 · 累计 {outcome.total} 天\n"
-                "明天再来领一张～"
+            header = (
+                f"📅 今日已签到 · 连续 {outcome.streak} 天（累计 {outcome.total} 天）"
             )
-            return
+        else:
+            header = (
+                f"✅ 签到成功 · 连续 {outcome.streak} 天（累计 {outcome.total} 天）"
+            )
 
         random_settings = self._random_settings()
         try:
@@ -3524,13 +3527,17 @@ class ImageTracePlugin(Star):
             # RandomMediaError 之外还可能有网络/解析等未预期异常：签到不能因此
             # 把异常抛回 AstrBot 事件管线，统一降级为可读提示
             logger.warning(f"签到取图失败: {exc}")
-            yield event.plain_result(
-                f"✅ 签到成功（连续 {outcome.streak} 天），但取图失败：{exc}"
-            )
+            if outcome.already:
+                yield event.plain_result(
+                    f"📅 今天已经签到过（连续 {outcome.streak} 天），但取图失败：{exc}"
+                )
+            else:
+                yield event.plain_result(
+                    f"✅ 签到成功（连续 {outcome.streak} 天），但取图失败：{exc}"
+                )
             return
 
         quote = await self._quote_library().pick()
-        header = f"✅ 签到成功 · 连续 {outcome.streak} 天（累计 {outcome.total} 天）"
         footer = f"连续签到 {outcome.streak} 天 · 累计 {outcome.total} 天"
         block_name = original_name or clean_display_name(original_url) or "今日签到"
 
@@ -3840,6 +3847,10 @@ class ImageTracePlugin(Star):
         调用方必须标记已发送并 stop_event，否则 respond stage 会照原路（base64
         直传）再发一次，那正是「上传文件大小超过限制」的来源。
 
+        固定 url / url-scaled 通道是例外：某张图没有可交给腾讯的公网直链
+        （只剩本地转码 path，或图床只有内网源）时，该图降级为分片上传——
+        URL 上传没有入参，照原通道发出去必然失败，白记一轮 WARN。
+
         失败语义两档（delivery.qq_on_failure）：
         - fallback（默认）：一张都还没发出去时返回 False，交回原有的本地压缩 /
           缩略图降级链；只要已经发过就绝不再交回，避免同一张图发两遍。
@@ -3862,6 +3873,7 @@ class ImageTracePlugin(Star):
 
         settings = self._random_settings()
         plan: list[tuple[dict, str, str | None]] = []
+        degraded = 0
         for block in images:
             # 固定通道（native/bytes/url/url-scaled）不依赖体积，省掉一次 HEAD 探测
             size = None if mode != "auto" else await self._qq_block_size(block)
@@ -3885,10 +3897,19 @@ class ImageTracePlugin(Star):
                 logger.debug("qq_official 上传通道：该批含直传图，交回原回传逻辑")
                 return False
             if channel in {"url", "url-scaled"} and public_url is None:
-                logger.warning(
-                    f"qq_official 固定直链通道但拿不到公网直链（图床地址疑似内网）: {url}"
-                )
+                # 钉死直链通道，但这张图没有可交给腾讯的公网直链：只剩本地
+                # 转码 path（格式体检把假格式换成 JPEG 时会丢掉 url），或图床
+                # 只有内网源（base_url 未配/本身是内网）。URL 上传没有入参，
+                # 发出去必然失败——降级到分片，图源本机就有，不依赖图床公网可达
+                degraded += 1
+                channel = "bytes"
             plan.append((block, channel, public_url))
+
+        if degraded:
+            logger.info(
+                f"qq_official 直链通道没有可用的公网直链（本地转码图或内网图床），"
+                f"本批 {degraded} 张改走分片上传"
+            )
 
         if mark_compressed:
             # 本通道发的是原图（URL 原样 / 分片原始字节），配文按「原图」口径写，

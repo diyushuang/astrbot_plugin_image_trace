@@ -258,6 +258,15 @@ def extract_quote(payload_text: str, json_path: str = "") -> str | None:
     return text or None
 
 
+def _split_quotes(raw: str) -> tuple[str, ...]:
+    """把多行文本拆成语句：跳过空行与 `#` 开头的注释行。"""
+    return tuple(
+        line.strip()
+        for line in str(raw or "").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    )
+
+
 def _load_quotes(file_path: str) -> tuple[str, ...]:
     """读取本地语句库；缺失时用内置语句初始化，任何失败都回退内置元组。
 
@@ -268,13 +277,9 @@ def _load_quotes(file_path: str) -> tuple[str, ...]:
     if path and os.path.isfile(path):
         try:
             with open(path, encoding="utf-8") as handle:
-                lines = [
-                    line.strip()
-                    for line in handle
-                    if line.strip() and not line.lstrip().startswith("#")
-                ]
+                lines = _split_quotes(handle.read())
             if lines:
-                return tuple(lines)
+                return lines
         except OSError as exc:
             logger.warning(f"读取签到语句库失败，使用内置语句: {exc}")
         return DEFAULT_QUOTES
@@ -298,6 +303,7 @@ class QuoteLibrary:
         self,
         quotes_file: str,
         *,
+        local_text: str = "",
         source: str = "builtin",
         api_url: str = "",
         json_path: str = "",
@@ -305,7 +311,8 @@ class QuoteLibrary:
         timeout: float = 5.0,
         http_getter=None,
     ) -> None:
-        self._quotes = _load_quotes(quotes_file)
+        # 配置面板里的多行文本框优先于 quotes.txt：粘贴即导入，留空才读文件
+        self._quotes = _split_quotes(local_text) or _load_quotes(quotes_file)
         self._source = str(source or "").strip().lower()
         self._api_url = str(api_url or "").strip()
         self._json_path = str(json_path or "").strip()
@@ -356,8 +363,15 @@ class QuoteLibrary:
         return extract_quote(body, self._json_path)
 
     async def pick(self) -> str:
-        """取一条语句：在线优先（可配），任何失败都回退本地语句库。"""
-        if self._source == "api" and self._api_ready:
+        """取一条语句。
+
+        builtin 只用本地；api 在线优先、失败回退本地；mixed 每次随机决定
+        本地或在线（在线失败同样回退本地）。
+        """
+        use_remote = self._source == "api" or (
+            self._source == "mixed" and random.random() < 0.5
+        )
+        if use_remote and self._api_ready:
             remote = await self._fetch_remote()
             if remote:
                 # 在线接口连续返回同一句时，用本地池换一句

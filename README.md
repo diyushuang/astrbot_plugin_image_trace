@@ -46,7 +46,7 @@ _An AstrBot plugin that traces a reposted, compressed or cropped image back to i
 | 🧩 **一次一条** | 向量命中的多张相似图合并为**一条**消息，配文集中在开头（带 `1.`/`2.` 序号）、图片连续排在末尾，避免 QQ 把图片裁成正方形缩略图 |
 | 🗂️ **多种存储** | 图床副本 / 通用 HTTP 图床（Lsky Pro、EasyImages、Chevereto…）/ CloudFlare-ImgBed / Cloudflare R2 / 甲骨文 OCI |
 | 🎲 **随机图** | `/随机图`、`/随机视频` 从图床随机接口取图回传，并可被 LLM 工具 `sendRandomMedia` 调用 |
-| 📅 **每日签到** | `/签到` 每人每天一次，回传一张随机缩略图；默认本地合成「边框 + 下方随机语句」卡片，也支持轻量模式与任意在线语句接口 |
+| 📅 **每日签到** | `/签到` 每天首次计入连续/累计天数；同日重复签到天数不变，但仍会回传一张新的随机缩略图。默认本地合成「边框 + 下方随机语句」卡片，也支持轻量模式与任意在线语句接口 |
 | 🖼️ **`/原图` 直取** | 从会话历史找回原图，或按文件名直接到图床取；均为原图 URL 直传，不下载、不本地中转 |
 | 🧹 **名字自动净化** | 配文前缀（`🖼️`/`🎬`/序号）与图床改名痕迹（毫秒时间戳、`@`→`_`）在展示与直查前统一剥净，复制配文当文件名也能取到图 |
 | 🛡️ **安全加固** | 全部出网经 SSRF 防护（逐跳校验 + IP 钉扎 + 响应限长）；密钥字段在配置面板标记为 secret |
@@ -110,7 +110,7 @@ flowchart LR
 | `/原图修复` | - | 清理会话历史里带配文前缀（`🖼️` / `🎬` / 序号）的旧记录，修复后 `/原图` 才能命中 | 所有人 |
 | `/随机图 [目录]` | `/随机图片` | 从图床随机图接口取一张随机图片并回传 | 所有人 |
 | `/随机视频 [目录]` | - | 从图床随机图接口取一段随机视频并回传 | 所有人 |
-| `/签到` | `/打卡` | 每日签到：每人每天一次，回传带边框与随机语句的随机缩略图 | 所有人 |
+| `/签到` | `/打卡` | 每日签到：首次计入天数；同日重复签到天数不变，但仍回传带边框与随机语句的新缩略图 | 所有人 |
 | `/溯源状态` | - | 查看图库统计与配置摘要 | 所有人 |
 | `/溯源重扫 [force]` | - | 扫描 `scan_dirs` 目录建立/更新索引；`force` 重建全部 | 管理员 |
 | `/溯源删除 <编号>` | - | 按 ID 删除图库条目（同步清理插件侧写入的向量点、远端对象与本地副本） | 管理员 |
@@ -193,7 +193,8 @@ flowchart LR
 | `checkin.render_mode` | `card` | `card`=本地合成「边框 + 语句」卡片（单条图文）/ `simple`=缩略图 + 文字语句（不下载、不合成） |
 | `checkin.border_px` | `0` | 卡片边框宽度；`0`=按图片宽度自动（约 4.5%，最小 12px） |
 | `checkin.utc_offset_hours` | `8` | 签到日期按该 UTC 偏移计算（默认北京时间，每天 0 点刷新） |
-| `checkin.quote_source` | `builtin` | `builtin`=只用本地 `quotes.txt` / `api`=优先在线语句接口，任何失败自动回退本地 |
+| `checkin.quote_source` | `builtin` | `builtin`=只用本地 `quotes.txt` / `api`=优先在线语句接口，失败回退本地 / `mixed`=每次随机本地或在线，在线失败回退本地 |
+| `checkin.quote_local_text` | - | 本地语句多行文本框：每行一句，直接粘贴即可导入；填写后优先于 `quotes.txt`，留空才读文件 |
 | `checkin.quote_api_url` | 一言 | 任意 http(s) GET 语句接口，可自带查询参数；示例见[常见问题](#常见问题) |
 | `checkin.quote_json_path` | `hitokoto` | 语句所在 JSON 点路径（如 `data.content`）；留空自动探测，非 JSON 响应按纯文本取首行 |
 | `checkin.quote_api_headers` | `{}` | 在线语句接口的附加请求头（需 Token / Referer 的服务用这里） |
@@ -472,8 +473,8 @@ QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条
 | `image_bed.py` | 图床与储存桶各模式的上传、直链反解、远端删除 | 上传失败一律回退本地副本，登记流程不中断 |
 | `image_delivery.py` | URL 缩放/原图还原、本地压缩、压缩证据三态、直发结果分类、图床直链拼装、向量命中去重的纯函数 | 不直接访问网络或 AstrBot 事件，便于独立测试 |
 | `random_media.py` | ImgBed 随机图接口客户端与响应解析纯函数；缩略图判定与改名痕迹清洗 | 出网经共享 HTTP 客户端；403 特判不重试；只取直链、不落地字节；前缀清理只认 `^\d{10,}_` 实测形态 |
-| `checkin_store.py` | 每日签到 SQLite 记录：按用户每日一次、连续/累计天数 | 日期由调用方按配置时区算好（本模块只做字符串比较）；写路径持锁；同日重复只读不写 |
-| `checkin_card.py` | 签到语句库（内置 `quotes.txt` + 任意在线接口）与 Pillow 拍立得卡片合成 | 在线失败一律回退本地；无中文字体返回 `None` 交主流程降级；不打包字体 |
+| `checkin_store.py` | 每日签到 SQLite 记录：每天首次计一次、连续/累计天数；同日重复签到只读不写 | 日期由调用方按配置时区算好（本模块只做字符串比较）；写路径持锁 |
+| `checkin_card.py` | 签到语句库（配置面板本地语句 / `quotes.txt` / 任意在线接口）与 Pillow 拍立得卡片合成 | 在线失败一律回退本地；无中文字体返回 `None` 交主流程降级；不打包字体 |
 | `media_history.py` | 会话级原图历史（LRU + 别名键） | 按会话/会话数封顶；主键与展示名双索引 |
 | `s3_store.py` | 纯标准库 AWS SigV4 签名 + 最小 S3 兼容客户端 | 签名与 URL/方法绑定，被重定向即报错而非复用签名 |
 | `vector_search.py` | Qdrant 检索 + OpenAI 兼容 embeddings 客户端；`thumb_url` → 原图反查 | embed 三值须与图床入库侧一致；错误统一归为 `VectorEngineError`；反查命中数必须恰为 1 且**永不抛错** |
@@ -523,8 +524,8 @@ QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条
 
 - 卡片需要中文字体。插件依次查找 Windows（微软雅黑/黑体）、Linux（Noto CJK/文泉驿）、macOS（苹方）；Docker 等精简环境常没有中文字体，可执行 `apt install fonts-wqy-microhei`（或挂载字体目录），也可在 `checkin.font_path` 填字体文件绝对路径。
 - 找不到任何可用中文字体时不会输出豆腐块，而是自动退回 `simple` 模式（缩略图 + 文字语句）。
-- 想改语句：编辑 `data/plugin_data/astrbot_plugin_image_trace/quotes.txt`（一行一句，`#` 开头为注释）；首次运行会自动生成内置语句。
-- 想换在线语句服务：把 `checkin.quote_source` 设为 `api`，`quote_api_url` 填接口地址，`quote_json_path` 按返回填路径——一言 `hitokoto`、今日诗词 `data.content`、纯文本接口留空；需要 Token/Referer 时用 `checkin.quote_api_headers`。接口失败会自动回退本地语句库，不影响签到。
+- 想改语句：在配置面板「本地语句」多行文本框中直接粘贴（每行一句，`#` 开头为注释），保存并重载插件即可；也可以编辑 `data/plugin_data/astrbot_plugin_image_trace/quotes.txt`。文本框非空时优先使用文本框内容，留空才读取文件。
+- 想换在线语句服务：把 `checkin.quote_source` 设为 `api`（在线优先）或 `mixed`（本地/在线随机），`quote_api_url` 填接口地址，`quote_json_path` 按返回填路径——一言 `hitokoto`、今日诗词 `data.content`、纯文本接口留空；需要 Token/Referer 时用 `checkin.quote_api_headers`。接口失败会自动回退本地语句库，不影响签到。
 
 </details>
 

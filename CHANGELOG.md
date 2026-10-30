@@ -2,13 +2,14 @@
 
 ## 1.7.15（2026-10-30，新增每日签到：随机缩略图 + 边框语句卡片）
 
-- **指令**：`/签到`（别名 `/打卡`），按 `sender_id` 全局每人每天一次；当天重复只回文本（含连续/累计天数），不再发图。
+- **指令**：`/签到`（别名 `/打卡`），按 `sender_id` 全局每天首次计入连续/累计天数；同日重复签到天数不变，但仍重新取图取句，每次回传新的卡片。
 - **取图**：复用 `/随机图` 的取图与缩略图替身链路；`/签到` 不指定目录，走 `random_media.default_dir` 目录池。
 - **卡片**：默认 `card` 模式——下载缩略图后用 Pillow 合成「白边 + 下方留白写句」的卡片 JPEG，页脚显示连续/累计天数；`checkin.render_mode=simple` 或字体缺失/下载失败时退化为「缩略图 + 文字」。卡片以成品 JPEG 经 `native` 通道交付，避免二次压缩糊字。
-- **语句**：内置 60 句写入 `data/plugin_data/astrbot_plugin_image_trace/quotes.txt`（可自行增删）；`quote_source=api` 时请求任意 GET 接口，用 `quote_json_path` 取字段（留空自动探测 `hitokoto` / `data.content` 等常见字段），支持 `quote_api_headers`；任何失败回退本地语句库。
+- **语句**：可在配置面板「本地语句」多行文本框直接粘贴导入（每行一句，空行与 `#` 注释忽略），非空时优先于 `quotes.txt`；文本框留空时首次运行仍会把内置 60 句写入 `data/plugin_data/astrbot_plugin_image_trace/quotes.txt`（可自行增删）；`quote_source=api` 时请求任意 GET 接口，`quote_source=mixed` 时每次随机本地或在线；`quote_json_path` 取字段（留空自动探测 `hitokoto` / `data.content` 等常见字段），支持 `quote_api_headers`；任何失败回退本地语句库。
 - **存储**：独立 `checkin.db`（`user_id / last_date / streak / total`），日期按 `checkin.utc_offset_hours`（默认 +8）计算，跨天 0 点刷新；`terminate` 关闭连接。
 - **性能**：本机 Pillow 12.3 实测（真实照片，含解码 + 绘制 + 编码，7 次中位数）：720px 输入 **9.2ms / 76KB** 卡片；1080px 输入 **18.7ms / 165KB** 卡片。合成开销可忽略，主要耗时是网络下载缩略图。
 - **重构**：把 `/随机图` 图片分支的「取图 → 内网改写 / HTTPS 升级 → 缩略图反查 → `_random_send_url`」抽为 `_random_image_candidate` / `_random_image_from_media`，`/签到` 与 `/随机图` 共用，行为不变。
+- **修复**：qq_official 固定 `url` / `url-scaled` 但该图没有可交给腾讯的公网直链（只剩本地转码 path 或图床只有内网源）时，该图降级为分片上传，不再发出一次必败的 URL 上传并记 WARN。
 - **自测**：同天重复 / 次日 / 断签 / 10 线程并发、语句 JSON 路径与自动探测 / 纯文本 / 清洗截断、在线接口成功与失败回退、三档尺寸合成耗时均通过。
 
 ## 1.7.14（2026-10-25，配置面板重构：19 个顶层项 → 7 组，同类合并 + 说明精简）
