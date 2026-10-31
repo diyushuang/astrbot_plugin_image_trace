@@ -143,7 +143,7 @@ def _phash(gray: Image.Image, hash_size: int) -> str:
     if not scale > 0 or abs(med) <= scale * _DEGENERATE_MEDIAN_RATIO:
         # 退化输入：中位数落在浮点噪声里，二值化无意义 → 全零约定码
         return "0" * phash_hex_len(hash_size)
-    return _bits_to_hex((low > np.median(low)).flatten())
+    return _bits_to_hex((low > med).flatten())
 
 
 def _dhash(gray: Image.Image) -> str:

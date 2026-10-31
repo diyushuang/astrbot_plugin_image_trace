@@ -155,6 +155,9 @@ def build_random_api_url(base_url, endpoint, *, directory, content_type) -> str:
     parsed_endpoint = urlsplit(path)
     if parsed_endpoint.scheme or parsed_endpoint.netloc:
         raise RandomMediaError("随机图接口必须是相对路径")
+    if parsed_endpoint.query or parsed_endpoint.fragment:
+        # endpoint 再带查询串/片段会与我们拼的 ?type=... 叠加成非法 URL
+        raise RandomMediaError("随机图接口不能包含查询参数或片段")
 
     params = {"type": "url", "form": "json"}
     target_dir = str(directory or "").strip()

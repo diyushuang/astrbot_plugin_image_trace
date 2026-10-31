@@ -20,8 +20,11 @@ PrepareCallback = Callable[[str, str, bool], dict]
 class GuardedHttpClient:
     """Own one pinned ``aiohttp`` session for all plugin HTTP requests."""
 
-    def __init__(self) -> None:
+    def __init__(self, allowed_private_hosts: set[str] | None = None) -> None:
         self._session: aiohttp.ClientSession | None = None
+        # 同一个集合对象由调用方（插件实例）持有并原地更新；请求时按实例白名单
+        # 豁免私网地址，不依赖 url_guard 的模块级全局集合
+        self.allowed_private_hosts = allowed_private_hosts
 
     async def request(
         self,
@@ -51,6 +54,11 @@ class GuardedHttpClient:
             method,
             url,
             prepare=wrapped_prepare,
+            **(
+                {"allowed_private_hosts": self.allowed_private_hosts}
+                if self.allowed_private_hosts is not None
+                else {}
+            ),
         )
 
     async def close(self) -> None:

@@ -127,8 +127,8 @@ def _mime_for(path: str) -> str:
 def thumb_path_key(url) -> str:
     """取直链里 `/file/` 之后的对象键（相对路径），用作反查的 host 无关判据。
 
-    图床把「同一张图」以两种 host 暴露：内网 `192.9.240.227:7658` 与公网反代
-    `img.dixc.de`（OpenResty → `172.19.0.2:8080`）。`payload.thumb_url` 里存的是
+    图床把「同一张图」以两种 host 暴露：内网 `10.0.0.5:7658` 与公网反代
+    `bed.example.com`（OpenResty → `10.0.0.6:8080`）。`payload.thumb_url` 里存的是
     **入库当时**的那一种（实测本部署全是内网 IP），而插件运行期手上的直链可能是
     另一种，于是整串精确匹配永远 0 命中。对象键与 host 无关，只按它匹配即可。
 
@@ -187,7 +187,7 @@ class VectorEngine:
             0.0,
             min(1.0, as_float(raw.get("duplicate_vector_threshold"), 0.995)),
         )
-        self.top_k = max(1, as_int(raw.get("top_k"), 5))
+        self.top_k = max(1, min(50, as_int(raw.get("top_k"), 5)))
         timeout_s = max(5, as_int(raw.get("request_timeout"), 30))
         self.timeout = aiohttp.ClientTimeout(total=timeout_s)
         self._http_getter = http_getter
@@ -823,8 +823,8 @@ class VectorEngine:
         只有名字，拼出来的就是 `/file/【微博@…】20200207-04：赵今麦海报.jpg`——
         图床里根本不存在这个对象，原图明明在
         `/file/7、综艺节目/爱奇艺《潮流合伙人》/《潮流合伙人》图集/` 下面。
-        实测同一文件的 A/B 对照（线上 http://192.9.240.227:7658 与公网
-        https://img.dixc.de 结果一致）：
+        实测同一文件的 A/B 对照（线上 http://10.0.0.5:7658 与公网
+        https://bed.example.com 结果一致）：
 
             裸文件名   /file/{裸名}            → HTTP 404
             带完整目录 /file/7、综艺节目/…/{裸名} → HTTP 200
@@ -982,9 +982,9 @@ class VectorEngine:
            去匹配。
 
         第二轮是必需的，不是冗余：`thumb_url` 里存的是**入库当时**的 host
-        （实测本部署 6000/6000 全是内网 `192.9.240.227:7658`），而插件运行期
-        手上的直链可能来自公网域名（同一图床的 OpenResty 反代，`img.dixc.de`
-        → `172.19.0.2:8080`）。同一个文件的两种写法 host 不同、路径逐字节相同，
+        （实测本部署 6000/6000 全是内网 `10.0.0.5:7658`），而插件运行期
+        手上的直链可能来自公网域名（同一图床的 OpenResty 反代，`bed.example.com`
+        → `10.0.0.6:8080`）。同一个文件的两种写法 host 不同、路径逐字节相同，
         整串精确匹配必然 0 命中——v1.5.9 的 `/原图` 反查正是死在这里。按路径匹配
         把 host 排除在判据之外，两种写法都能命中。
 
@@ -1120,7 +1120,7 @@ class VectorEngine:
         """
         # mime 为空时保持单参调用，兼容既有调用方/测试对 embed_file(path) 的替换
         vector = await (self.embed_file(path, mime=mime) if mime else self.embed_file(path))
-        file_name = os.path.basename(urlparse(image_url).path) or os.path.basename(path)
+        file_name = os.path.basename(unquote(urlparse(image_url).path)) or os.path.basename(path)
         payload = {
             "src": src or image_url,
             "image_url": image_url,

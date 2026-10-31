@@ -41,13 +41,13 @@
         "description": "【选填】仅管理员可登记原图",
         "type": "bool",
         "default": true,
-        "hint": "开启后只有管理员能执行 /登记原图、/删除 等写操作。"
+        "hint": "开启后只有管理员能执行 /登记原图；/溯源重扫、/溯源删除 始终仅管理员可用。"
       },
       "max_images_per_query": {
         "description": "【选填】单次溯源最多处理图片数",
         "type": "int",
         "default": 3,
-        "hint": "一条消息带多张图时按此截断。",
+        "hint": "一条消息带多张图时按此截断，范围 1~10。",
         "collapsed": true
       },
       "hash_size": {
@@ -71,7 +71,7 @@
         "description": "【选填】未命中时提示的候选数",
         "type": "int",
         "default": 3,
-        "hint": "0=不提示最接近的图。",
+        "hint": "0=不提示最接近的图，范围 0~50。",
         "collapsed": true
       }
     }
@@ -591,7 +591,7 @@
         ],
         "default": "card",
         "obvious_hint": true,
-        "hint": "card=本地合成带边框+语句的卡片（单条图文，需下载缩略图）；simple=缩略图 + 文字语句（不下载、不合成）。"
+        "hint": "card=本地合成带边框+语句的卡片（单条图文，需下载缩略图）；simple=缩略图 + 文字语句（不做卡片合成；图片仍按推送通道交付，auto 下 OneBot 可能本地下载压缩）。"
       },
       "border_px": {
         "description": "【选填】卡片边框宽度（像素）",
@@ -733,7 +733,7 @@
           "jina-image"
         ],
         "default": "nemotron-vl",
-        "hint": "向量模型接口的图片入参风格，需与图床入库侧一致；不一致则检索不到。不确定时保持默认，用 /向量自检 验证。",
+        "hint": "向量模型接口的图片入参风格，需与图床入库侧一致；不一致则检索不到。不确定时保持默认，先用少量图片执行 /溯源 验证。",
         "collapsed": true
       },
       "embed_input_type": {
@@ -754,7 +754,7 @@
         "description": "【选填】向量检索返回候选数",
         "type": "int",
         "default": 5,
-        "hint": "每次从 Qdrant 取回的最相似点数：达到相似度阈值的命中会全部回传（按相似度降序），因此该值同时也是单次回传图片数量的上限；未命中时其中前 top_n 条作为候选列出。",
+        "hint": "每次从 Qdrant 取回的最相似点数：达到相似度阈值的命中会全部回传（按相似度降序），因此该值同时也是单次回传图片数量的上限；未命中时其中前 top_n 条作为候选列出。范围 1~50。",
         "collapsed": true
       },
       "request_timeout": {
@@ -782,13 +782,13 @@
         "description": "【选填】图床哈希索引",
         "type": "bool",
         "default": true,
-        "hint": "启动时从图床拉取预置 pHash，使哈希引擎也能反查图床图片；需已配置向量引擎。"
+        "hint": "启动时从图床拉取预置 pHash，使哈希引擎也能反查图床图片；只需配置 Qdrant 地址（不依赖 embedding）。"
       },
       "remote_hash_ttl": {
         "description": "【选填】哈希缓存有效期（秒）",
         "type": "int",
         "default": 21600,
-        "hint": "超期后下次启动重建。",
+        "hint": "超期或缓存为空时重建；切换 hash_size 后旧精度缓存会自动失效。",
         "collapsed": true
       },
       "remote_hash_max_points": {

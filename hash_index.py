@@ -13,9 +13,11 @@ pHash 正好补上这个空档：拉一份全量哈希（2.4 万张图 × 64 hex
 **复用位矩阵内核**：汉明距离沿用 library.py 的 `_POPCOUNT[xor].sum(axis=1)`
 （一次向量化算出与全库的距离），不另起一套算法——两套算法早晚会在边界位上分叉。
 
-**缓存策略**：索引落盘为 JSON，进程内保留矩阵。命中缓存的条件是「点数没变」：
-Qdrant 的 count 便宜（一次请求），比逐页取版本号划算；点数变了就整体重建，
-不做增量——增量对不上位矩阵的构建方式，容易留下位置错乱的幽灵行。
+**缓存策略**：索引落盘为 JSON，进程内保留矩阵。缓存是否可复用由两层判据决定：
+文件里的 `hex_len` 必须与当前 `hash_size` 一致（否则切换 hash_size 后旧缓存
+会被整批过滤成 0 条），且编译后确实有可用条目；两者任一不满足都按「没有缓存」
+处理并删除，交由 `remote_hash_ttl` 控制的下一次刷新重建。不做增量——增量对不上
+位矩阵的构建方式，容易留下位置错乱的幽灵行。
 """
 
 from __future__ import annotations
@@ -29,10 +31,20 @@ from dataclasses import dataclass
 from urllib.parse import urlparse
 
 import numpy as np
-from astrbot.api import logger
 
-from .features import phash_hex_len
-from .library import _POPCOUNT
+try:
+    from astrbot.api import logger
+except Exception:  # 兼容独立模块加载/本地自测环境
+    import logging
+
+    logger = logging.getLogger("hash_index")
+
+try:
+    from .features import phash_hex_len
+    from .library import _POPCOUNT
+except ImportError:  # 兼容插件以独立模块方式加载
+    from features import phash_hex_len  # type: ignore[no-redef]
+    from library import _POPCOUNT  # type: ignore[no-redef]
 
 # 服务端为「中位数落在浮点噪声里」的退化图（纯色/纯渐变/大面积平坦图）写的哨兵
 # 值。必须与 img-indexer 的 tools/gen_phash.mjs::DEGENERATE_SENTINEL 一致。
@@ -100,6 +112,10 @@ class HashIndex:
 
         缓存文件损坏（写一半断电、手工改坏）一律按「没有缓存」处理并删掉——
         带着半截索引跑检索会给出「未命中」的确定结论，比没有索引危险得多。
+
+        `hex_len` 必须与当前 hash_size 一致：切换 hash_size 后，同一份缓存里
+        的条目会全部因长度不符被过滤，若仍返回成功，调用方会按「缓存新鲜」跳过
+        刷新，图床哈希腿持续为空到 TTL 到期。编译后无可用条目时同样视为无效。
         """
         if not self.cache_path or not os.path.isfile(self.cache_path):
             return False
@@ -109,6 +125,14 @@ class HashIndex:
             items = data.get("items")
             if not isinstance(items, list) or not items:
                 return False
+            declared_hex_len = data.get("hex_len")
+            if declared_hex_len is not None and int(declared_hex_len) != self.expected_hex_len:
+                logger.warning(
+                    "图床哈希缓存精度与当前 hash_size 不一致"
+                    f"（缓存 {declared_hex_len}，当前 {self.expected_hex_len}），将重建"
+                )
+                self._discard_cache_file()
+                return False
             created_at = float(data.get("created_at") or 0)
             count = int(data.get("remote_count") or 0)
         except Exception as exc:
@@ -116,6 +140,11 @@ class HashIndex:
             self._discard_cache_file()
             return False
         self._build(items, remote_count=count, built_at=created_at)
+        if not self._cache[0]:
+            # 条目全部不合规（长度/hex 非法）：保留这份缓存只会让哈希腿静默为空
+            logger.warning("图床哈希缓存无可用条目，将重建")
+            self._discard_cache_file()
+            return False
         logger.info(
             f"图床哈希缓存已载入：{len(self._cache[0])} 条（远端点位 {count}，"
             f"建于 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(created_at))}）"

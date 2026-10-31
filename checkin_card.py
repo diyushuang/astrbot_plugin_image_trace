@@ -280,7 +280,9 @@ def _load_quotes(file_path: str) -> tuple[str, ...]:
                 lines = _split_quotes(handle.read())
             if lines:
                 return lines
-        except OSError as exc:
+        except (OSError, UnicodeError) as exc:
+            # UnicodeDecodeError 不是 OSError：用户用 ANSI/GBK 编辑器保存
+            # quotes.txt 时，只捕 OSError 会让异常逃到 /签到 主流程
             logger.warning(f"读取签到语句库失败，使用内置语句: {exc}")
         return DEFAULT_QUOTES
 

@@ -42,7 +42,7 @@ from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 try:
-    from .checkin_card import QuoteLibrary, compose_poster
+    from .checkin_card import DEFAULT_QUOTES, QuoteLibrary, compose_poster
     from .checkin_store import CheckinStore
     from .common import (
         AI_VERIFY_MAX_CANDIDATES,
@@ -66,6 +66,7 @@ try:
         is_blank,
         is_qq_image_bed_host,
         read_bytes,
+        sanitize_error_text,
         truthy,
     )
     from .features import (
@@ -126,10 +127,10 @@ try:
         strip_leading_decoration,
         swap_url_origin,
     )
-    from .url_guard import read_limited_bytes, set_allowed_private_hosts
+    from .url_guard import read_limited_bytes
     from .vector_search import VectorEngine, VectorEngineError
 except ImportError:  # 兼容插件以独立模块方式加载
-    from checkin_card import QuoteLibrary, compose_poster  # type: ignore[no-redef]
+    from checkin_card import DEFAULT_QUOTES, QuoteLibrary, compose_poster  # type: ignore[no-redef]
     from checkin_store import CheckinStore  # type: ignore[no-redef]
     from common import (  # type: ignore[no-redef]
         AI_VERIFY_MAX_CANDIDATES,
@@ -153,6 +154,7 @@ except ImportError:  # 兼容插件以独立模块方式加载
         is_blank,
         is_qq_image_bed_host,
         read_bytes,
+        sanitize_error_text,
         truthy,
     )
     from features import (  # type: ignore[no-redef]
@@ -213,15 +215,13 @@ except ImportError:  # 兼容插件以独立模块方式加载
         strip_leading_decoration,
         swap_url_origin,
     )
-    from url_guard import (  # type: ignore[no-redef]
-        read_limited_bytes,
-        set_allowed_private_hosts,
-    )
+    from url_guard import read_limited_bytes  # type: ignore[no-redef]
     from vector_search import VectorEngine, VectorEngineError  # type: ignore[no-redef]
 
 PLUGIN_NAME = "astrbot_plugin_image_trace"
 # 扫描目录认可的图片扩展名。TIFF 由 Pillow 原生支持；AVIF 只有 Pillow 11.3+
 # 能解码，旧环境收进来只会让每张 AVIF 都记一条「扫描失败」，故按能力开关。
+# HEIC/HEIF 同理：没有 pillow-heif 时每张都会解码失败，不应纳入扫描。
 IMAGE_EXTS = {
     ".jpg",
     ".jpeg",
@@ -230,13 +230,15 @@ IMAGE_EXTS = {
     ".webp",
     ".bmp",
     ".jfif",
-    ".heic",
-    ".heif",
     ".tif",
     ".tiff",
-} | ({".avif"} if avif_available() else set())
+} | ({".heic", ".heif"} if heif_available() else set()) | (
+    {".avif"} if avif_available() else set()
+)
 # QQ 开放平台富媒体 file_type：1=图片、2=视频、3=语音、4=文件
 QQ_IMAGE_FILE_TYPE = 1
+# 假格式转码前的像素上限：与 features / 签到卡片同一量级，防解压炸弹
+QQ_TRANSCODE_MAX_PIXELS = 50_000_000
 
 # ----------------------------------------------------------------------
 # 配置布局（1.7.14）：同类项合并进 basic / delivery / limits 三个组。
@@ -387,12 +389,16 @@ class ImageTracePlugin(Star):
             expected_phash_hex_len=phash_hex_len(hash_size),
         )
         self.hash_threshold = max(0.0, min(1.0, self._float_cfg("similarity_threshold", 0.85)))
-        self.top_n = max(0, self._int_cfg("top_n", 3))
-        self.max_images_per_query = max(1, self._int_cfg("max_images_per_query", 3))
+        # 配置上限：这两个值直接放大网络请求量与消息长度，手改离谱值时必须收敛
+        self.top_n = max(0, min(50, self._int_cfg("top_n", 3)))
+        self.max_images_per_query = max(1, min(10, self._int_cfg("max_images_per_query", 3)))
         # v1.2.x 的储存桶配置先迁移，再合并（储存桶完整时优先于图床）
         self._migrate_bucket_config()
         self._bed_cfg = self._effective_bed_cfg()
         self._http: GuardedHttpClient | None = None
+        # 内网直连白名单按实例持有：交给本实例的 GuardedHttpClient，避免多个
+        # 插件实例通过模块级全局集合互相覆盖（旧实现 terminate 会清掉别人的白名单）
+        self._allowed_private_hosts: set[str] = set()
         self.bed = ImageBedClient(self.data_dir, self._bed_cfg, self._get_http)
         self.vector = VectorEngine(config, self._get_http)
         # 图床感知哈希索引：把 img-indexer 入库时预置的 pHash 拉到本地，
@@ -405,8 +411,13 @@ class ImageTracePlugin(Star):
         # 回传过的原图直链的历史（供 /原图 找回）；随机图客户端惰性构造
         self.history = MediaHistory()
         self._random_media_client: RandomMediaClient | None = None
-        # 每日签到：独立 SQLite 记录（按用户全局一天一次）与语句库（首次取句时构造）
-        self.checkin_store = CheckinStore(os.path.join(self.data_dir, "checkin.db"))
+        # 每日签到：独立 SQLite 记录（按用户全局一天一次）与语句库（首次取句时构造）。
+        # 签到是附属功能：DB 打不开时降级为「签到不可用」，不能拖垮整个插件加载。
+        self.checkin_store: CheckinStore | None = None
+        try:
+            self.checkin_store = CheckinStore(os.path.join(self.data_dir, "checkin.db"))
+        except Exception as exc:
+            logger.error(f"签到数据库初始化失败，/签到 将不可用: {exc}")
         self._quote_library_cache: QuoteLibrary | None = None
         # 图床缩放能力冷却截止时刻（time.monotonic 口径，0 表示未观测到拒绝）。
         # 探测到 API 级拒绝（405/501 等）后的一段时间内不再探测缩放版。
@@ -435,8 +446,15 @@ class ImageTracePlugin(Star):
     # ------------------------------------------------------------------
 
     def remote_hash_on(self) -> bool:
-        """图床哈希索引开关（默认开；需向量引擎已配置才能拉到数据）。"""
-        return self._bool_cfg("remote_hash_enabled", True) and self.vector.enabled
+        """图床哈希索引开关（默认开；只需 Qdrant 可达，不依赖 embedding）。
+
+        拉取只调用 Qdrant scroll，不碰向量化接口；因此启用判定用 qdrant_ready
+        而不是 vector.enabled——只配 Qdrant、不配 embedding 的纯哈希部署同样
+        应该能用图床哈希索引。
+        """
+        return self._bool_cfg("remote_hash_enabled", True) and bool(
+            getattr(self.vector, "qdrant_ready", False)
+        )
 
     def _remote_hash_ttl(self) -> int:
         """缓存最长有效期（秒）。缓存新鲜时启动/溯源都不重新拉取。"""
@@ -447,9 +465,18 @@ class ImageTracePlugin(Star):
         return max(0, self._int_cfg("remote_hash_max_points", 0))
 
     def _remote_hash_cache_fresh(self) -> bool:
-        """本地缓存是否仍在 remote_hash_ttl 有效期内。"""
+        """本地缓存是否仍在 remote_hash_ttl 有效期内且确实有可用条目。
+
+        仅有 built_at 不够：切换 hash_size 后旧缓存全部长度不符，load_cache
+        仍会返回成功但 count 为 0；此时若按 TTL 判「新鲜」，图床哈希腿会静默
+        空转直到 TTL 到期。要求 count > 0 才能在空缓存时触发重建。
+        """
         built_at = float(getattr(self.remote_hash, "built_at", 0.0) or 0.0)
-        return built_at > 0 and (time.time() - built_at) < self._remote_hash_ttl()
+        return (
+            built_at > 0
+            and self.remote_hash.count > 0
+            and (time.time() - built_at) < self._remote_hash_ttl()
+        )
 
     def _maybe_start_remote_hash_refresh(self) -> None:
         """缓存过期或缺失时才启动刷新。
@@ -854,11 +881,6 @@ class ImageTracePlugin(Star):
             self._remove_quiet(path)
         return ResolvedImage(message=self._download_fail_message())
 
-    async def _resolve_local_file(self, seg) -> tuple[str, bool, str]:
-        """兼容入口：返回 (路径, 是否临时文件, 失败提示)。"""
-        resolved = await self._resolve_local(seg, probe=self._probe_mime)
-        return resolved.path, resolved.is_tmp, resolved.message
-
     @staticmethod
     def _download_fail_message() -> str:
         return (
@@ -1142,8 +1164,9 @@ class ImageTracePlugin(Star):
 
     async def _get_http(self) -> GuardedHttpClient:
         if self._http is None:
-            # 连接器启用 IP 钉扎：出网连接只允许落在 url_guard 校验过的地址上
-            self._http = GuardedHttpClient()
+            # 连接器启用 IP 钉扎：出网连接只允许落在 url_guard 校验过的地址上。
+            # 内网直连白名单按实例传入，避免多实例共享模块级全局集合。
+            self._http = GuardedHttpClient(self._allowed_private_hosts)
         return self._http
 
     def _cleanup_tmp(self) -> None:
@@ -1178,9 +1201,9 @@ class ImageTracePlugin(Star):
         default_dir 支持单个目录或用 `,` 分隔的目录池：图床的 /random 只收单一
         dir，池用于「不指定目录时尽量覆盖整库」——见 pick_default_directory。
 
-        lan_base_url（内网直连）非空时：随机接口改走内网源，其主机注册进
-        url_guard 的私网白名单（仅豁免该主机的私网地址拒绝，其它 SSRF 校验
-        照旧）；每次归一化都重注册，配置改动后热重载即可生效。
+        lan_base_url（内网直连）非空时：随机接口改走内网源，其主机进入本实例
+        的私网白名单（仅豁免该主机的私网地址拒绝，其它 SSRF 校验照旧）；
+        每次归一化都重写本实例白名单，配置改动后热重载即可生效。
         """
         raw = self._dict_cfg("random_media")
         lan_base = str(raw.get("lan_base_url") or "").strip()
@@ -1192,7 +1215,9 @@ class ImageTracePlugin(Star):
             else:
                 logger.warning(f"random_media.lan_base_url 不是有效的 http(s) 地址，已忽略: {lan_base}")
                 lan_base = ""
-        set_allowed_private_hosts({lan_host} if lan_host else ())
+        self._allowed_private_hosts.clear()
+        if lan_host:
+            self._allowed_private_hosts.add(lan_host)
         timeout = as_float(raw.get("timeout"), 10.0)
         if timeout <= 0:
             # 0/负数会让请求立即超时，回退默认值
@@ -1354,12 +1379,41 @@ class ImageTracePlugin(Star):
         return bool(getattr(event, "_image_trace_sent", False))
 
     @staticmethod
+    def _reset_event_sent(event: AstrMessageEvent) -> None:
+        """复位投递标记，供多图查询在两轮不同图片之间使用。
+
+        去重盾的职责是阻止**同一批图片**在回退路径上重复发送，而不是限制
+        整个事件只能发一次；/溯源 一条消息可带多张图（max_images_per_query），
+        每张图都是独立查询，必须在下一轮开始前复位。
+        """
+        try:
+            event._image_trace_sent = False
+        except AttributeError:  # 少数事件实现带 __slots__，标记失败不影响发送
+            logger.debug("事件对象不支持动态属性，跳过已发送标记复位")
+
+    @staticmethod
     def _mark_event_sent(event: AstrMessageEvent) -> None:
         """标记本次事件已投递图片，禁止后续任何回退路径再发一次。"""
         try:
             event._image_trace_sent = True
         except AttributeError:  # 少数事件实现带 __slots__，标记失败不影响发送
             logger.debug("事件对象不支持动态属性，跳过已发送标记")
+
+    @staticmethod
+    def _defer_event_stop(event: AstrMessageEvent, defer: bool | None = None) -> bool:
+        """多图溯源期间延迟 stop_event，避免管道在首图后中断生成器。
+
+        AstrBot 的调度器一旦发现 event 已 stopped，会停止继续消费当前处理器
+        的异步生成器；而 /溯源 需要按 max_images_per_query 依次处理多张图。
+        故在整轮循环内置位，循环结束由 trace 统一 stop。
+        """
+        if defer is not None:
+            try:
+                event._image_trace_defer_stop = bool(defer)
+            except AttributeError:
+                logger.debug("事件对象不支持动态属性，跳过延迟 stop 标记")
+            return bool(defer)
+        return bool(getattr(event, "_image_trace_defer_stop", False))
 
     @staticmethod
     def _vector_caption(block: dict, evidence: CompressionEvidence) -> str:
@@ -1809,6 +1863,10 @@ class ImageTracePlugin(Star):
         明确失败（FAILED）才允许换通道重发；结果未知（超时）一律就此打住——
         请求可能已经送达，再发一次用户就会收到两张一模一样的图。
 
+        投递成功后默认 stop_event 防 respond stage 重发；多图 /溯源 通过
+        `_defer_event_stop` 把 stop 推迟到整轮结束，否则管道会在首图后中断
+        当前处理器，后续图片不再处理。
+
         remember_blocks 供「发缩略图、记原图」使用：/随机图 发出去的是替身
         （thumb_url），但会话历史必须留下原图直链，否则 /原图 只能找回那张 720px
         的缩略图。缺省 None 表示记的就是本次发出的 blocks（其余调用点行为不变）。
@@ -1818,129 +1876,151 @@ class ImageTracePlugin(Star):
             return
         target = self._delivery_target(event)
         self._remember_blocks(event, blocks if remember_blocks is None else remember_blocks)
-        if target.offbox_upload:
-            # 第三方转存平台的两个前置动作（格式体检 → 上传通道接管）收在一个
-            # 入口里：前者可能把假格式换成 path/缩略图 URL，后者必须拿着改写后
-            # 的 block 才能判断该走 URL 还是分片，顺序不可交换
-            blocks, handled = await self._offbox_pipeline(
-                event, header, blocks, mark_compressed=mark_compressed
+        # 格式体检可能把假格式转成本地 JPEG（block["_tmp_owned"]）；这些临时文件
+        # 只服务于本次投递，发送完成后必须删除，否则会随每次 /随机图、/原图 累积。
+        owned_paths: list[str] = []
+        try:
+            if target.offbox_upload:
+                # 第三方转存平台的两个前置动作（格式体检 → 上传通道接管）收在一个
+                # 入口里：前者可能把假格式换成 path/缩略图 URL，后者必须拿着改写后
+                # 的 block 才能判断该走 URL 还是分片，顺序不可交换
+                blocks, handled = await self._offbox_pipeline(
+                    event, header, blocks, mark_compressed=mark_compressed
+                )
+                owned_paths = [
+                    str(block.get("path") or "")
+                    for block in blocks
+                    if block.get("_tmp_owned") and block.get("path")
+                ]
+                if handled:
+                    # 通道接管已自行发完消息：必须标记已发送并 stop_event，否则
+                    # respond stage 会照原路（base64 直传）再发一遍
+                    self._mark_event_sent(event)
+                    if not self._defer_event_stop(event):
+                        event.stop_event()
+                    return
+            mode, max_side, quality, scaled_url_style = self._delivery_config()
+            if mode_override is not None:
+                mode = mode_override
+            image_blocks = [block for block in blocks if block.get("url") or block.get("path")]
+            raw_urls = [str(block["url"]) for block in image_blocks if block.get("url")]
+            all_urls = bool(image_blocks) and len(raw_urls) == len(image_blocks)
+            direct_mode = mode in {"url", "url-scaled"}
+            # URL 直发条件：模式允许 + 全是 URL + 能走 OneBot + 所有 URL 扩展名
+            # 能被协议端解析出宽高（否则 QQ 侧拿不到尺寸，体验差）。
+            # url-scaled 模式下默认走 URL 直传；若 QQ 协议端会剥离查询参数导致
+            # 图床返回原图，可把 scaled_url_style 改为 "cf-path"（路径式，参数
+            # 嵌在路径里不会被剥离，但需图床域名开启 Cloudflare Image Resizing）。
+            direct_ok = (
+                direct_mode
+                and all_urls
+                and target.direct_send
+                and (mode == "url" or all(is_napcat_parseable_url(u) for u in raw_urls))
             )
-            if handled:
-                # 通道接管已自行发完消息：必须标记已发送并 stop_event，否则
-                # respond stage 会照原路（base64 直传）再发一遍
-                self._mark_event_sent(event)
-                event.stop_event()
-                return
-        mode, max_side, quality, scaled_url_style = self._delivery_config()
-        if mode_override is not None:
-            mode = mode_override
-        image_blocks = [block for block in blocks if block.get("url") or block.get("path")]
-        raw_urls = [str(block["url"]) for block in image_blocks if block.get("url")]
-        all_urls = bool(image_blocks) and len(raw_urls) == len(image_blocks)
-        direct_mode = mode in {"url", "url-scaled"}
-        # URL 直发条件：模式允许 + 全是 URL + 能走 OneBot + 所有 URL 扩展名
-        # 能被协议端解析出宽高（否则 QQ 侧拿不到尺寸，体验差）。
-        # url-scaled 模式下默认走 URL 直传；若 QQ 协议端会剥离查询参数导致
-        # 图床返回原图，可把 scaled_url_style 改为 "cf-path"（路径式，参数
-        # 嵌在路径里不会被剥离，但需图床域名开启 Cloudflare Image Resizing）。
-        direct_ok = (
-            direct_mode
-            and all_urls
-            and target.direct_send
-            and (mode == "url" or all(is_napcat_parseable_url(u) for u in raw_urls))
-        )
 
-        # 回传计划最多只算一次：回退路径此前会重跑一遍规划，把同样的探测白做
-        # 第二次（图床还会因此多做一次缩放处理）。
-        plan: tuple[list[str], list[CompressionEvidence]] | None = None
-        if direct_ok:
-            plan = await self._url_delivery_plan(image_blocks, max_side, mode, quality=quality, scaled_url_style=scaled_url_style)
+            # 回传计划最多只算一次：回退路径此前会重跑一遍规划，把同样的探测白做
+            # 第二次（图床还会因此多做一次缩放处理）。
+            plan: tuple[list[str], list[CompressionEvidence]] | None = None
+            if direct_ok:
+                plan = await self._url_delivery_plan(image_blocks, max_side, mode, quality=quality, scaled_url_style=scaled_url_style)
+                urls, evidences = plan
+                if mark_compressed:
+                    self._mark_compressed_captions(blocks, evidences)
+                outcome = await self._send_via_onebot(event, header, blocks, urls)
+                if outcome is not SendOutcome.FAILED:
+                    # SENT 已送达；UNKNOWN 可能已送达——两者都不能再发第二次
+                    self._mark_event_sent(event)
+                    if not self._defer_event_stop(event):
+                        event.stop_event()
+                    return
+
+            if allow_local_fallback and not self._event_already_sent(event):
+                should_compress = mode in {"auto", "bytes"} or (
+                    mode == "url-scaled"
+                    and any(block.get("path") for block in image_blocks)
+                )
+                # 走 URL 直传但没能直发成功：既包括 FAILED 后的回退，也包括扩展名
+                # 让协议端解析不了宽高、压根没尝试直发的情形（改本地压缩成 JPEG 再发）
+                onebot_failed = target.direct_send and direct_mode and all_urls
+                if should_compress or onebot_failed:
+                    if mode in {"auto", "bytes"} and target.direct_send:
+                        # OneBot 下 auto/bytes 直发压缩字节（混合载荷）：压缩结果
+                        # 经 base64 段直达 QQ，不经协议端二次下载，压缩 100% 生效
+                        outcome = await self._local_compress_delivery(
+                            event, header, blocks, image_blocks, mark_compressed=mark_compressed
+                        )
+                        if outcome is not None and outcome is not SendOutcome.FAILED:
+                            # SENT 已送达；UNKNOWN 可能已送达——两者都不能再发第二次
+                            self._mark_event_sent(event)
+                            if not self._defer_event_stop(event):
+                                event.stop_event()
+                            return
+                        # None=准备失败 或 FAILED=直发失败：字节路径已试过，整批改走 URL 链
+                        logger.warning("OneBot 压缩直发未成功，改用标准消息链 URL 发送")
+                    else:
+                        prepared = await self._prepare_delivery_blocks(
+                            image_blocks, compress=mode != "url"
+                        )
+                        if prepared is not None:
+                            evidences = [
+                                CompressionEvidence.COMPRESSED if compressed else CompressionEvidence.ORIGINAL
+                                for _, compressed in prepared
+                            ]
+                            if mark_compressed:
+                                self._mark_compressed_captions(blocks, evidences)
+                            fallback_header = header
+                            if any(
+                                item is CompressionEvidence.COMPRESSED for item in evidences
+                            ):
+                                fallback_header += "（已压缩）"
+                            chain = self._mention_prefix(event)
+                            if fallback_header:
+                                chain.append(Comp.Plain((" " if chain else "") + fallback_header))
+                            image_index = 0
+                            for block in blocks:
+                                if block.get("text"):
+                                    chain.append(Comp.Plain("\n" + str(block["text"])))
+                                if block.get("url") or block.get("path"):
+                                    data, _ = prepared[image_index]
+                                    chain.append(Comp.Image.fromBytes(data))
+                                    image_index += 1
+                            self._mark_event_sent(event)
+                            yield event.chain_result(chain)
+                            return
+                        logger.warning("本地图片回退失败，改用标准消息链 URL 发送")
+
+            if self._event_already_sent(event):
+                return
+            if plan is None:
+                plan = await self._url_delivery_plan(image_blocks, max_side, mode, quality=quality, scaled_url_style=scaled_url_style)
             urls, evidences = plan
             if mark_compressed:
                 self._mark_compressed_captions(blocks, evidences)
-            outcome = await self._send_via_onebot(event, header, blocks, urls)
-            if outcome is not SendOutcome.FAILED:
-                # SENT 已送达；UNKNOWN 可能已送达——两者都不能再发第二次
-                self._mark_event_sent(event)
-                event.stop_event()
-                return
-
-        if allow_local_fallback and not self._event_already_sent(event):
-            should_compress = mode in {"auto", "bytes"} or (
-                mode == "url-scaled"
-                and any(block.get("path") for block in image_blocks)
-            )
-            # 走 URL 直传但没能直发成功：既包括 FAILED 后的回退，也包括扩展名
-            # 让协议端解析不了宽高、压根没尝试直发的情形（改本地压缩成 JPEG 再发）
-            onebot_failed = target.direct_send and direct_mode and all_urls
-            if should_compress or onebot_failed:
-                if mode in {"auto", "bytes"} and target.direct_send:
-                    # OneBot 下 auto/bytes 直发压缩字节（混合载荷）：压缩结果
-                    # 经 base64 段直达 QQ，不经协议端二次下载，压缩 100% 生效
-                    outcome = await self._local_compress_delivery(
-                        event, header, blocks, image_blocks, mark_compressed=mark_compressed
-                    )
-                    if outcome is not None and outcome is not SendOutcome.FAILED:
-                        # SENT 已送达；UNKNOWN 可能已送达——两者都不能再发第二次
-                        self._mark_event_sent(event)
-                        event.stop_event()
-                        return
-                    # None=准备失败 或 FAILED=直发失败：字节路径已试过，整批改走 URL 链
-                    logger.warning("OneBot 压缩直发未成功，改用标准消息链 URL 发送")
-                else:
-                    prepared = await self._prepare_delivery_blocks(
-                        image_blocks, compress=mode != "url"
-                    )
-                    if prepared is not None:
-                        evidences = [
-                            CompressionEvidence.COMPRESSED if compressed else CompressionEvidence.ORIGINAL
-                            for _, compressed in prepared
-                        ]
-                        if mark_compressed:
-                            self._mark_compressed_captions(blocks, evidences)
-                        fallback_header = header
-                        if any(
-                            item is CompressionEvidence.COMPRESSED for item in evidences
-                        ):
-                            fallback_header += "（已压缩）"
-                        chain = self._mention_prefix(event)
-                        if fallback_header:
-                            chain.append(Comp.Plain((" " if chain else "") + fallback_header))
-                        image_index = 0
-                        for block in blocks:
-                            if block.get("text"):
-                                chain.append(Comp.Plain("\n" + str(block["text"])))
-                            if block.get("url") or block.get("path"):
-                                data, _ = prepared[image_index]
-                                chain.append(Comp.Image.fromBytes(data))
-                                image_index += 1
-                        self._mark_event_sent(event)
-                        yield event.chain_result(chain)
-                        return
-                    logger.warning("本地图片回退失败，改用标准消息链 URL 发送")
-
-        if self._event_already_sent(event):
-            return
-        if plan is None:
-            plan = await self._url_delivery_plan(image_blocks, max_side, mode, quality=quality, scaled_url_style=scaled_url_style)
-        urls, evidences = plan
-        if mark_compressed:
-            self._mark_compressed_captions(blocks, evidences)
-        chain = self._mention_prefix(event)
-        if header:
-            chain.append(Comp.Plain((" " if chain else "") + header))
-        image_index = 0
-        for block in blocks:
-            if block.get("text"):
-                chain.append(Comp.Plain("\n" + str(block["text"])))
-            path = str(block.get("path") or "")
-            if block.get("url"):
-                chain.append(Comp.Image.fromURL(urls[image_index]))
-                image_index += 1
-            elif path:
-                chain.append(Comp.Image.fromFileSystem(path))
-        self._mark_event_sent(event)
-        yield event.chain_result(chain)
+            chain = self._mention_prefix(event)
+            if header:
+                chain.append(Comp.Plain((" " if chain else "") + header))
+            # urls / evidences 与 image_blocks（有 url 或 path 的 block）同序，
+            # 而本循环遍历的是全部 blocks（含纯文本 block）。因此计数必须按
+            # 「有图 block」推进，只对 url block 取用 urls——否则前面夹一张
+            # 只有 path 的图（格式体检转码产物）就会让后续 URL 用错下标。
+            image_index = 0
+            for block in blocks:
+                if block.get("text"):
+                    chain.append(Comp.Plain("\n" + str(block["text"])))
+                path = str(block.get("path") or "")
+                if block.get("url"):
+                    chain.append(Comp.Image.fromURL(urls[image_index]))
+                elif path:
+                    chain.append(Comp.Image.fromFileSystem(path))
+                if block.get("url") or path:
+                    image_index += 1
+            self._mark_event_sent(event)
+            yield event.chain_result(chain)
+        finally:
+            # 生成器被消费完/关闭时执行：此时消息已由 OneBot 直发或由 respond
+            # stage 发完，删除转码产物是安全的
+            for owned in owned_paths:
+                self._remove_quiet(owned)
 
     # ------------------------------------------------------------------
     # 指令：溯源
@@ -1954,36 +2034,46 @@ class ImageTracePlugin(Star):
         if not images:
             yield event.plain_result(self._usage())
             return
-        engine = self._engine_choice()
-        budget = self.max_images_per_query
-        if engine == "vector":
-            if not self.vector.enabled:
-                yield event.plain_result(self.vector.config_hint())
+        # 多图查询期间不能逐图 stop_event：AstrBot 调度器一旦看到 stopped 就会
+        # 中断当前生成器，后面的图片不会被处理。整轮结束后再统一 stop。
+        self._defer_event_stop(event, True)
+        try:
+            engine = self._engine_choice()
+            budget = self.max_images_per_query
+            if engine == "vector":
+                if not self.vector.enabled:
+                    yield event.plain_result(self.vector.config_hint())
+                    return
+                for seg in images[:budget]:
+                    self._reset_event_sent(event)
+                    async for item in self._trace_vector(event, seg):
+                        yield item
+                return
+            if engine == "auto" and self.vector.enabled:
+                for seg in images[:budget]:
+                    self._reset_event_sent(event)
+                    async for item in self._trace_auto(event, seg):
+                        yield item
+                return
+            # hash（或 auto 但向量引擎未配置）
+            if self._hash_pool_size() == 0:
+                empty_note = (
+                    "（向量引擎未启用：若图床侧已部署向量库，请检查 vector_search 配置）"
+                    if not self.vector.enabled
+                    else ""
+                )
+                yield event.plain_result(
+                    "图库还是空的：可发送 /登记原图 登记原图，"
+                    "或在插件配置 scan_dirs 填写图床目录后执行 /溯源重扫。" + empty_note
+                )
                 return
             for seg in images[:budget]:
-                async for item in self._trace_vector(event, seg):
+                self._reset_event_sent(event)
+                async for item in self._trace_hash(event, seg):
                     yield item
-            return
-        if engine == "auto" and self.vector.enabled:
-            for seg in images[:budget]:
-                async for item in self._trace_auto(event, seg):
-                    yield item
-            return
-        # hash（或 auto 但向量引擎未配置）
-        if self._hash_pool_size() == 0:
-            empty_note = (
-                "（向量引擎未启用：若图床侧已部署向量库，请检查 vector_search 配置）"
-                if not self.vector.enabled
-                else ""
-            )
-            yield event.plain_result(
-                "图库还是空的：可发送 /登记原图 登记原图，"
-                "或在插件配置 scan_dirs 填写图床目录后执行 /溯源重扫。" + empty_note
-            )
-            return
-        for seg in images[:budget]:
-            async for item in self._trace_hash(event, seg):
-                yield item
+        finally:
+            self._defer_event_stop(event, False)
+            event.stop_event()
 
     # ------------------------------------------------------------------
     # 哈希引擎（原有 pHash 比对逻辑，行为保持不变）
@@ -2135,9 +2225,13 @@ class ImageTracePlugin(Star):
             async for result in self._yield_delivery(event, title, [block]):
                 yield result
         else:
-            yield event.plain_result(
-                f"{title}，但原图文件已不存在："
+            # 本地路径/图床直链都可能暴露服务器目录或内网地址，只进日志
+            logger.warning(
+                f"哈希命中 #{best.id} 的原图不可用: "
                 f"{best.file_path or best.image_url or '未知路径'}"
+            )
+            yield event.plain_result(
+                f"{title}，但原图文件已不存在或无法访问（详情见机器人日志）。"
             )
 
     # ------------------------------------------------------------------
@@ -2345,6 +2439,10 @@ class ImageTracePlugin(Star):
                 # 只为 stop_event 决策等待提示结果；图片可能已经交付，不再回滚。
                 prompt_via_onebot = await prompt_task
                 prompt_task = None
+                if not prompt_via_onebot:
+                    # 协议端明确拒绝提示（FAILED）：图片可能已发，但标题不能丢，
+                    # 改走标准消息链补发一次纯文本
+                    yield event.plain_result(header)
         finally:
             # 投递层异常或消费者提前退出时回收提示任务，避免留下悬挂任务。
             if prompt_task is not None:
@@ -2353,8 +2451,9 @@ class ImageTracePlugin(Star):
                     await prompt_task
         # 提示用 OneBot 原生发出（图片那条未必）时，仍按旧语义停事件；若图片
         # 那条也走了 OneBot，_yield_delivery 已停过，这里重复调用无副作用。
+        # 多图溯源期间由 trace 统一延迟 stop，否则管道会在首图后中断生成器。
         # 放在 yield 之后：第二条消息已经交付，停事件不会把它吞掉。
-        if prompt_via_onebot:
+        if prompt_via_onebot and not self._defer_event_stop(event):
             event.stop_event()
 
     @staticmethod
@@ -2599,7 +2698,11 @@ class ImageTracePlugin(Star):
         开关没开 / 拉取失败（条数 0）/ 拉到了但被大量跳过（skipped 偏高）。
         """
         if not self.remote_hash_on():
-            reason = "未配置向量引擎" if not self.vector.enabled else "已关闭"
+            reason = (
+                "未配置 Qdrant（vector_search.qdrant_url）"
+                if not getattr(self.vector, "qdrant_ready", False)
+                else "已关闭"
+            )
             return f"· 图床哈希索引：{reason}"
         info = self.remote_hash.stats()
         if not info["count"]:
@@ -2794,7 +2897,13 @@ class ImageTracePlugin(Star):
             except Exception as e:
                 logger.warning(f"删除远端对象失败 #{entry_id}: {e}")
         self._remove_local_copy(row)
-        desc = row["note"] or row["file_path"] or row["image_url"] or "无备注"
+        # 展示只用备注：file_path / image_url 可能含服务器目录或内网地址，
+        # 管理员命令的回执同样会进群聊，细节只写日志
+        desc = row["note"] or "无备注"
+        logger.info(
+            f"/溯源删除 #{entry_id}: note={row['note'] or ''} "
+            f"path={row['file_path'] or ''} url={row['image_url'] or ''}"
+        )
         suffix = ("，" + "、".join(notes)) if notes else ""
         yield event.plain_result(f"✅ 已删除 #{entry_id}（{desc}）{suffix}")
 
@@ -2965,10 +3074,10 @@ class ImageTracePlugin(Star):
         `@` 换 `_`），倒推做不到。
 
         **host 差异由反查侧吸收，这里不强行归一化**。实测该部署的 payload：
-            thumb_url = http://192.9.240.227:7658/file/thumbnails/178965…_【微博_…】.jpg
-            image_url = http://192.9.240.227:7658/file/12%E3%80%81…%E5%89%A7%E7%85%A7.jpg
+            thumb_url = http://10.0.0.5:7658/file/thumbnails/178965…_【微博_…】.jpg
+            image_url = http://10.0.0.5:7658/file/12%E3%80%81…%E5%89%A7%E7%85%A7.jpg
         两者都记**内网 IP**；而插件运行期手上的直链可能来自公网反代
-        `img.dixc.de`（OpenResty → `172.19.0.2:8080`，同一图床）。故这里只把
+        `bed.example.com`（OpenResty → `10.0.0.6:8080`，同一图床）。故这里只把
         编码形态还原成原始形态（`unquote`，缩略图那侧存的是**未编码**串），
         实际匹配交给 `original_info_for_thumb`：它先试整串、再退回按 `/file/`
         之后的**对象键**匹配，从而与 host 无关。
@@ -3100,7 +3209,13 @@ class ImageTracePlugin(Star):
         #     为什么 quoted 也可能拦不住：用户引用机器人消息时，QQ 会把图转存到
         #     自己的 CDN，插件手上的直链里**没有 `thumbnails/` 段**，
         #     `is_thumbnail_url` 只能返回 False，于是走到这里。
-        thumb_hit = await self._original_from_thumb_name(name)
+        #
+        #     只对「裸文件名」生效：入参自带目录时（`/原图 目录/海报.jpg`）说明
+        #     用户给的是**原图路径**，而缩略图名反查只按 basename 比对，会把别的
+        #     目录下同名缩略图的原图当成本次要取的文件——比查不到更糟。
+        thumb_hit = ("", "")
+        if "/" not in name:
+            thumb_hit = await self._original_from_thumb_name(name)
         if thumb_hit[1]:
             original_name, original_url = thumb_hit
             logger.info(f"/原图 按缩略图名反查回原图: {name} -> {original_url}")
@@ -3129,7 +3244,11 @@ class ImageTracePlugin(Star):
                     "无法确定你要哪一张。请带上目录再试（如："
                     f"/原图 目录名/{name}）。",
                 )
-            return "", "", f"图床里没有找到「{name}」，已尝试：{candidate}"
+            # 失败文案只带路径、不带主机：图床地址可能配置成内网 IP/内网域名，
+            # 群聊里不应出现；完整直链留在日志，便于管理员核对。
+            candidate_path = unquote(urlsplit(candidate).path)
+            logger.info(f"/原图 图床直查未命中: {name} -> {candidate}")
+            return "", "", f"图床里没有找到「{name}」，已尝试路径：{candidate_path}"
         return name, candidate, ""
 
     async def _file_name_matches(self, name: str) -> int | None:
@@ -3324,7 +3443,9 @@ class ImageTracePlugin(Star):
             media_url = await self._random_client().fetch(target_dir, content_type)
         except RandomMediaError as exc:
             logger.warning(f"获取随机媒体失败: {exc}")
-            yield event.plain_result(f"⚠️ 获取随机媒体失败：{exc}")
+            yield event.plain_result(
+                f"⚠️ 获取随机媒体失败：{sanitize_error_text(exc)}"
+            )
             return
         lan_hosts = self._lan_url_hosts(settings)
         if lan_hosts:
@@ -3497,6 +3618,9 @@ class ImageTracePlugin(Star):
         if not settings["enabled"]:
             yield event.plain_result("每日签到功能已在插件配置中关闭。")
             return
+        if self.checkin_store is None:
+            yield event.plain_result("签到存储不可用（数据库初始化失败），详情请查看机器人日志。")
+            return
         user_id = str(event.get_sender_id() or "").strip()
         if not user_id:
             yield event.plain_result("无法识别发送者，签到失败。")
@@ -3525,19 +3649,25 @@ class ImageTracePlugin(Star):
             )
         except Exception as exc:
             # RandomMediaError 之外还可能有网络/解析等未预期异常：签到不能因此
-            # 把异常抛回 AstrBot 事件管线，统一降级为可读提示
+            # 把异常抛回 AstrBot 事件管线，统一降级为可读提示（URL/内网地址脱敏）
             logger.warning(f"签到取图失败: {exc}")
+            safe_exc = sanitize_error_text(exc)
             if outcome.already:
                 yield event.plain_result(
-                    f"📅 今天已经签到过（连续 {outcome.streak} 天），但取图失败：{exc}"
+                    f"📅 今天已经签到过（连续 {outcome.streak} 天），但取图失败：{safe_exc}"
                 )
             else:
                 yield event.plain_result(
-                    f"✅ 签到成功（连续 {outcome.streak} 天），但取图失败：{exc}"
+                    f"✅ 签到成功（连续 {outcome.streak} 天），但取图失败：{safe_exc}"
                 )
             return
 
-        quote = await self._quote_library().pick()
+        try:
+            quote = await self._quote_library().pick()
+        except Exception as exc:
+            # 语句文件损坏/非 UTF-8/接口构造失败都不该让签到整体失败
+            logger.warning(f"签到语句获取失败，使用内置语句: {exc}")
+            quote = random.choice(DEFAULT_QUOTES)
         footer = f"连续签到 {outcome.streak} 天 · 累计 {outcome.total} 天"
         block_name = original_name or clean_display_name(original_url) or "今日签到"
 
@@ -3637,6 +3767,8 @@ class ImageTracePlugin(Star):
             if kind == "path":
                 new_block.pop("url", None)
                 new_block["path"] = value
+                # 转码产物属于本次投递：由 _yield_delivery 在发送完成后清理
+                new_block["_tmp_owned"] = True
             else:
                 new_block["url"] = value
             rewritten.append(new_block)
@@ -3668,13 +3800,18 @@ class ImageTracePlugin(Star):
                 if qq_upload_safe_image(head):
                     return None
                 # 嗅探已消费前 16 字节：转码必须用完整字节，把 head 拼回去，
-                # 否则 PIL 拿到的是缺了文件头的残缺流，解码必败
-                rest = await read_limited_bytes(resp, limit - len(head))
+                # 否则 PIL 拿到的是缺了文件头的残缺流，解码必败。
+                # 上限按完整响应体算：read_limited_bytes 会拿 Content-Length 与
+                # limit 比较，若传 limit-len(head) 会把恰好等于上限的文件误拒。
+                rest = await read_limited_bytes(resp, limit)
                 data = head + rest
+                if len(data) > limit:
+                    logger.warning(f"qq_official 图片超过体检上限，按原样交付: {len(data)} 字节")
+                    return None
         except Exception as exc:
             logger.warning(f"qq_official 图片格式体检失败，按原样交付: {exc}")
             return None
-        path = await asyncio.to_thread(self._write_transcoded_jpeg, bytes(data))
+        path = await asyncio.to_thread(self._write_transcoded_jpeg, data)
         if path:
             return ("path", path)
         file_id = self._bed_file_id(url)
@@ -3709,6 +3846,11 @@ class ImageTracePlugin(Star):
             return None
         try:
             with Image.open(io.BytesIO(data)) as image:
+                if image.width * image.height > QQ_TRANSCODE_MAX_PIXELS:
+                    logger.warning(
+                        f"qq_official 待转码图片像素过大，跳过转码: {image.size}"
+                    )
+                    return None
                 fixed = ImageOps.exif_transpose(image)
                 if fixed.mode not in ("RGB", "L"):
                     fixed = fixed.convert("RGB")
@@ -3777,9 +3919,8 @@ class ImageTracePlugin(Star):
         base_url，故命中内网主机时按 base_url 换源（只换协议+主机端口，路径与
         查询串原样保留）。
 
-        判定不能只看 IP 段：本部署的内网直连地址是 `192.9.240.227`，它属于
-        **公网段**（RFC1918 私有段只有 10/8、172.16/12、192.168/16），句法检查
-        会把它当成公网地址放行。因此以配置为准：
+        判定不能只看 IP 段：曾遇到把云厂商分配的公网段 IP 当作内网直连地址的
+        部署，句法检查会把它当公网地址放行。因此以配置为准：
 
         1. 命中内网直连主机（lan_base_url）→ 按 base_url 换回公网源；
         2. 换完仍落在内网主机上（说明 base_url 本身就配成了内网）→ 不可用；
@@ -3943,7 +4084,9 @@ class ImageTracePlugin(Star):
                         "qq_official 上传通道不可用，交回原回传逻辑（本地压缩/缩略图）"
                     )
                     return False
-                await self._qq_notify(event, target, f"⚠️ 图片发送失败：{detail}")
+                await self._qq_notify(
+                    event, target, f"⚠️ 图片发送失败：{sanitize_error_text(detail)}"
+                )
                 return True
             sent_any = True
         return True
@@ -4220,8 +4363,8 @@ class ImageTracePlugin(Star):
 
     async def terminate(self):
         errors: list[str] = []
-        # 内网直连白名单随插件卸载清理，避免残留到同进程的其它插件实例
-        set_allowed_private_hosts(())
+        # 本实例的内网直连白名单随插件卸载清空（模块级全局已不再被本实例使用）
+        self._allowed_private_hosts.clear()
         await self._stop_remote_hash_refresh(errors)
         if self._http is not None:
             try:
@@ -4240,10 +4383,11 @@ class ImageTracePlugin(Star):
             self.library.close()
         except Exception as e:
             errors.append(f"图库数据库: {e}")
-        try:
-            self.checkin_store.close()
-        except Exception as e:
-            errors.append(f"签到数据库: {e}")
+        if self.checkin_store is not None:
+            try:
+                self.checkin_store.close()
+            except Exception as e:
+                errors.append(f"签到数据库: {e}")
         if errors:
             logger.error("图片溯源插件卸载时部分资源清理失败: " + "；".join(errors))
         logger.info("图片溯源插件已卸载。")

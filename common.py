@@ -7,6 +7,7 @@ image_bed / vector_search / s3_store 取用，避免同一份真值表与解析
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 USER_AGENT = "AstrBot-Plugin-ImageTrace/1.0"
@@ -129,3 +130,25 @@ def as_float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+# 用户可见文案里的 URL / 裸 IPv4：错误详情只进日志，不能把内网地址带进群聊
+_URL_IN_TEXT_RE = re.compile(r"(?:https?|ftp)://[^\s'\"<>，。；：、）】]+", re.IGNORECASE)
+_IPV4_IN_TEXT_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b")
+
+
+def sanitize_error_text(value: Any, limit: int = 200) -> str:
+    """把异常文本收敛成可进群聊的短句：隐藏 URL 与 IP，并截断长度。
+
+    仅用于**用户可见**的错误提示；完整异常仍应写日志。管理员配置的图床
+    地址可能含内网 IP 或带签名的查询串，异常字符串常把它们原样拼进去。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return "未知错误（详情见机器人日志）"
+    text = _URL_IN_TEXT_RE.sub("<地址已隐藏>", text)
+    text = _IPV4_IN_TEXT_RE.sub("<地址已隐藏>", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "…"
+    return text

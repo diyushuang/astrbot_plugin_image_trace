@@ -182,10 +182,6 @@ class S3CompatClient:
     async def delete_object(self, bucket: str, key: str) -> None:
         await self._signed("DELETE", f"/{bucket}/{key}", expect=(200, 204))
 
-    async def aclose(self) -> None:
-        """保留兼容；HTTP 会话由共享客户端统一释放。"""
-        return None
-
     async def _signed(
         self,
         method: str,

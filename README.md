@@ -5,7 +5,7 @@
 
 **群聊里随手转发的一张图，一键找回它的原图。**
 
-[![version](https://img.shields.io/badge/version-1.7.15-blue?style=flat-square)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.7.17-blue?style=flat-square)](./CHANGELOG.md)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4?style=flat-square)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat-square)](./LICENSE)
@@ -46,10 +46,10 @@ _An AstrBot plugin that traces a reposted, compressed or cropped image back to i
 | 🧩 **一次一条** | 向量命中的多张相似图合并为**一条**消息，配文集中在开头（带 `1.`/`2.` 序号）、图片连续排在末尾，避免 QQ 把图片裁成正方形缩略图 |
 | 🗂️ **多种存储** | 图床副本 / 通用 HTTP 图床（Lsky Pro、EasyImages、Chevereto…）/ CloudFlare-ImgBed / Cloudflare R2 / 甲骨文 OCI |
 | 🎲 **随机图** | `/随机图`、`/随机视频` 从图床随机接口取图回传，并可被 LLM 工具 `sendRandomMedia` 调用 |
-| 📅 **每日签到** | `/签到` 每天首次计入连续/累计天数；同日重复签到天数不变，但仍会回传一张新的随机缩略图。默认本地合成「边框 + 下方随机语句」卡片，也支持轻量模式与任意在线语句接口 |
-| 🖼️ **`/原图` 直取** | 从会话历史找回原图，或按文件名直接到图床取；均为原图 URL 直传，不下载、不本地中转 |
+| 📅 **每日签到** | `/签到` 每天首次计入连续/累计天数；同日重复签到天数不变，但仍会回传一张新的随机卡片/缩略图。默认本地合成「边框 + 下方随机语句」卡片，也支持轻量模式与任意在线语句接口 |
+| 🖼️ **`/原图` 直取** | 从会话历史找回原图，或按文件名直接到图床取；默认原图 URL 直传、不下载不本地中转。QQ 官方机器人拿不到公网直链时按上传通道降级（固定 `bytes` 或本地转码图会先落盘） |
 | 🧹 **名字自动净化** | 配文前缀（`🖼️`/`🎬`/序号）与图床改名痕迹（毫秒时间戳、`@`→`_`）在展示与直查前统一剥净，复制配文当文件名也能取到图 |
-| 🛡️ **安全加固** | 全部出网经 SSRF 防护（逐跳校验 + IP 钉扎 + 响应限长）；密钥字段在配置面板标记为 secret |
+| 🛡️ **安全加固** | 插件自身发起的全部出网（下载兜底、图床 / 对象存储 / Qdrant / 随机图 / 语句接口）经 SSRF 防护（逐跳校验 + IP 钉扎 + 响应限长）；密钥字段在配置面板标记为 secret。平台适配器自身的上传/拉流请求由其负责，不经过本插件的 `url_guard` |
 
 > [!NOTE]
 > `/溯源` 日常查询只依赖配置好的向量 AI 与 Qdrant；哈希引擎可全程本地运行，不依赖任何外部服务。图床哈希索引的**拉取**需要 Qdrant 可达，但拉下来之后检索全程离线。
@@ -76,7 +76,7 @@ flowchart LR
     I -- 命中 --> J["先发命中提示，再一条消息回传全部相似图（记入会话级原图历史）"]
     I -- 未命中 --> K["提示未找到（哈希引擎可展示最接近候选）"]
     N --> J
-    J --> L["/原图 [文件名]：剥离 width/height/fit/fallback，原图 URL 直取（不下载、不本地中转）"]
+    J --> L["/原图 [文件名]：剥离 width/height/fit/fallback，默认原图 URL 直取（QQ 官方无公网直链时按上传通道降级）"]
 ```
 
 ## 安装
@@ -110,7 +110,7 @@ flowchart LR
 | `/原图修复` | - | 清理会话历史里带配文前缀（`🖼️` / `🎬` / 序号）的旧记录，修复后 `/原图` 才能命中 | 所有人 |
 | `/随机图 [目录]` | `/随机图片` | 从图床随机图接口取一张随机图片并回传 | 所有人 |
 | `/随机视频 [目录]` | - | 从图床随机图接口取一段随机视频并回传 | 所有人 |
-| `/签到` | `/打卡` | 每日签到：首次计入天数；同日重复签到天数不变，但仍回传带边框与随机语句的新缩略图 | 所有人 |
+| `/签到` | `/打卡` | 每日签到：首次计入天数；同日重复签到天数不变，但仍回传新的卡片/缩略图 | 所有人 |
 | `/溯源状态` | - | 查看图库统计与配置摘要 | 所有人 |
 | `/溯源重扫 [force]` | - | 扫描 `scan_dirs` 目录建立/更新索引；`force` 重建全部 | 管理员 |
 | `/溯源删除 <编号>` | - | 按 ID 删除图库条目（同步清理插件侧写入的向量点、远端对象与本地副本） | 管理员 |
@@ -152,7 +152,7 @@ flowchart LR
 | `basic.hash_similarity_threshold` | `0.85` | 哈希引擎命中阈值（0~1），相似度 = 1 − 汉明距离 ÷ 总位数 |
 | `basic.ai_verify` | `false` | 是否用视觉大模型复核命中结果 |
 | `basic.register_admin_only` | `true` | 仅管理员可登记原图 |
-| `basic.max_images_per_query` | `3` | 单次溯源最多处理图片数 |
+| `basic.max_images_per_query` | `3` | 单次溯源最多处理图片数，范围 1~10 |
 | `delivery.napcat_mode` | `auto` | NapCat / OneBot 推送通道：`auto` / `native` / `bytes` / `url` / `url-scaled`（[详见下文](#回图模式)） |
 | `delivery.qq_mode` | `auto` | QQ 官方机器人推送通道，取值同上 |
 | `delivery.napcat_max_side` | `1920` | 缩放或本地压缩的最长边，范围 1~4096 |
@@ -169,10 +169,10 @@ flowchart LR
 | 配置 | 默认 | 说明 |
 | --- | --- | --- |
 | `basic.hash_size` | `16` | pHash 精度：16→256bit；可选 4/8/12/16/20/24/28/32（须为 4 的倍数）。**修改后需 `/溯源重扫 force`** |
-| `basic.top_n` | `3` | 未命中时提示的最接近候选数，`0` 表示不提示 |
+| `basic.top_n` | `3` | 未命中时提示的最接近候选数，`0` 表示不提示，范围 0~50 |
 | `limits.max_download_mb` | `20` | 单张图片下载上限（MB） |
-| `limits.remote_hash_enabled` | `true` | 图床哈希索引：把图床预置的 pHash 拉到本地，让哈希检索也能反查图床图。需已配置 `vector_search` |
-| `limits.remote_hash_ttl` | `21600` | 图床哈希缓存有效期（秒），超期后启动时重建 |
+| `limits.remote_hash_enabled` | `true` | 图床哈希索引：把图床预置的 pHash 拉到本地，让哈希检索也能反查图床图。只需配置 `vector_search.qdrant_url`（不依赖 embedding） |
+| `limits.remote_hash_ttl` | `21600` | 图床哈希缓存有效期（秒），超期或缓存为空时重建 |
 | `limits.remote_hash_max_points` | `0` | 拉取上限，`0`=不限；调试可设 `50` 先验证链路 |
 | `delivery.napcat_target_kb` | `0` | 压缩目标体积（KB，0=不限制）；非 0 时启用质量阶梯 |
 | `delivery.napcat_webp` | `false` | 压缩输出改用 WebP（体积更小、编码更慢；反而变大时回退原字节） |
@@ -190,7 +190,7 @@ flowchart LR
 | `random_media.show_file_info` / `enable_llm` | `true` / `true` | 回传是否附带文件名 / 是否允许 LLM 工具调用 |
 | `random_media.send_thumbnail` | `true` | `/随机图` 发 720px 缩略图替身；会话历史仍记原图，`/原图` 不受影响；查不到替身时发原图 |
 | `checkin.enabled` | `true` | 启用每日签到；关闭后 `/签到` 只提示功能已关闭 |
-| `checkin.render_mode` | `card` | `card`=本地合成「边框 + 语句」卡片（单条图文）/ `simple`=缩略图 + 文字语句（不下载、不合成） |
+| `checkin.render_mode` | `card` | `card`=本地合成「边框 + 语句」卡片（单条图文）/ `simple`=缩略图 + 文字语句（不做卡片合成；图片仍按推送通道交付，`auto` 下 OneBot 可能本地下载压缩） |
 | `checkin.border_px` | `0` | 卡片边框宽度；`0`=按图片宽度自动（约 4.5%，最小 12px） |
 | `checkin.utc_offset_hours` | `8` | 签到日期按该 UTC 偏移计算（默认北京时间，每天 0 点刷新） |
 | `checkin.quote_source` | `builtin` | `builtin`=只用本地 `quotes.txt` / `api`=优先在线语句接口，失败回退本地 / `mixed`=每次随机本地或在线，在线失败回退本地 |
@@ -412,7 +412,7 @@ QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条
 | `embed_input_type` | 仅 nemotron-vl 相关：非对称模型的 input_type，图片只能走 passage 侧（插件固定 passage），需与入库侧一致 |
 | `similarity_threshold` | cosine 相似度阈值，默认 `0.80`（建议用成对图片实测校准） |
 | `duplicate_vector_threshold` | 重复图合并阈值，默认 `0.995`；达到该值视为同一张图，只回传代表图 |
-| `top_k` | 每次取回候选数，默认 `5` |
+| `top_k` | 每次取回候选数，默认 `5`，范围 1~50 |
 | `request_timeout` | 请求超时（秒），默认 `30` |
 | `vector_index_on_register` | `/登记原图` 后是否插件侧同步写向量库，默认开；图床自带服务器侧钩子时自动跳过，避免重复计算 |
 
@@ -445,7 +445,7 @@ QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条
 3. **特征计算** — 灰度化 → EXIF 转正 → 缩放 → DCT（预计算正交矩阵）→ 低频中值二值化得到 pHash，辅以 dHash/aHash；全程在 `asyncio.to_thread` 中执行，不阻塞事件循环。
 4. **相似度检索** — 图库哈希常驻内存（numpy 位矩阵，整体替换 + 快照读），XOR + 查表 popcount 批量算汉明距离，数万张图毫秒级；向量引擎走 Qdrant 检索并做同图去重。
 5. **结果回传** — 统一入口收口哈希、向量、随机图三条链路：QQ `aiocqhttp` 优先经 OneBot 原生接口直传 URL，失败后回退本地压缩，最后回退标准消息链（细节见[回图模式](#回图模式)）。
-6. **`/原图` 直取** — `/溯源` 与 `/随机图` 回传的图片都记入会话级原图历史；`/原图` 据此把原图直链直接下发，不下载不本地中转；历史未命中时按文件名拼图床直链、探测存在后直传。
+6. **`/原图` 直取** — `/溯源` 与 `/随机图` 回传的**带公开直链**图片都记入会话级原图历史；`/原图` 据此把原图直链直接下发，默认不下载不本地中转（QQ 官方机器人拿不到公网直链时按上传通道降级）；历史未命中时按文件名拼图床直链、探测存在后直传。仅本地路径（local 模式且无直链）的命中无法进历史，需重新 `/溯源`。
 
 <details>
 <summary><b>技术细节：为什么哈希引擎也"AI"？pHash 是怎么算的？</b></summary>
@@ -461,7 +461,7 @@ QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条
 <details>
 <summary><b>模块职责与关键约束（15 个模块，点击展开）</b></summary>
 
-依赖方向单向：`main` → 各子模块；子模块 → `common` / `http_client` / `url_guard`。
+依赖方向以 `main` → 各子模块为主；少量子模块复用既有能力（`hash_index` → `features` / `library`，`vector_search` / `media_history` → `random_media`，`image_bed` → `s3_store`），通用件（`common` / `http_client` / `url_guard`）被子模块共享。
 
 | 文件 | 职责 | 关键约束 |
 | --- | --- | --- |
@@ -485,13 +485,13 @@ QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条
 
 ```
 登记原图：
-  图片段 → _resolve_local_file（AstrBot 媒体解析优先，失败走 SSRF 校验兜底下载）
+  图片段 → _resolve_local（AstrBot 媒体解析优先，失败走 SSRF 校验兜底下载）
         → compute_features（to_thread）→ add_if_absent 查重（锁内原子）
         → bed.store()（按生效的储存桶/图床模式上传，失败回退本地副本）→ 写库
         → 可选：同步向量点（内容指纹派生 point id，幂等）
 
 /溯源：
-  图片段 → _resolve_local_file
+  图片段 → _resolve_local
         → 向量引擎：embed_file → Qdrant points/query（旧版回退 points/search）→ 阈值过滤与同图去重
         或 哈希引擎：本地图库 search + 图床索引 search（两腿按相似度合并，同分本地优先）
                      → 阈值过滤 → 可选 AI 复核
@@ -543,7 +543,7 @@ QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条
 
 - 图床里的图不在机器人磁盘上，`scan_dirs` 扫不到。开启后插件会把图床侧（img-indexer）入库时算好的感知哈希**整体拉到本地**，于是哈希引擎也能反查图床原图——不必等向量的多模态推理，毫秒级出结果。
 - 关闭只影响哈希引擎的覆盖面（退化为仅本地 `scan_dirs`），不影响向量引擎与其它功能。
-- 拉取需要 Qdrant 可达，缓存到 `remote_phash.json` 后检索全程离线；默认每 6 小时（`remote_hash_ttl`）在启动时自动刷新一次。
+- 拉取需要 Qdrant 可达，缓存到 `remote_phash.json` 后检索全程离线；默认每 6 小时（`remote_hash_ttl`）在启动时自动刷新一次。切换 `hash_size` 后旧精度缓存会自动失效重建，不会继续空转。
 - **索引依赖两侧哈希口径逐位一致**：插件 `features.py` 与 img-indexer 的 `src/lib/phash.mjs` 必须给出同一个码。若只改一侧，检索相似度会集体塌到 0.5 附近、表现为「什么都查不到」且**不报错**。改任一侧后请用 img-indexer 的 `tools/verify_phash.mjs` 做双向比对。
 - 想先验证链路（尤其容器内 HEIC 解码）可把 `remote_hash_max_points` 设为 `50`，只拉少量点位试跑。
 
@@ -646,7 +646,7 @@ v1.5.7 起改为「文字集中 → 图片集中」：标题与全部配文合�
 v1.6.0 已修复。这里前后有两层原因：
 
 1. **v1.5.9 修的**——**引用图按名直查**这一步错位：引用上一条 `/随机图` 消息时，引用直链本身就指向 `thumbnails/…`，插件直接拿它当原图名拼直链，于是「查原图」查回来的正是那张替身；
-2. **v1.6.0 修的**——反查的匹配判据**混进了 host**：Qdrant 里 `thumb_url` 存的是入库当时的地址（本部署实测全是内网 `192.9.240.227:7658`），而插件运行期手上的直链可能来自公网反代 `img.dixc.de`（同一个图床）。host 不同、路径相同，整串精确匹配必然 0 命中，于是反查全部落空。
+2. **v1.6.0 修的**——反查的匹配判据**混进了 host**：Qdrant 里 `thumb_url` 存的是入库当时的地址（本部署实测全是内网 `10.0.0.5:7658`），而插件运行期手上的直链可能来自公网反代 `bed.example.com`（同一个图床）。host 不同、路径相同，整串精确匹配必然 0 命中，于是反查全部落空。
 
 现在的处理分两轮：先按整串精确匹配，落空后改用 `/file/` 之后的**对象键**（与 host 无关）再匹配一轮；两轮都要求 `count(exact)` 命中数**恰好为 1**，命中即换成真正的原图直链交付。
 
@@ -761,6 +761,8 @@ OneBot 图片直发（send_group_msg，4 张）：发送未确认：协议端 se
 | 项 | 位置 / 要求 |
 | --- | --- |
 | 图库索引 | `data/plugin_data/astrbot_plugin_image_trace/library.db`（SQLite） |
+| 签到记录 | `data/plugin_data/astrbot_plugin_image_trace/checkin.db`（SQLite，用户 ID / 连续天数 / 累计天数） |
+| 签到语句库 | `data/plugin_data/astrbot_plugin_image_trace/quotes.txt`（首次运行自动写入内置 60 句，可自行增删） |
 | 图床哈希缓存 | `data/plugin_data/astrbot_plugin_image_trace/remote_phash.json`（约 2.4 万条 ≈ 4MB，可安全删除，下次启动自动重拉） |
 | 本地图床副本 | `data/plugin_data/astrbot_plugin_image_trace/images/` |
 | 临时文件 | `data/plugin_data/astrbot_plugin_image_trace/tmp/`（自动清理） |

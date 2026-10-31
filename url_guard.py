@@ -106,12 +106,18 @@ def _url_origin(url: str) -> str:
     return f"{(parsed.hostname or '').lower()}:{_url_port(parsed)}"
 
 
-def resolve_public_addrs(url: str) -> tuple[str, list[ResolveResult]]:
+def resolve_public_addrs(
+    url: str, allowed_private_hosts: set[str] | None = None
+) -> tuple[str, list[ResolveResult]]:
     """校验 URL 并解析主机。返回 (主机名, 已确认公网的地址列表)。
 
     主机为 IP 字面量时同样返回一份已校验地址，调用方据此钉扎——
     不依赖 aiohttp 对 IP 直连跳过 resolver 的内部实现行为，升级后
     仍保持"未钉扎即拒绝"的 fail-closed 语义。
+
+    allowed_private_hosts 未传（None）时使用模块级全局白名单（兼容既有调用方与
+    测试）；传入集合（含空集合）时只按该集合豁免——GuardedHttpClient 按实例
+    携带自己的集合，避免多个插件实例通过全局变量互相覆盖。
     """
     try:
         parsed = urlparse(url)
@@ -127,7 +133,10 @@ def resolve_public_addrs(url: str) -> tuple[str, list[ResolveResult]]:
 
     # 管理员配置的内网直连主机（如 lan_base_url 的主机）豁免私网地址拒绝；
     # 其余主机维持 fail-closed：解析到内网地址即拒绝
-    allow_private = host.lower() in _ALLOWED_PRIVATE_HOSTS
+    allow_set = (
+        _ALLOWED_PRIVATE_HOSTS if allowed_private_hosts is None else allowed_private_hosts
+    )
+    allow_private = host.lower() in allow_set
 
     # 端口合法性先于任何放行判断，避免 http://1.2.3.4:99999/ 之类绕过
     port = _url_port(parsed)
@@ -290,6 +299,7 @@ async def guarded_request(
     *,
     max_redirects: int = 3,
     prepare: Callable[[str, str, bool], dict] | None = None,
+    allowed_private_hosts: set[str] | None = None,
 ) -> AbstractAsyncContextManager[aiohttp.ClientResponse]:
     """发起经 SSRF 校验的 HTTP 请求，手动跟随重定向并对每一跳重新校验。
 
@@ -305,7 +315,12 @@ async def guarded_request(
     origin = _url_origin(url)
     current = url
     for hop in range(max_redirects + 1):
-        host, addrs = await asyncio.to_thread(resolve_public_addrs, current)
+        if allowed_private_hosts is None:
+            host, addrs = await asyncio.to_thread(resolve_public_addrs, current)
+        else:
+            host, addrs = await asyncio.to_thread(
+                resolve_public_addrs, current, allowed_private_hosts
+            )
         cross_origin = _url_origin(current) != origin
         kwargs = prepare_headers(prepare, current, method, cross_origin)
 
@@ -321,7 +336,9 @@ async def guarded_request(
         if resp.status not in REDIRECT_STATUSES:
             return resp
         location = resp.headers.get("Location", "")
-        await resp.release()
+        # aiohttp 的 ClientResponse.release() 是同步方法（返回 None），不能 await；
+        # 早期测试替身把它写成 async，掩盖了真实环境里「跟一次重定向就 TypeError」。
+        resp.release()
         if not location or hop == max_redirects:
             raise UrlBlockedError(f"重定向无效或次数超过上限 {max_redirects}: {url}")
         current = urljoin(current, location)

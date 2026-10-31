@@ -329,10 +329,10 @@ def is_public_http_url(url: str) -> bool:
     判断为真不代表一定可达（域名可能已失效），判断为假则一定不可达。调用方
     据此把 URL 上传降级到分片，而不是把一次必败的上传发出去。
 
-    注意这条检查**只能识别形如 10/172.16/192.168 的私有段与回环地址**：像
-    `192.9.240.227` 这种被拿来当内网用的地址其实属于公网段，句法上分不出来。
+    注意这条检查**只能识别形如 10/172.16/192.168 的私有段与回环地址**：有些部署
+    会把云厂商分配的公网段 IP 当作内网地址使用，句法上分不出来。
     所以真正决定「图床直链能不能交给腾讯下载」的是配置里的内网/公网地址对比
-    （见 main._qq_public_url），本函数只兜住第三方的明显内网地址。
+    （见 main._public_media_url），本函数只兜住第三方的明显内网地址。
     """
     try:
         parsed = urlsplit(str(url or "").strip())
@@ -644,17 +644,25 @@ def build_imgbed_file_url(base_url: str, file_name: str) -> str | None:
 
     供 /原图 在会话历史未命中时直接按文件名到图床取原图。文件名允许带目录
     （如 `2026/09/abc.jpg`），但拒绝一切可能拼出跨站或路径穿越的输入：绝对
-    URL、`..`、`//`、空名一律返回 None。拼出的结果还必须落回 ImgBed 的
-    /file/ 口径，避免 base 配错时发出一条语法合法却指向别处的链接。
+    URL、`.`/`..` 路径段、空段、反斜杠、控制字符、空名一律返回 None。校验
+    必须在 `unquote` **之后**做：`%2e%2e` 解码前不含字面 `..`，先检查会被绕过。
+    拼出的结果还必须落回 ImgBed 的 /file/ 口径，避免 base 配错时发出一条
+    语法合法却指向别处的链接。
     """
     base = str(base_url or "").strip().rstrip("/")
     name = str(file_name or "").strip().strip("/")
-    if not base or not name or ".." in name or "//" in name:
+    if not base or not name:
         return None
-    parsed = urlsplit(name)
+    decoded = unquote(name)
+    if "\\" in decoded or any(ord(ch) < 32 or ord(ch) == 127 for ch in decoded):
+        return None
+    segments = decoded.split("/")
+    if any(segment in ("", ".", "..") for segment in segments):
+        return None
+    parsed = urlsplit(decoded)
     if parsed.scheme or parsed.netloc:
         return None
-    candidate = f"{base}/file/{quote(unquote(name), safe='/')}"
+    candidate = f"{base}/file/{quote(decoded, safe='/')}"
     return candidate if is_cloudflare_imgbed_url(candidate) else None
 
 
@@ -697,7 +705,7 @@ def prefer_inline_bytes(
 ) -> bool:
     """拿到字节后决定发 base64 段还是 URL 段。
 
-    压缩成功的字节必须内联——这是 local-compress 模式的全部意义，不能
+    压缩成功的字节必须内联——这是 auto/bytes 通道压缩生效的全部意义，不能
     交给协议端二次下载。未压缩的字节仅在内联安全（≤上限）或 URL 不可用
     （无 URL / 协议端解析不了宽高）时内联；未压缩且超上限的巨型动图等
     交给 URL 段，避免单条消息过大。

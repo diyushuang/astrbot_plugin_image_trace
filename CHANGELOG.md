@@ -1,10 +1,33 @@
 # 更新日志
 
+## 1.7.17（2026-10-31，回传链路修复与审查加固）
+
+- **修复（高）**：`guarded_request` 对 `ClientResponse.release()` 误用了 `await`。真实 aiohttp 里该方法是同步的，任何 3xx 重定向都会在跟随第一跳时抛 `TypeError`；早期测试替身写成 async 掩盖了这一点。现改为同步调用，并用真实 aiohttp 重定向实测覆盖。
+- **修复**：回退消息链的 URL 下标只对 URL block 递增，而回传计划按「URL + path block」编号；混合批（如 qq_official 格式体检转码出的本地 path 图）回退时，后续 URL 图会取到空串。现按「有图 block」推进下标。
+- **修复**：`/原图 <目录>/<文件名>` 不再先按 basename 做缩略图名反查——该反查只按文件名比对，可能把另一目录下同名缩略图对应的原图当作要取的文件；带目录的查询继续走图床相对路径直查。
+- **兼容**：`hash_index.py` 补上按平铺模块加载（`from features / library`）的导入回退，与其余模块口径一致，插件以独立模块方式加载时不再 `ImportError`。
+- **加固**：群聊文案去地址化：`/原图` 未命中改为回显尝试路径（不含主机）、哈希命中但原图不可用时不再回显本地路径/直链、`/溯源删除` 回执只用备注、qq_official 上传失败通知统一经 `sanitize_error_text`；完整信息只进日志。
+- **优化**：`_phash` 复用已算出的中位数，避免对低频块重复求 `np.median`。
+- **测试**：新增「混合 path/url 回退下标」用例，扩展「带目录名不触发缩略图名反查」与群聊脱敏断言；全量 **402 passed / 2 skipped**，`ruff check` 全绿。
+
+## 1.7.16（2026-10-30，多图溯源投递修复与一轮审查加固）
+
+- **修复（高）**：一条消息带多张图时，`/溯源` 只投递第一张命中。原因是事件级「已投递」标记 + 每图成功后立即 `stop_event()`，AstrBot 调度器会在首图后中断处理器生成器。现在 `trace` 在每轮不同图片之间复位投递标记，并把 `stop_event()` 延迟到整轮结束；同一批图的回退去重语义不变。
+- **修复（安全）**：`build_imgbed_file_url` 的路径穿越校验改为在 `unquote` **之后**进行，拒绝 `%2e%2e` 编码的上级目录、`.`/空路径段、反斜杠与控制字符；补回归测试。
+- **修复（高）**：切换 `basic.hash_size` 后，旧图床哈希缓存会被整批过滤成 0 条，但仍被判定为「新鲜」，导致哈希腿静默空转到 TTL 到期。`HashIndex.load_cache` 现在校验缓存 `hex_len`，编译后无可用条目也按无效缓存丢弃；`_remote_hash_cache_fresh` 追加 `count > 0` 判据。图床哈希索引的启用判定改用 `qdrant_ready`，只配 Qdrant、不配 embedding 的纯哈希部署也能用。
+- **修复**：`quotes.txt` 被 ANSI/GBK 编辑器保存时 `UnicodeDecodeError` 会逃到 `/签到` 主流程；`_load_quotes` 现捕获 `UnicodeError` 回退内置语句，`_checkin_flow` 对语句库构造/取句再加一层兜底。签到 DB 初始化失败只降级「签到不可用」，不再拖垮插件加载。
+- **修复**：向量同步的 `payload.file_name` 改用 `unquote` 后的真名，避免 `/原图 <中文名>` 的精确反查与展示名出现百分号编码。
+- **修复**：OneBot 命中提示被协议端明确拒绝（FAILED）时，标题改走标准消息链补发，不再静默丢失。
+- **修复**：qq_official 假格式转码的本地 JPEG 在投递完成后删除（避免长期累积）；转码前加 50MP 像素上限；格式体检的响应体上限改为按完整长度校验，修掉 16 字节短读误拒。
+- **加固**：`/随机图`、`/签到` 的用户可见错误统一脱敏（隐藏 URL / IPv4，仅日志保留详情）；随机图 endpoint 拒绝自带查询参数/片段；内网直连白名单改为按插件实例持有，避免多实例互相覆盖；`top_n`（0~50）、`max_images_per_query`（1~10）、`vector_search.top_k`（1~50）增加上限；扫描扩展名中的 HEIC/HEIF 按 `pillow-heif` 能力开关。
+- **清理**：删除无调用点的 `_resolve_local_file` 与 `S3CompatClient.aclose`；同步 README / schema / SETUP 的过期说明，并脱敏文档与注释中的真实部署地址。
+- **测试**：新增 13 例（多图投递、编码路径穿越、哈希缓存精度失配、签到存储/语句/卡片/主流程兜底、错误脱敏、按实例白名单、随机图 endpoint 校验等）。全量 **401 passed / 2 skipped**，`ruff check` 全绿。
+
 ## 1.7.15（2026-10-30，新增每日签到：随机缩略图 + 边框语句卡片）
 
 - **指令**：`/签到`（别名 `/打卡`），按 `sender_id` 全局每天首次计入连续/累计天数；同日重复签到天数不变，但仍重新取图取句，每次回传新的卡片。
 - **取图**：复用 `/随机图` 的取图与缩略图替身链路；`/签到` 不指定目录，走 `random_media.default_dir` 目录池。
-- **卡片**：默认 `card` 模式——下载缩略图后用 Pillow 合成「白边 + 下方留白写句」的卡片 JPEG，页脚显示连续/累计天数；`checkin.render_mode=simple` 或字体缺失/下载失败时退化为「缩略图 + 文字」。卡片以成品 JPEG 经 `native` 通道交付，避免二次压缩糊字。
+- **卡片**：默认 `card` 模式——下载缩略图后用 Pillow 合成「白边 + 下方留白写句」的卡片 JPEG，页脚显示连续/累计天数；`checkin.render_mode=simple` 或字体缺失/下载失败时退化为「缩略图 + 文字」。卡片默认交给适配器原样交付（OneBot 侧 `native`）；QQ 官方通道按其上传配置发送，二者都不会对成品 JPEG 二次压缩。
 - **语句**：可在配置面板「本地语句」多行文本框直接粘贴导入（每行一句，空行与 `#` 注释忽略），非空时优先于 `quotes.txt`；文本框留空时首次运行仍会把内置 60 句写入 `data/plugin_data/astrbot_plugin_image_trace/quotes.txt`（可自行增删）；`quote_source=api` 时请求任意 GET 接口，`quote_source=mixed` 时每次随机本地或在线；`quote_json_path` 取字段（留空自动探测 `hitokoto` / `data.content` 等常见字段），支持 `quote_api_headers`；任何失败回退本地语句库。
 - **存储**：独立 `checkin.db`（`user_id / last_date / streak / total`），日期按 `checkin.utc_offset_hours`（默认 +8）计算，跨天 0 点刷新；`terminate` 关闭连接。
 - **性能**：本机 Pillow 12.3 实测（真实照片，含解码 + 绘制 + 编码，7 次中位数）：720px 输入 **9.2ms / 76KB** 卡片；1080px 输入 **18.7ms / 165KB** 卡片。合成开销可忽略，主要耗时是网络下载缩略图。
@@ -21,7 +44,7 @@
 
 - **分层**：顶层收敛为 `basic`（基础）/ `delivery`（图片推送）/ `image_bed` /
   `storage_bucket` / `random_media` / `vector_search` / `limits`（限制与缓存）
-  七组，仅保留 `advanced_settings` 一个面板开关。
+  七组；进阶项收在各组内，用 WebUI 原生 `collapsed` 折叠。
 - **合并同类项**：
   - `image_delivery` + `qq_upload` → `delivery`，用平台前缀区分：`napcat_*` 8 项、
     `qq_*` 6 项（`qq_upload.direct_max_mb` → `delivery.qq_native_max_mb`，与新词表对齐）；
@@ -145,7 +168,7 @@
   文字说明」；本批已经成功发出过就绝不再交回，避免同一张图发两遍。`/原图` 走
   本通道也发原图（URL 原样 / 分片原始字节），配文按「原图」口径写，不谎称已
   压缩。
-- 公网判定细节：内网直连地址可能是**公网段 IP**（实测 `192.9.240.227` 并不属
+- 公网判定细节：内网直连地址可能是**公网段 IP**（实测 `10.0.0.5` 并不属
   于 RFC1918 私有段），句法级检查分不出来。改为按 `lan_base_url` 把直链换回
   `base_url` 公网源再比对主机，换完仍落在内网主机（`base_url` 也配成内网）才
   判定不可用。
@@ -376,7 +399,7 @@ payload 里只有 `phash`、没有 `image_url`/`src`；`HashIndex.build()` 取�
 
 线上报 `/原图 【微博@YOUKESHU有棵树】20240308-05：抖音直播.jpg` 回
 「图床里没有找到「【微博@YOUKESHU有棵树】20240308-05：抖音直播.jpg」，已尝试：
-`https://img.dixc.de/file/%E3%80%90%E5%BE%AE%E5%8D%9A%40YOUKESHU…jpg`」。
+`https://bed.example.com/file/%E3%80%90%E5%BE%AE%E5%8D%9A%40YOUKESHU…jpg`」。
 
 **这不是新缺陷，是 1.6.2 那条「先反查、再退回拼名」的兜底被真实数据大面积触发。**
 1.6.2 要求反查命中数**恰好为 1** 才采用，`>1` 时有意放弃（当时的理由：同名多份
@@ -420,7 +443,7 @@ payload 里只有 `phash`、没有 `image_url`/`src`；`HashIndex.build()` 取�
 
 ```
 file_name_matches('【微博@YOUKESHU有棵树】20240308-05：抖音直播.jpg') = 2   ← 确为重名
-original_by_file_name(同名) → http://192.9.240.227:7658/file/10、商务宣传/有棵树/
+original_by_file_name(同名) → http://10.0.0.5:7658/file/10、商务宣传/有棵树/
                               有棵树抖音直播（20240304）/【微博@YOUKESHU有棵树】…jpg
                                该直链 HEAD/GET 均 200，3,594,079 字节
 连查 3 次结果完全一致                ← 确定性通过
@@ -488,7 +511,7 @@ original_by_file_name(同名) → http://192.9.240.227:7658/file/10、商务宣�
 /file/7、综艺节目/爱奇艺《潮流合伙人》/《潮流合伙人》图集/【微博@潮流合伙人】20200207-04：赵今麦海报.jpg  → HTTP 200
 ```
 
-A/B 实测（内网 `192.9.240.227:7658` 与公网 `img.dixc.de` 结果一致）：**裸名 404 / 带目录 200**。
+A/B 实测（内网 `10.0.0.5:7658` 与公网 `bed.example.com` 结果一致）：**裸名 404 / 带目录 200**。
 即图床里根本没有「裸名」这个对象——目录层级是对象键的一部分，猜不出来。
 
 - **改为先反查、再退回拼名**：新增 `VectorEngine.original_by_file_name()`，按 Qdrant 的
@@ -518,7 +541,7 @@ A/B 实测（内网 `192.9.240.227:7658` 与公网 `img.dixc.de` 结果一致）
 
 ```
 count(file_name = 【微博@潮流合伙人】…) = 1        ← 精确命中，唯一
-→ payload.image_url = http://192.9.240.227:7658/file/7%E3%80%81…%E6%B5%B7%E6%8A%A5.jpg
+→ payload.image_url = http://10.0.0.5:7658/file/7%E3%80%81…%E6%B5%B7%E6%8A%A5.jpg
 → HEAD 该直链 → 200, Content-Length = 5245245    ← 5.2MB 全尺寸原图，不再是 720px 替身
 ```
 
@@ -573,8 +596,8 @@ count(file_name = 【微博@潮流合伙人】…) = 1        ← 精确命中�
 
 1.5.9 上线后线上仍报「随机图命中的是缩略图且反查不到原图」，`/原图` 依旧拿不到
 原图。根因是**反查的匹配判据里混进了 host**：`payload.thumb_url` 存的是入库当时的
-地址（实测本部署 6000/6000 全是内网 `192.9.240.227:7658`），而插件运行期手上的
-直链可能来自公网反代 `img.dixc.de`（OpenResty → `172.19.0.2:8080`，**同一图床**）。
+地址（实测本部署 6000/6000 全是内网 `10.0.0.5:7658`），而插件运行期手上的
+直链可能来自公网反代 `bed.example.com`（OpenResty → `10.0.0.6:8080`，**同一图床**）。
 同一个文件两种写法 host 不同、路径逐字节相同，整串精确匹配必然 0 命中。
 
 - **反查改为「先整串、再按对象键」两轮匹配**：新增 `thumb_path_key()`，取 `/file/`
