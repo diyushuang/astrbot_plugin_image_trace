@@ -8,6 +8,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -25,4 +26,17 @@ jobs:
       - name: Ruff
         run: ruff check .
       - name: Pytest
-        run: pytest -q
+        # 完整输出写文件，只打印尾部：失败时既能看到摘要与首个 traceback，
+        # 又不会让 GitHub 因步骤日志过大而截断（截断后反而看不到根因）。
+        run: |
+          set +e
+          pytest -q > pytest.log 2>&1
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::group::pytest (tail -n 250)"
+            tail -n 250 pytest.log
+            echo "::endgroup::"
+          else
+            tail -n 20 pytest.log
+          fi
+          exit "$status"
