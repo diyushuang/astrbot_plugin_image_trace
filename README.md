@@ -504,7 +504,8 @@ QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条
 - 配置解析使用 `common.as_int` / `as_float` / `truthy` / `is_blank`，不要写 `value or default`（会把合法的 0 / False 吞掉）；
 - 涉及 SQLite 或大文件复制的调用若出现在 async 上下文，应包 `asyncio.to_thread`；
 - 群聊回复文案保持脱敏：含内网地址 / Key 的错误细节只进日志，不进群聊；
-- 发布包按白名单打包 **22 个文件**（15 个 `.py` + `README.md` / `CHANGELOG.md` / `metadata.yaml` / `requirements.txt` / `_conf_schema.json` / `LICENSE` / `logo.png`），不含 `.git`、`data/` 与会话状态目录；**新增模块必须登记进 `scripts/build_release.py` 的 `PLUGIN_FILES`**，否则安装后会 `ImportError`；
+- 发布包按白名单打包 **22 个文件**（15 个 `.py` + `README.md` / `CHANGELOG.md` / `metadata.yaml` / `requirements.txt` / `_conf_schema.json` / `LICENSE` / `logo.png`），不含 `.git`、`data/`、会话状态目录与测试；**新增模块必须登记进 `scripts/build_release.py` 的 `PLUGIN_FILES`**，否则安装后会 `ImportError`；
+- 测试与开发配置在仓库内（`tests/`、`pytest.ini`、`ruff.toml`、`dev_requirements.txt`），不进入发布包；提交流程由 `.github/workflows/ci.yml` 在 Python 3.10 / 3.12 上跑 `ruff check .` 与 `pytest -q`（本地等价命令需在仓库根执行）；
 - 提交前确认 `metadata.yaml` 的 `version` 使用无 `v` 前缀的 SemVer，并与 `CHANGELOG.md`、README 徽章一致。
 
 </details>

@@ -1,0 +1,11 @@
+target-version = "py310"
+line-length = 100
+
+[lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[lint.isort]
+# 仓库根目录就是包目录，测试从父目录按包名导入。显式声明为 first-party，
+# 否则「在仓库内跑 ruff」会把它当成第三方包而要求不同的 import 排序。
+known-first-party = ["astrbot_plugin_image_trace"]
