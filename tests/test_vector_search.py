@@ -340,10 +340,18 @@ async def test_embed_bytes_reads_chunked_response_body(monkeypatch):
 
 async def test_invalid_embedding_json_retries_once_and_recovers(monkeypatch, caplog):
     engine = make_engine()
+    bad_body = '{"data":[{"embedding":[1]},]}'
+    # JSONDecodeError.pos 的取值随 Python 版本变化（3.14 与 3.10/3.12 差一位），
+    # 断言不能写死；按当前解释器实际解析结果推导期望值。
+    expected_pos = 0
+    try:
+        json.loads(bad_body)
+    except json.JSONDecodeError as exc:
+        expected_pos = exc.pos
     client, delays = use_embed_responses(
         engine,
         [
-            FakeEmbedResponse(200, '{"data":[{"embedding":[1]},]}'),
+            FakeEmbedResponse(200, bad_body),
             FakeEmbedResponse(200, '{"data":[{"embedding":[1, 2]}]}'),
         ],
         monkeypatch,
@@ -355,7 +363,7 @@ async def test_invalid_embedding_json_retries_once_and_recovers(monkeypatch, cap
     assert len(client.calls) == 2
     assert delays == [2]
     assert "Content-Length=29" in caplog.text
-    assert "解析位置=26" in caplog.text
+    assert f"解析位置={expected_pos}" in caplog.text
 
 
 async def test_invalid_embedding_json_has_one_retry_limit(monkeypatch):
