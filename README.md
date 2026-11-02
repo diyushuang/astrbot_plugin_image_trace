@@ -5,7 +5,7 @@
 
 **群聊里随手转发的一张图，一键找回它的原图。**
 
-[![version](https://img.shields.io/badge/version-1.7.17-blue?style=flat-square)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.7.20-blue?style=flat-square)](./CHANGELOG.md)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4?style=flat-square)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat-square)](./LICENSE)
@@ -46,7 +46,7 @@ _An AstrBot plugin that traces a reposted, compressed or cropped image back to i
 | 🧩 **一次一条** | 向量命中的多张相似图合并为**一条**消息，配文集中在开头（带 `1.`/`2.` 序号）、图片连续排在末尾，避免 QQ 把图片裁成正方形缩略图 |
 | 🗂️ **多种存储** | 图床副本 / 通用 HTTP 图床（Lsky Pro、EasyImages、Chevereto…）/ CloudFlare-ImgBed / Cloudflare R2 / 甲骨文 OCI |
 | 🎲 **随机图** | `/随机图`、`/随机视频` 从图床随机接口取图回传，并可被 LLM 工具 `sendRandomMedia` 调用 |
-| 📅 **每日签到** | `/签到` 每天首次计入连续/累计天数；同日重复签到天数不变，但仍会回传一张新的随机卡片/缩略图。默认本地合成「边框 + 下方随机语句」卡片，也支持轻量模式与任意在线语句接口 |
+| 📅 **每日签到** | `/签到` 每天首次计入连续/累计天数；同日重复签到天数不变，但仍会回传一张新的随机卡片/图片。两个维度各自独立：**合不合成**（`card` 卡片 / `simple` 图文直发）与**用哪张图**（`thumbnail` 缩略图 / `original` 原图，与 `/随机图` 的 `send_thumbnail` 互不影响）；`checkin.mode=weibo` 时改为「微博文案 + 图库对应图」，卡片显示博主与发博日期、不显示链接 |
 | 🖼️ **`/原图` 直取** | 从会话历史找回原图，或按文件名直接到图床取；默认原图 URL 直传、不下载不本地中转。QQ 官方机器人拿不到公网直链时按上传通道降级（固定 `bytes` 或本地转码图会先落盘） |
 | 🧹 **名字自动净化** | 配文前缀（`🖼️`/`🎬`/序号）与图床改名痕迹（毫秒时间戳、`@`→`_`）在展示与直查前统一剥净，复制配文当文件名也能取到图 |
 | 🛡️ **安全加固** | 插件自身发起的全部出网（下载兜底、图床 / 对象存储 / Qdrant / 随机图 / 语句接口）经 SSRF 防护（逐跳校验 + IP 钉扎 + 响应限长）；密钥字段在配置面板标记为 secret。平台适配器自身的上传/拉流请求由其负责，不经过本插件的 `url_guard` |
@@ -110,7 +110,8 @@ flowchart LR
 | `/原图修复` | - | 清理会话历史里带配文前缀（`🖼️` / `🎬` / 序号）的旧记录，修复后 `/原图` 才能命中 | 所有人 |
 | `/随机图 [目录]` | `/随机图片` | 从图床随机图接口取一张随机图片并回传 | 所有人 |
 | `/随机视频 [目录]` | - | 从图床随机图接口取一段随机视频并回传 | 所有人 |
-| `/签到` | `/打卡` | 每日签到：首次计入天数；同日重复签到天数不变，但仍回传新的卡片/缩略图 | 所有人 |
+| `/签到` | `/打卡` | 每日签到：首次计入天数；同日重复签到天数不变，但仍回传新的卡片/图片。呈现方式（合成卡片 / 图文直发）与取图方式（缩略图 / 原图）各自独立配置，且不影响 `/随机图`；`checkin.mode=weibo` 时回传「微博文案 + 图库对应图」 | 所有人 |
+| `/签到文案导入` | `/签到文案上传` | 管理员：把微博文案 CSV/MD 作为附件发送，导入插件数据目录；映射表由 `scripts/build_weibo_map.py` 生成 | 管理员 |
 | `/溯源状态` | - | 查看图库统计与配置摘要 | 所有人 |
 | `/溯源重扫 [force]` | - | 扫描 `scan_dirs` 目录建立/更新索引；`force` 重建全部 | 管理员 |
 | `/溯源删除 <编号>` | - | 按 ID 删除图库条目（同步清理插件侧写入的向量点、远端对象与本地副本） | 管理员 |
@@ -188,9 +189,11 @@ flowchart LR
 | `random_media.default_dir` | - | 未指定目录时的默认目录（如 `风景/2026`），留空从根目录取图。支持 `,` 目录池，每次随机取其一 |
 | `random_media.timeout` / `retry_count` | `10` / `3` | 单次请求超时（秒）/ 失败重试次数（指数退避，403 不重试） |
 | `random_media.show_file_info` / `enable_llm` | `true` / `true` | 回传是否附带文件名 / 是否允许 LLM 工具调用 |
-| `random_media.send_thumbnail` | `true` | `/随机图` 发 720px 缩略图替身；会话历史仍记原图，`/原图` 不受影响；查不到替身时发原图 |
+| `random_media.send_thumbnail` | `true` | **只作用于 `/随机图`、`/随机视频`**：发 720px 缩略图替身；会话历史仍记原图，`/原图` 不受影响；查不到替身时发原图。与 `/签到` 完全独立 |
 | `checkin.enabled` | `true` | 启用每日签到；关闭后 `/签到` 只提示功能已关闭 |
-| `checkin.render_mode` | `card` | `card`=本地合成「边框 + 语句」卡片（单条图文）/ `simple`=缩略图 + 文字语句（不做卡片合成；图片仍按推送通道交付，`auto` 下 OneBot 可能本地下载压缩） |
+| `checkin.mode` | `quote` | `quote`=随机图 + 随机语句（现有行为）/ `weibo`=随机取一条微博文案及其图库对应图片；卡片显示博主与发博日期、不显示链接 |
+| `checkin.render_mode` | `card` | **合不合成**：`card`=本地合成「边框 + 语句」卡片（单条图文）/ `simple`=不合成，图片 + 文字语句直接发（图片仍按推送通道交付，`auto` 下 OneBot 可能本地下载压缩） |
+| `checkin.image_mode` | `thumbnail` | **用哪张图**（只作用于 `/签到`，与 `random_media.send_thumbnail` 互不影响）：`thumbnail`=图床 720px 缩略图（快）/ `original`=原图（全尺寸，下载与上传都更慢）；两种取值在 `card` 模式下都会合成卡片（原图先降采样到最长边 1440px） |
 | `checkin.border_px` | `0` | 卡片边框宽度；`0`=按图片宽度自动（约 4.5%，最小 12px） |
 | `checkin.utc_offset_hours` | `8` | 签到日期按该 UTC 偏移计算（默认北京时间，每天 0 点刷新） |
 | `checkin.quote_source` | `builtin` | `builtin`=只用本地 `quotes.txt` / `api`=优先在线语句接口，失败回退本地 / `mixed`=每次随机本地或在线，在线失败回退本地 |
@@ -459,7 +462,7 @@ QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条
 ## 项目结构与开发
 
 <details>
-<summary><b>模块职责与关键约束（15 个模块，点击展开）</b></summary>
+<summary><b>模块职责与关键约束（16 个模块，点击展开）</b></summary>
 
 依赖方向以 `main` → 各子模块为主；少量子模块复用既有能力（`hash_index` → `features` / `library`，`vector_search` / `media_history` → `random_media`，`image_bed` → `s3_store`），通用件（`common` / `http_client` / `url_guard`）被子模块共享。
 
@@ -475,6 +478,7 @@ QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条
 | `random_media.py` | ImgBed 随机图接口客户端与响应解析纯函数；缩略图判定与改名痕迹清洗 | 出网经共享 HTTP 客户端；403 特判不重试；只取直链、不落地字节；前缀清理只认 `^\d{10,}_` 实测形态 |
 | `checkin_store.py` | 每日签到 SQLite 记录：每天首次计一次、连续/累计天数；同日重复签到只读不写 | 日期由调用方按配置时区算好（本模块只做字符串比较）；写路径持锁 |
 | `checkin_card.py` | 签到语句库（配置面板本地语句 / `quotes.txt` / 任意在线接口）与 Pillow 拍立得卡片合成 | 在线失败一律回退本地；无中文字体返回 `None` 交主流程降级；不打包字体 |
+| `weibo_posts.py` | 微博文案 CSV/MD 解析、去重、映射表读写与短链提取 | 纯数据处理，不访问网络、不依赖 AstrBot；MD 正文优先但必须保留 CSV 的链接/code |
 | `media_history.py` | 会话级原图历史（LRU + 别名键） | 按会话/会话数封顶；主键与展示名双索引 |
 | `s3_store.py` | 纯标准库 AWS SigV4 签名 + 最小 S3 兼容客户端 | 签名与 URL/方法绑定，被重定向即报错而非复用签名 |
 | `vector_search.py` | Qdrant 检索 + OpenAI 兼容 embeddings 客户端；`thumb_url` → 原图反查 | embed 三值须与图床入库侧一致；错误统一归为 `VectorEngineError`；反查命中数必须恰为 1 且**永不抛错** |
@@ -504,7 +508,7 @@ QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条
 - 配置解析使用 `common.as_int` / `as_float` / `truthy` / `is_blank`，不要写 `value or default`（会把合法的 0 / False 吞掉）；
 - 涉及 SQLite 或大文件复制的调用若出现在 async 上下文，应包 `asyncio.to_thread`；
 - 群聊回复文案保持脱敏：含内网地址 / Key 的错误细节只进日志，不进群聊；
-- 发布包按白名单打包 **22 个文件**（15 个 `.py` + `README.md` / `CHANGELOG.md` / `metadata.yaml` / `requirements.txt` / `_conf_schema.json` / `LICENSE` / `logo.png`），不含 `.git`、`data/`、会话状态目录与测试；**新增模块必须登记进 `scripts/build_release.py` 的 `PLUGIN_FILES`**，否则安装后会 `ImportError`；
+- 发布包按白名单打包 **23 个文件**（16 个 `.py` + `README.md` / `CHANGELOG.md` / `metadata.yaml` / `requirements.txt` / `_conf_schema.json` / `LICENSE` / `logo.png`），不含 `.git`、`data/`、会话状态目录与测试；**新增模块必须登记进 `scripts/build_release.py` 的 `PLUGIN_FILES`**，否则安装后会 `ImportError`；
 - 测试与开发配置在仓库内（`tests/`、`pytest.ini`、`ruff.toml`、`dev_requirements.txt`），不进入发布包；提交流程由 `.github/workflows/ci.yml` 在 Python 3.10 / 3.12 上跑 `ruff check .` 与 `pytest -q`（本地等价命令需在仓库根执行）；
 - 提交前确认 `metadata.yaml` 的 `version` 使用无 `v` 前缀的 SemVer，并与 `CHANGELOG.md`、README 徽章一致。
 
@@ -521,12 +525,25 @@ QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条
 </details>
 
 <details>
-<summary><b>签到卡片里的字是方框 / 变成了「缩略图 + 文字」？</b></summary>
+<summary><b>签到卡片里的字是方框 / 变成了「图片 + 文字」？</b></summary>
 
 - 卡片需要中文字体。插件依次查找 Windows（微软雅黑/黑体）、Linux（Noto CJK/文泉驿）、macOS（苹方）；Docker 等精简环境常没有中文字体，可执行 `apt install fonts-wqy-microhei`（或挂载字体目录），也可在 `checkin.font_path` 填字体文件绝对路径。
-- 找不到任何可用中文字体时不会输出豆腐块，而是自动退回 `simple` 模式（缩略图 + 文字语句）。
+- 找不到任何可用中文字体时不会输出豆腐块，而是自动退回 `simple` 模式（图片 + 文字语句）。
+- **两个开关别搞混**：`checkin.render_mode` 决定合不合成卡片，`checkin.image_mode` 决定用缩略图还是原图。`image_mode=thumbnail` 时卡片优先用缩略图替身合成（成品最长边只有 1440px，没必要拿原图）；`image_mode=original` 时按你的要求用原图合成，Pillow 会先做 JPEG DCT 缩放再降到 1440px，不会撑爆内存。这两项与 `random_media.send_thumbnail` 互相独立——那个只影响 `/随机图`。
+- **emoji 不会出现在卡片上**：中文字体没有彩色 emoji 字形，画上去就是豆腐块。卡片渲染前会自动剔除 emoji（聊天消息里的原文保留），`★ ♪` 这类字体有字形的符号不受影响。
 - 想改语句：在配置面板「本地语句」多行文本框中直接粘贴（每行一句，`#` 开头为注释），保存并重载插件即可；也可以编辑 `data/plugin_data/astrbot_plugin_image_trace/quotes.txt`。文本框非空时优先使用文本框内容，留空才读取文件。
 - 想换在线语句服务：把 `checkin.quote_source` 设为 `api`（在线优先）或 `mixed`（本地/在线随机），`quote_api_url` 填接口地址，`quote_json_path` 按返回填路径——一言 `hitokoto`、今日诗词 `data.content`、纯文本接口留空；需要 Token/Referer 时用 `checkin.quote_api_headers`。接口失败会自动回退本地语句库，不影响签到。
+
+</details>
+
+<details>
+<summary><b>微博签到模式怎么放文案、怎么保证图文对应？</b></summary>
+
+1. 把微博原创文案 CSV/MD 放到 `data/plugin_data/astrbot_plugin_image_trace/weibo/`，或在群里把文件作为附件发送并执行 `/签到文案导入`（管理员）；
+2. 在插件配置里设 `checkin.mode=weibo`，重载插件；
+3. 用 `scripts/build_weibo_map.py` 生成 `weibo/weibo_post_map.json`（该脚本依赖本机图床索引，**不随插件发布包分发**，需从开发仓库自取）：脚本逐条用微博短链接取该微博图片，算 pHash 后在图床 `remote_phash.json` 索引里反查 `12、日常分享/【微博图集@账号】/` 下的同一张图，写入「文案 → 图库图片」映射；加 `--prefetch-thumbs` 会把匹配到的 720px 缩略图预缓存到 `weibo/thumbs/`；
+4. `/签到` 只读本地映射表，随机取一条微博；`image_mode=thumbnail` 时 card 模式优先读 `weibo/thumbs/` 的本地缩略图（零网络），没有缓存才用 `thumb_url`（优先内网）下载并合成卡片；`image_mode=original` 时一律发/用 `image_url` 原图。一条微博多图时映射脚本只保留一张，满足「只发一张」；
+5. 映射表里匹配不到图的微博仍保留文案，签到时按同账号同日的已匹配图片回退；仍没有图则回退随机语句。映射表比源 CSV/MD 旧时，`/溯源状态` 会提示重新生成。
 
 </details>
 
@@ -764,6 +781,9 @@ OneBot 图片直发（send_group_msg，4 张）：发送未确认：协议端 se
 | 图库索引 | `data/plugin_data/astrbot_plugin_image_trace/library.db`（SQLite） |
 | 签到记录 | `data/plugin_data/astrbot_plugin_image_trace/checkin.db`（SQLite，用户 ID / 连续天数 / 累计天数） |
 | 签到语句库 | `data/plugin_data/astrbot_plugin_image_trace/quotes.txt`（首次运行自动写入内置 60 句，可自行增删） |
+| 微博文案库 | `data/plugin_data/astrbot_plugin_image_trace/weibo/`（放微博原创文案 CSV/MD；也可用 `/签到文案导入` 上传） |
+| 微博签到映射 | `data/plugin_data/astrbot_plugin_image_trace/weibo/weibo_post_map.json`（由 `scripts/build_weibo_map.py` 生成，签到只读此表） |
+| 微博缩略图缓存 | `data/plugin_data/astrbot_plugin_image_trace/weibo/thumbs/`（`--prefetch-thumbs` 预生成，card 模式零网络读本地文件） |
 | 图床哈希缓存 | `data/plugin_data/astrbot_plugin_image_trace/remote_phash.json`（约 2.4 万条 ≈ 4MB，可安全删除，下次启动自动重拉） |
 | 本地图床副本 | `data/plugin_data/astrbot_plugin_image_trace/images/` |
 | 临时文件 | `data/plugin_data/astrbot_plugin_image_trace/tmp/`（自动清理） |

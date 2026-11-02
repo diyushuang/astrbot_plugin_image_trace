@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
 import io
 import os
 import random
@@ -129,6 +130,13 @@ try:
     )
     from .url_guard import read_limited_bytes
     from .vector_search import VectorEngine, VectorEngineError
+    from .weibo_posts import (
+        WeiboPost,
+        load_post_map,
+        load_posts_from_dir,
+        map_is_stale,
+        parse_weibo_text,
+    )
 except ImportError:  # 兼容插件以独立模块方式加载
     from checkin_card import DEFAULT_QUOTES, QuoteLibrary, compose_poster  # type: ignore[no-redef]
     from checkin_store import CheckinStore  # type: ignore[no-redef]
@@ -217,6 +225,13 @@ except ImportError:  # 兼容插件以独立模块方式加载
     )
     from url_guard import read_limited_bytes  # type: ignore[no-redef]
     from vector_search import VectorEngine, VectorEngineError  # type: ignore[no-redef]
+    from weibo_posts import (  # type: ignore[no-redef]
+        WeiboPost,
+        load_post_map,
+        load_posts_from_dir,
+        map_is_stale,
+        parse_weibo_text,
+    )
 
 PLUGIN_NAME = "astrbot_plugin_image_trace"
 # 扫描目录认可的图片扩展名。TIFF 由 Pillow 原生支持；AVIF 只有 Pillow 11.3+
@@ -419,6 +434,18 @@ class ImageTracePlugin(Star):
         except Exception as exc:
             logger.error(f"签到数据库初始化失败，/签到 将不可用: {exc}")
         self._quote_library_cache: QuoteLibrary | None = None
+        # 微博签到：文案源目录 + 预生成映射表。映射表由 scripts/build_weibo_map.py
+        # 离线生成，签到只读本地 JSON，不请求微博、不算 pHash。
+        self.weibo_dir = os.path.join(self.data_dir, "weibo")
+        self.weibo_thumb_dir = os.path.join(self.weibo_dir, "thumbs")
+        try:
+            os.makedirs(self.weibo_thumb_dir, exist_ok=True)
+        except OSError as exc:
+            logger.warning(f"微博文案目录创建失败，微博签到将回退随机语句: {exc}")
+        self._weibo_posts_cache: list[WeiboPost] | None = None
+        self._weibo_meta_cache: dict = {}
+        self._weibo_signature: tuple | None = None
+        self._weibo_empty_warned = False
         # 图床缩放能力冷却截止时刻（time.monotonic 口径，0 表示未观测到拒绝）。
         # 探测到 API 级拒绝（405/501 等）后的一段时间内不再探测缩放版。
         self._scaled_verify_unsupported_until = 0.0
@@ -1284,11 +1311,17 @@ class ImageTracePlugin(Star):
         raw = self._dict_cfg("checkin")
         headers = raw.get("quote_api_headers")
         source = str(raw.get("quote_source") or "").strip().lower()
+        mode = str(raw.get("mode") or "").strip().lower()
+        image_mode = str(raw.get("image_mode") or "").strip().lower()
         return {
             "enabled": bool_or(raw.get("enabled"), True),
+            "mode": "weibo" if mode == "weibo" else "quote",
             "render_mode": "simple"
             if str(raw.get("render_mode") or "").strip().lower() == "simple"
             else "card",
+            # 签到自己的取图口径，与 random_media.send_thumbnail 独立：那边管
+            # /随机图、/随机视频 发哪张，这边只管 /签到 发哪张/拿哪张合成。
+            "image_mode": "original" if image_mode == "original" else "thumbnail",
             "border_px": max(0, min(200, as_int(raw.get("border_px"), 0))),
             "utc_offset_hours": max(-12, min(14, as_int(raw.get("utc_offset_hours"), 8))),
             "quote_source": source if source in {"api", "mixed"} else "builtin",
@@ -2688,6 +2721,7 @@ class ImageTracePlugin(Star):
             lines.append(f"· Embed：{self.vector.embed_model} / {self.vector.image_input}")
         lines.append(f"· 扫描目录：{len(scan_dirs)} 个")
         lines.append(self._remote_hash_line())
+        lines.append(await self._weibo_status_line())
         lines.append(f"· AI 复核：{'开' if self._bool_cfg('ai_verify', False) else '关'}")
         yield event.plain_result("\n".join(lines))
 
@@ -2956,7 +2990,9 @@ class ImageTracePlugin(Star):
             "· /溯源删除 <编号> —— 删除图库条目（管理员）\n"
             "· /随机图 [目录] —— 从图床随机取一张图片并回传\n"
             "· /随机视频 [目录] —— 从图床随机取一个视频并回传\n"
-            "· /签到 —— 每日签到领取一张带边框与随机语句的随机缩略图（每天首次计入天数，同日重复只换图不涨天数，可 /打卡）\n"
+            "· /签到 —— 每日签到领取一张带边框的卡片（每天首次计入天数，同日重复只换图不涨天数，可 /打卡）；"
+            "checkin.mode=weibo 时改为“微博文案 + 对应图库图片”，卡片显示博主与发博日期\n"
+            "· /签到文案导入 —— 管理员：把微博文案 CSV/MD 作为附件发送，导入插件数据目录\n"
             "· /原图 [文件名] —— 取原图：带文件名时直接到图床按名取（无需先回传），"
             "不带文件名取本会话最近回传的原图\n"
             "· /原图修复 —— 清理会话历史里带配文前缀（🖼️ / 🎬 / 序号）的旧记录\n"
@@ -2994,6 +3030,129 @@ class ImageTracePlugin(Star):
         """每日签到，领取一张带边框与随机语句的随机缩略图"""
         async for result in self._checkin_flow(event):
             yield result
+
+    @staticmethod
+    def _first_file_segment(event: AstrMessageEvent):
+        """取本条消息或引用消息里的第一个文件段；旧版本没有 File 时返回 None。"""
+        file_type = getattr(Comp, "File", None)
+        if not isinstance(file_type, type):
+            return None
+        reply_type = getattr(Comp, "Reply", None)
+        for seg in getattr(event.message_obj, "message", None) or []:
+            if isinstance(seg, file_type):
+                return seg
+            if reply_type is not None and isinstance(seg, reply_type):
+                for sub in getattr(seg, "chain", None) or []:
+                    if isinstance(sub, file_type):
+                        return sub
+        return None
+
+    @filter.command("签到文案导入", alias={"签到文案上传"})
+    async def checkin_import(self, event: AstrMessageEvent):
+        """管理员：导入微博文案 CSV/MD 到插件数据目录。"""
+        if not event.is_admin():
+            yield event.plain_result("仅管理员可导入签到文案。")
+            return
+        segment = self._first_file_segment(event)
+        if segment is None:
+            yield event.plain_result(
+                "请把 CSV 或 MD 文件作为附件发送，并在同一条消息中发送 /签到文案导入。"
+            )
+            return
+        name = os.path.basename(str(getattr(segment, "name", "") or "")).strip()
+        try:
+            getter = getattr(segment, "get_file", None)
+            if callable(getter):
+                try:
+                    target = await getter(allow_return_url=True)
+                except TypeError:  # 旧版本 get_file 可能没有该关键字
+                    target = await getter()
+            else:
+                target = str(getattr(segment, "file", "") or "")
+            if not target:
+                yield event.plain_result("无法读取文件内容，请重新发送附件。")
+                return
+            if str(target).lower().startswith(("http://", "https://")):
+                data = await self._download_bytes(str(target))
+            else:
+                data = await asyncio.to_thread(read_bytes, str(target))
+        except Exception as exc:
+            logger.warning(f"签到文案导入读取失败: {exc}")
+            yield event.plain_result(f"读取文件失败：{sanitize_error_text(exc)}")
+            return
+        if len(data) > 4 * 1024 * 1024:
+            yield event.plain_result("文件超过 4MB，请拆分后再导入。")
+            return
+        try:
+            text = data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                yield event.plain_result("文件不是 UTF-8 编码，无法解析。")
+                return
+        extension = os.path.splitext(name)[1].lower()
+        if extension not in {".csv", ".md", ".markdown"}:
+            first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+            if "序号" in first_line and "发布时间" in first_line:
+                extension = ".csv"
+            elif first_line.startswith("# 微博原创文案"):
+                extension = ".md"
+            else:
+                yield event.plain_result(
+                    "无法识别文件格式：只支持 CSV（序号,发布时间,来源,文案,微博链接）"
+                    "或微博原创文案 MD 导出。"
+                )
+                return
+        base = os.path.basename(name) or f"weibo_import_{secrets.token_hex(4)}{extension}"
+        base = base.replace("/", "_").replace("\\", "_").strip()
+        if not base or base in {".", ".."} or not base.lower().endswith(
+            (".csv", ".md", ".markdown")
+        ):
+            base = f"weibo_import_{secrets.token_hex(4)}{extension}"
+        parsed = parse_weibo_text(text, base)
+        if not parsed:
+            yield event.plain_result("未解析到任何微博文案，请检查文件内容。")
+            return
+        try:
+            await asyncio.to_thread(os.makedirs, self.weibo_dir, exist_ok=True)
+            final_path = os.path.join(self.weibo_dir, base)
+            temp_path = f"{final_path}.tmp"
+
+            def write_text() -> None:
+                with open(temp_path, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                os.replace(temp_path, final_path)
+
+            await asyncio.to_thread(write_text)
+        except OSError as exc:
+            logger.warning(f"签到文案导入写入失败: {exc}")
+            yield event.plain_result(f"写入失败：{sanitize_error_text(exc)}")
+            return
+        self._weibo_posts_cache = None
+        self._weibo_meta_cache = {}
+        self._weibo_signature = None
+        accounts = sorted({post.account for post in parsed})
+        dates = sorted({post.date for post in parsed})
+        account_text = "、".join(accounts[:5]) + ("…" if len(accounts) > 5 else "")
+        date_text = f"{dates[0][:4]}-{dates[0][4:6]}-{dates[0][6:]}" if dates else "-"
+        if dates and dates[-1] != dates[0]:
+            date_text += f" ~ {dates[-1][:4]}-{dates[-1][4:6]}-{dates[-1][6:]}"
+        map_path = self._weibo_map_path()
+        map_note = "映射表未生成：签到时会按同账号同日图片回退，建议运行 scripts/build_weibo_map.py。"
+        if os.path.isfile(map_path):
+            map_posts, _generated, map_meta = await asyncio.to_thread(load_post_map, map_path)
+            if map_is_stale(map_path, self.weibo_dir):
+                map_note = "源文件已更新，映射表比源文件旧；请重新运行 scripts/build_weibo_map.py。"
+            else:
+                map_note = (
+                    f"映射表：{len(map_posts)} 条，可配对 "
+                    f"{int(map_meta.get('matched_count') or 0)} 条。"
+                )
+        yield event.plain_result(
+            f"✅ 已导入 {base}：{len(parsed)} 条文案，账号 {account_text}，"
+            f"日期 {date_text}。\n{map_note}"
+        )
 
     def _imgbed_base(self) -> str:
         """/原图 直查用的图床站点地址（取第一个配置完整的）。
@@ -3494,13 +3653,17 @@ class ImageTracePlugin(Star):
         yield event.plain_result(f"随机媒体获取成功：{media_url}")
 
     async def _random_image_candidate(
-        self, directory, settings: dict
+        self, directory, settings: dict, *, thumbnail: bool | None = None
     ) -> tuple[str, str, str]:
         """取一张随机图并归一为 (发送直链, 原图直链, 原图权威名)。
 
         /签到 与 /随机图 共用这段「取图 → 内网改写/HTTPS 升级 → 缩略图反查 →
         选发送态」链路。抽出来是为了让「发缩略图、历史留原图」的口径只存在
         一份：任何一处改动都不会让两条命令各自漂移。
+
+        thumbnail 只覆盖「这次发哪张」，默认 None 表示沿用
+        random_media.send_thumbnail；/签到 传 checkin.image_mode 换算的布尔值，
+        因此两个功能同链路、异配置，互不影响。
 
         失败抛 RandomMediaError，由调用方给出可读提示。
         """
@@ -3515,15 +3678,18 @@ class ImageTracePlugin(Star):
             # 改写幂等；公网域名形式的直链也一并收进来），后续取字节不出公网
             media_url = swap_url_origin(media_url, settings["lan_base_url"], lan_hosts)
         media_url = upgrade_to_https(media_url, settings["base_url"])
-        return await self._random_image_from_media(media_url, settings)
+        return await self._random_image_from_media(media_url, settings, thumbnail=thumbnail)
 
     async def _random_image_from_media(
-        self, media_url: str, settings: dict
+        self, media_url: str, settings: dict, *, thumbnail: bool | None = None
     ) -> tuple[str, str, str]:
         """把随机到的图片直链归一为 (发送直链, 原图直链, 原图权威名)。
 
         发送用缩略图替身、历史留原图：QQ 侧下载小图更快，sendMsg 回执超时
         概率显著下降；而 /原图 仍能凭历史里的原图直链取回全尺寸文件。
+
+        thumbnail 覆盖「这次发哪张」：None=沿用 random_media.send_thumbnail；
+        False 时直接把原图当发送态（/签到 的 original 模式），历史仍记原图。
 
         边界：图床的 /random 若被指到 thumbnails/ 目录（default_dir 配错或
         用户显式传了该目录），media_url 本身就是缩略图。此时别再查替身
@@ -3563,11 +3729,11 @@ class ImageTracePlugin(Star):
                 else:
                     hint = "原因见 DEBUG 日志"
                 logger.warning(f"随机图命中的是缩略图且反查不到原图（{hint}）: {media_url}")
-        send_url = await self._random_send_url(original_url, settings)
+        send_url = await self._random_send_url(original_url, settings, thumbnail=thumbnail)
         return send_url, original_url, original_name
 
     # ------------------------------------------------------------------
-    # 指令：每日签到（随机缩略图 + 边框语句卡片）
+    # 指令：每日签到（随机图 + 边框语句卡片，取图/呈现各有一档开关）
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -3577,15 +3743,24 @@ class ImageTracePlugin(Star):
             handle.write(data)
 
     async def _checkin_card_path(
-        self, image_url: str, quote: str, footer: str, settings: dict
+        self,
+        image_url: str,
+        quote: str,
+        footer: str,
+        settings: dict,
+        *,
+        quote_max_lines: int = 3,
     ) -> str | None:
-        """下载缩略图 → 合成卡片 → 落临时文件，返回路径；任一步失败返回 None。
+        """下载图片 → 合成卡片 → 落临时文件，返回路径；任一步失败返回 None。
 
         合成放进 to_thread：Pillow 解码/绘制/编码是 CPU 活，放事件循环里会
         阻塞其它消息处理；实测 720px 卡片整段约 10ms、1440px 约 25ms。
         """
         try:
-            data = await self._download_bytes(image_url)
+            if os.path.isfile(image_url):
+                data = await asyncio.to_thread(read_bytes, image_url)
+            else:
+                data = await self._download_bytes(image_url)
         except Exception as exc:
             logger.warning(f"签到卡片下载图片失败，改用轻量模式: {exc}")
             return None
@@ -3596,6 +3771,7 @@ class ImageTracePlugin(Star):
             footer=footer,
             font_path=settings["font_path"],
             border_px=settings["border_px"],
+            quote_max_lines=quote_max_lines,
         )
         if not image_bytes:
             return None
@@ -3606,6 +3782,278 @@ class ImageTracePlugin(Star):
             logger.warning(f"签到卡片写入临时文件失败: {exc}")
             return None
         return path
+
+    async def _checkin_card_source(
+        self, send_url: str, original_url: str, settings: dict
+    ) -> str:
+        """卡片合成专用图源：遵循 checkin.image_mode，与「回传的那张」解耦。
+
+        ``checkin.image_mode`` 决定合成用哪张：
+        - ``original``：直接用原图。合成端会先做 JPEG 的 DCT 缩放再降到最长边
+          1440px，所以原图不会撑爆内存，只是多花下载流量；
+        - ``thumbnail``（默认）：优先缩略图替身。卡片成品只有 ≤1440px，用原图
+          合成没有收益——2026-11-02 线上实录：一张 8736×11648 的手机长图被拿来
+          合成，既白花几十 MB 流量与上亿像素解码，又被 compose_poster 的防炸
+          上限挡回去，整张卡片降级成没有边框的轻量模式。
+
+        注意这里**不看** ``random_media.send_thumbnail``：那个开关管 /随机图、
+        /随机视频 发哪张，与签到各管各的，只是共用同一段缩略图反查链路。
+
+        settings 是**签到组**的配置（只取 image_mode）；缩略图替身回来的是公网
+        直链，必须再按 random_media 的内网配置换源，所以内部另取
+        ``_random_settings()``，不能拿签到配置去算 lan_base_url。
+        """
+        source = original_url or send_url
+        if settings.get("image_mode") == "original":
+            return source
+        if is_thumbnail_url(send_url):
+            # 上游已经给的就是缩略图直链（图床随机目录指到了 thumbnails/）
+            return send_url
+        thumb = await self._random_send_url(
+            source, self._random_settings(), thumbnail=True
+        )
+        if thumb and thumb != source:
+            logger.debug(f"签到卡片改用缩略图合成: {source} -> {thumb}")
+        return thumb or source
+
+    # ------------------------------------------------------------------
+    # 微博签到：离线映射表（签到只读本地 JSON，不请求微博、不算 pHash）
+    # ------------------------------------------------------------------
+
+    def _weibo_map_path(self) -> str:
+        return os.path.join(self.weibo_dir, "weibo_post_map.json")
+
+    def _weibo_signature_sync(self) -> tuple:
+        """映射表 + 源文件 mtime 组合；任一方变化即触发重新加载。"""
+        try:
+            map_mtime = os.path.getmtime(self._weibo_map_path())
+        except OSError:
+            map_mtime = 0.0
+        source_mtime = 0.0
+        try:
+            for name in os.listdir(self.weibo_dir):
+                if not name.lower().endswith((".csv", ".md", ".markdown")):
+                    continue
+                try:
+                    source_mtime = max(
+                        source_mtime,
+                        os.path.getmtime(os.path.join(self.weibo_dir, name)),
+                    )
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        return (round(map_mtime, 3), round(source_mtime, 3))
+
+    def _load_weibo_pool_sync(self) -> tuple[list[WeiboPost], dict]:
+        """读映射表；映射缺失/过期时才解析 CSV/MD，避免签到热路径重复解析。
+
+        映射表优先（带图），源文件只用来补新帖子：映射过期时把源文件里有、
+        映射里没有的帖子追加进来，这些帖子的 image 为 None，签到走回退。
+        """
+        map_path = self._weibo_map_path()
+        posts, generated_at, map_meta = load_post_map(map_path)
+        stale = map_is_stale(map_path, self.weibo_dir)
+        source_posts: list[WeiboPost] = []
+        source_files: list[str] = []
+        errors: list[str] = []
+        if not posts or stale:
+            source_posts, source_files, errors = load_posts_from_dir(self.weibo_dir)
+        merged = posts
+        if not posts:
+            merged = source_posts
+        elif stale and source_posts:
+            by_key = {(post.account.casefold(), post.published_at): post for post in posts}
+            merged = [
+                by_key.get((post.account.casefold(), post.published_at), post)
+                for post in source_posts
+            ]
+            # 源文件被删掉时仍保留映射里的旧条目，避免已有配图丢失
+            source_keys = {
+                (post.account.casefold(), post.published_at) for post in source_posts
+            }
+            merged.extend(
+                post
+                for post in posts
+                if (post.account.casefold(), post.published_at) not in source_keys
+            )
+        meta = {
+            "count": len(merged),
+            "matched_count": sum(1 for post in merged if post.image is not None),
+            "map_count": len(posts),
+            "map_generated_at": generated_at,
+            "map_stale": stale,
+            "source_files": [os.path.basename(path) for path in source_files],
+            "errors": errors,
+            "map_meta": map_meta,
+        }
+        return merged, meta
+
+    async def _weibo_posts(self) -> tuple[list[WeiboPost], dict]:
+        """签到热路径：mtime 未变时直接返回内存池，不解析任何文件。"""
+        signature = await asyncio.to_thread(self._weibo_signature_sync)
+        if self._weibo_posts_cache is not None and signature == self._weibo_signature:
+            return self._weibo_posts_cache, self._weibo_meta_cache
+        posts, meta = await asyncio.to_thread(self._load_weibo_pool_sync)
+        self._weibo_posts_cache = posts
+        self._weibo_meta_cache = meta
+        self._weibo_signature = signature
+        if posts:
+            self._weibo_empty_warned = False
+        elif not self._weibo_empty_warned:
+            logger.warning(
+                "微博签到模式已开启，但 %s 下没有文案文件或映射表；/签到 将回退随机语句。",
+                self.weibo_dir,
+            )
+            self._weibo_empty_warned = True
+        if meta.get("errors"):
+            logger.warning("微博文案解析失败: %s", "；".join(meta["errors"]))
+        return posts, meta
+
+    async def _weibo_status_line(self) -> str:
+        settings = self._checkin_settings()
+        # 两个维度各自独立，状态行里都报出来，省得用户改完不知道生效在哪一层：
+        # render_mode=合不合成，image_mode=用缩略图还是原图。
+        shape = (
+            f"{'合成卡片' if settings['render_mode'] == 'card' else '图文直发'}"
+            f"，取图：{'原图' if settings['image_mode'] == 'original' else '缩略图'}"
+        )
+        if settings["mode"] != "weibo":
+            return f"· 签到模式：quote（随机图 + 随机语句；{shape}）"
+        posts, meta = await self._weibo_posts()
+        if not posts:
+            return f"· 签到模式：weibo（未找到文案/映射，/签到 将回退随机语句；{shape}）"
+        matched = int(meta.get("matched_count") or 0)
+        suffix = "，源文件比映射新" if meta.get("map_stale") else ""
+        if not meta.get("map_count"):
+            suffix += "，映射表未生成"
+        return (
+            f"· 签到模式：weibo（文案 {len(posts)} 条，可配对 {matched} 条"
+            f"{suffix}；{shape}）"
+        )
+
+    def _weibo_thumb_path(self, file_name: str) -> str:
+        """本地预缓存缩略图路径；文件名用 sha1，避免中文/特殊字符进路径。"""
+        key = hashlib.sha1(str(file_name or "").encode("utf-8")).hexdigest()
+        path = os.path.join(self.weibo_thumb_dir, f"{key}.jpg")
+        return path if os.path.isfile(path) else ""
+
+    async def _weibo_candidate(self, random_settings: dict, *, image_mode: str = "thumbnail"):
+        """取一条微博及其图库图片；返回 (post, 发送直链, 原图直链, 文件名, 本地缩略图)。
+
+        映射表里有图就直接用；没有图时退一步取同账号同日的任意已匹配图片，
+        仍没有则返回 None，由调用方回退现有「随机图 + 随机语句」。
+
+        ``本地缩略图`` 由映射脚本的 ``--prefetch-thumbs`` 预生成；只有
+        ``image_mode=thumbnail`` 才会返回它（card 模式零网络合成），原图模式
+        必须发/用原图，不能被本地缩略图顶替。
+
+        ``image_mode`` 来自 ``checkin.image_mode``，只影响签到：thumbnail 取
+        ``thumb_url``，original 取 ``image_url``。
+        """
+        posts, _meta = await self._weibo_posts()
+        if not posts:
+            return None
+        post = random.choice(posts)
+        image = post.image
+        if image is None:
+            pool = [
+                item.image
+                for item in posts
+                if item.image is not None
+                and item.account.casefold() == post.account.casefold()
+                and item.date == post.date
+            ]
+            if pool:
+                image = random.choice(pool)
+        if image is None:
+            return None
+        use_thumb = image_mode != "original"
+        local_thumb = self._weibo_thumb_path(image.file_name) if use_thumb else ""
+        original_url = image.image_url or image.thumb_url
+        if original_url:
+            original_url = build_original_url(unquote(original_url))
+        # 原图模式下优先真原图直链，映射里缺 image_url 时才退 thumb_url
+        preferred, fallback = (
+            (image.thumb_url, original_url)
+            if use_thumb
+            else (original_url, image.thumb_url)
+        )
+        send_url = preferred or fallback
+        lan_hosts = self._lan_url_hosts(random_settings)
+        lan_base = str((random_settings or {}).get("lan_base_url") or "")
+        if lan_hosts:
+            send_url = swap_url_origin(send_url, lan_base, lan_hosts)
+            original_url = swap_url_origin(original_url, lan_base, lan_hosts)
+        base_url = str((random_settings or {}).get("base_url") or "")
+        send_url = upgrade_to_https(send_url, base_url)
+        original_url = upgrade_to_https(original_url, base_url)
+        if not send_url and not local_thumb:
+            return None
+        return post, send_url, original_url, image.file_name, local_thumb
+
+    async def _deliver_checkin(
+        self,
+        event: AstrMessageEvent,
+        header: str,
+        quote: str,
+        footer: str,
+        send_url: str,
+        original_url: str,
+        block_name: str,
+        settings: dict,
+        *,
+        quote_max_lines: int = 3,
+        simple_text: str = "",
+        card_source: str = "",
+    ):
+        """签到统一交付：card 合成失败自动退回 simple；两类签到共用。
+
+        card_source 供微博模式传本地预缓存缩略图路径；它只在
+        ``checkin.image_mode=thumbnail`` 时可当合成源（原图模式要求用原图），
+        否则按 ``_checkin_card_source`` 现查——合成用小图，不能拿 send_url 兜底
+        （它可能是原图）。
+        """
+        remember = (
+            [{"url": original_url, "file_name": block_name}] if original_url else []
+        )
+        if settings["render_mode"] == "card":
+            source = card_source if settings["image_mode"] == "thumbnail" else ""
+            if not source:
+                source = await self._checkin_card_source(
+                    send_url, original_url, settings
+                )
+            path = await self._checkin_card_path(
+                source,
+                quote,
+                footer,
+                settings,
+                quote_max_lines=quote_max_lines,
+            )
+            if path:
+                try:
+                    async for result in self._yield_delivery(
+                        event,
+                        header,
+                        [{"path": path, "file_name": block_name}],
+                        # 卡片已是成品 JPEG：交给适配器原样发送，避免二次压缩
+                        mode_override="native",
+                        allow_local_fallback=False,
+                        remember_blocks=remember,
+                    ):
+                        yield result
+                finally:
+                    self._remove_quiet(path)
+                return
+            logger.warning("签到卡片合成失败，改用轻量模式")
+        text = simple_text or f"{header}\n💬 {quote}"
+        async for result in self._yield_delivery(
+            event,
+            text,
+            [{"url": send_url, "file_name": block_name}],
+            remember_blocks=remember,
+        ):
+            yield result
 
     async def _checkin_flow(self, event: AstrMessageEvent):
         """签到主流程：判定 → 取图 → 取句 → 卡片/轻量交付。
@@ -3643,9 +4091,56 @@ class ImageTracePlugin(Star):
             )
 
         random_settings = self._random_settings()
+
+        # 微博模式：映射表里已有「文案 → 图库图片」，签到只读本地 JSON + 内网缩略图。
+        # 任何一步失败都不把异常抛回事件管线，直接继续走下面的随机语句回退。
+        if settings["mode"] == "weibo":
+            try:
+                candidate = await self._weibo_candidate(
+                    random_settings, image_mode=settings["image_mode"]
+                )
+            except Exception as exc:
+                logger.warning(f"微博签到取图失败，回退随机语句: {exc}")
+                candidate = None
+            if candidate is not None:
+                post, send_url, original_url, image_name, local_thumb = candidate
+                quote = post.text
+                footer = (
+                    f"{post.account_display} · {post.date_display}\n"
+                    f"连续签到 {outcome.streak} 天 · 累计 {outcome.total} 天"
+                )
+                block_name = (
+                    clean_display_name(image_name)
+                    or image_name
+                    or clean_display_name(original_url)
+                    or "今日签到"
+                )
+                simple_text = (
+                    f"{header}\n📝 {post.account_display} · {post.date_display}"
+                    f"\n💬 {quote}"
+                )
+                async for result in self._deliver_checkin(
+                    event,
+                    header,
+                    quote,
+                    footer,
+                    send_url,
+                    original_url,
+                    block_name,
+                    settings,
+                    quote_max_lines=5,
+                    simple_text=simple_text,
+                    card_source=local_thumb,
+                ):
+                    yield result
+                return
+            logger.debug("微博文案暂无可配图片，回退随机图 + 随机语句")
+
         try:
+            # 签到的取图口径来自 checkin.image_mode，与 random_media.send_thumbnail
+            # 各管各的：这里显式传布尔值，/随机图 那条仍走配置默认。
             send_url, original_url, original_name = await self._random_image_candidate(
-                "", random_settings
+                "", random_settings, thumbnail=settings["image_mode"] != "original"
             )
         except Exception as exc:
             # RandomMediaError 之外还可能有网络/解析等未预期异常：签到不能因此
@@ -3670,33 +4165,16 @@ class ImageTracePlugin(Star):
             quote = random.choice(DEFAULT_QUOTES)
         footer = f"连续签到 {outcome.streak} 天 · 累计 {outcome.total} 天"
         block_name = original_name or clean_display_name(original_url) or "今日签到"
-
-        if settings["render_mode"] == "card":
-            path = await self._checkin_card_path(send_url, quote, footer, settings)
-            if path:
-                try:
-                    async for result in self._yield_delivery(
-                        event,
-                        header,
-                        [{"path": path, "file_name": block_name}],
-                        # 卡片已是成品 JPEG：交给适配器原样发送，避免 auto/bytes
-                        # 再压一次把文字压糊
-                        mode_override="native",
-                        allow_local_fallback=False,
-                        remember_blocks=[{"url": original_url, "file_name": block_name}],
-                    ):
-                        yield result
-                finally:
-                    # 生成器消费完表示回传已结束（或本就未发送），此时删安全
-                    self._remove_quiet(path)
-                return
-            logger.warning("签到卡片合成失败，改用轻量模式")
-
-        async for result in self._yield_delivery(
+        async for result in self._deliver_checkin(
             event,
-            f"{header}\n💬 {quote}",
-            [{"url": send_url, "file_name": block_name}],
-            remember_blocks=[{"url": original_url, "file_name": block_name}],
+            header,
+            quote,
+            footer,
+            send_url,
+            original_url,
+            block_name,
+            settings,
+            quote_max_lines=3,
         ):
             yield result
 
@@ -4244,15 +4722,24 @@ class ImageTracePlugin(Star):
         except Exception as exc:
             logger.debug(f"qq_official 失败说明发送失败（忽略）: {exc}")
 
-    async def _random_send_url(self, media_url: str, settings: dict) -> str:
+    async def _random_send_url(
+        self, media_url: str, settings: dict, *, thumbnail: bool | None = None
+    ) -> str:
         """把随机到的原图换成它的缩略图直链；取不到替身就原样返回原图。
 
         缩略图与原图落在同一个 Qdrant 点上（点 id = UUID5(原图 id)），所以只要
         随机到的是内容目录里的原图，就能按 id 查出它的 thumb_url——不需要映射表，
         也不能靠文件名（图床给缩略图改过名）。整条链路都失败时静默退回原图：
         替身只是提速手段，绝不能因为它缺席而让 /随机图 发不出图。
+
+        thumbnail 是「这次要发哪一张」的显式口径：
+        - None（默认）= 按 random_media.send_thumbnail，/随机图、/随机视频 走这条；
+        - True/False = 调用方自带口径，/签到 用 checkin.image_mode 传进来。
+        两条链路共用同一段反查，但判定来源各自独立，互不覆盖。
         """
-        if not settings.get("send_thumbnail", True):
+        if thumbnail is None:
+            thumbnail = bool(settings.get("send_thumbnail", True))
+        if not thumbnail:
             return media_url
         file_id = self._bed_file_id(media_url)
         if not file_id:

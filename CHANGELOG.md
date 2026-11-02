@@ -1,5 +1,38 @@
 # 更新日志
 
+## 1.7.20（2026-11-02，签到拆成「取图」×「呈现」两个独立维度）
+
+- **新增**：`checkin.image_mode`（`thumbnail` / `original`，默认 `thumbnail`）。签到取哪张图从此由自己决定，**与 `random_media.send_thumbnail` 完全独立、互不影响**：`thumbnail` 走图床 720px 缩略图，`original` 走原图直链。两个功能仍共用同一条「取图 → 内网换源 → 缩略图反查」链路，只是口径各传各的。
+- **重构**：`_random_send_url()` 的 `force` 参数换成 `thumbnail: bool | None`——`None`（默认）沿用 `random_media.send_thumbnail`，`/随机图`、`/随机视频` 走这条；`/签到` 显式传布尔值。`_random_image_candidate()` / `_random_image_from_media()` 同步透传，避免「为了给签到开后门而全局无视配置」这种耦合。
+- **行为**：`render_mode` 仍是「合不合成」（`card` / `simple`），`image_mode` 管「用哪张」；四种组合都成立。`card` + `original` 时合成源用原图（`compose_poster` 的 DCT 缩放保证不会撑爆内存），`card` + `thumbnail` 时优先缩略图替身。
+- **修复**：`_checkin_card_source()` 之前拿签到组配置去算 `lan_base_url`（签到组没有这个键），导致反查回来的缩略图替身是公网直链、丢掉内网换源；现内部另取 `_random_settings()`。
+- **修复**：微博模式原图下仍会拿 `weibo/thumbs/` 的本地缩略图当合成源；现在 `_weibo_candidate(image_mode=...)` 一并决定发送态与本地缓存是否可用。
+- **修复（高）**：`wrap_text` 把文案里的换行符当普通字符塞进行内，`ImageDraw.textlength` 随即抛 `ValueError: can't measure length of multiline text`，`compose_poster` 兜住后返回 `None`——微博文案几乎都带换行，`mode=weibo` + `render_mode=card` 实际上一张卡片都出不来，全部静默降级成没有边框的轻量模式。现在换行按**硬换行**切段、段内再按像素折行，行数预算全局共享。
+- **修复**：中文字体（微软雅黑 / Noto CJK / 文泉驿）没有彩色 emoji 字形，卡片上 emoji 会渲染成豆腐块（实测「坠入秋日棕调氛围里🍂」→「…里□」）。渲染前统一剔除 emoji（`checkin_card.strip_emoji`），`★ ♪` 这类字体确实有字形的符号保留；聊天消息里的原文不动。
+- **修复**：映射表被手工改坏字段类型（如 `"score": "很高"`）时 `load_post_map` 会抛 `ValueError`，`/溯源状态` 整条报错。现在 `score` / `count` / `matched_count` / `sources` 全部容错降级，损坏的条目按 0 / 空处理。
+- **状态**：`/溯源状态` 的签到行同时报出「合成卡片/图文直发」与「缩略图/原图」，改完配置一眼能确认生效在哪一层。
+- **测试**：新增 8 例（配置归一化、原图模式不查替身、`thumbnail` 覆盖 `send_thumbnail` 双向验证、微博原图模式、多行文案硬换行、emoji 剔除、多行+emoji 卡片合成回归、映射表字段容错），全量 **424 passed**，`ruff check` 全绿。
+
+## 1.7.19（2026-11-02，签到卡片改用缩略图合成）
+
+> 1.7.20 起该行为由 `checkin.image_mode` 控制，默认仍是缩略图。
+
+- **修复（高）**：`card` 模式的合成源图改用缩略图替身。`random_media.send_thumbnail` 管的是「回传给用户的那张」，关掉后 `/随机图` 直发原图，签到卡片也跟着拿原图去合成——2026-11-02 线上撞到一张 **8736×11648** 的手机长图，白下载几十 MB、解码上亿像素，还被 `compose_poster` 的 50MP 防炸闸门挡回去，整张卡片降级成没有边框的轻量模式（日志 `签到卡片源图像素过大，跳过合成`）。新增 `_checkin_card_source()`：`send_url` 已是缩略图直链就直接用，否则按原图对象键查一次 Qdrant 缩略图替身（`_random_send_url(..., force=True)` 无视 `send_thumbnail`），查不到才退回原图。
+- **修复**：`compose_poster` 不再因源图像素过大直接放弃合成。解码前先 `Image.draft()` 做 JPEG 的 DCT 缩放（1/2、1/4、1/8），8736×11648 的源图能直接解出约 2000px 的中图再判像素闸门；PNG 等 `draft` 无效的格式仍由原闸门兜住解压炸弹，不会放大内存风险。
+- **测试**：新增 4 例（缩略图优先 / 已是缩略图不重复反查 / 查不到退回原图 / 超尺寸源图降采样出图），全量 **416 passed**，`ruff check` 全绿。
+
+## 1.7.18（2026-10-31，微博文案签到模式）
+
+- **新增**：`checkin.mode=weibo`。签到从微博文案库随机取一条，配图库中同一微博的一张图；卡片显示文案、博主与发博日期，不显示微博链接；一条微博多图时只发一张。
+- **新增**：`weibo_posts.py`，支持微博原创文案 CSV（`序号,发布时间,来源,文案,微博链接`）与 MD 导出解析；同一账号+发布时间重复时 MD 正文优先，但自动保留 CSV 的链接与短链 code。
+- **新增**：`/签到文案导入`（管理员）。把 CSV/MD 作为附件发给机器人即可写入 `data/plugin_data/astrbot_plugin_image_trace/weibo/`，无需登录服务器。
+- **新增**：`scripts/build_weibo_map.py`（不随插件发布）。离线逐条用微博短链匿名取图、算 pHash、在图床 `remote_phash.json` 索引里反查 `12、日常分享/【微博图集@账号】/` 的同一张图，生成 `weibo_post_map.json`。实测 2013/2023 年微博均能精确命中（相似度 0.99~1.00）。
+- **性能**：签到热路径只读本地映射表与 mtime 缓存，不请求微博、不算 pHash；映射脚本加 `--prefetch-thumbs` 可把匹配到的 720px 缩略图预缓存到 `weibo/thumbs/`，card 模式直接读本地文件（零网络），主要耗时只剩卡片合成（约 10~25ms）；没有本地缓存时才用 `thumb_url`（优先内网）下载。
+- **回退**：映射里没有图的微博仍保留文案，签到优先取同账号同日已匹配图片；仍没有图则回退现有「随机图 + 随机语句」，签到不中断。
+- **卡片**：`compose_poster` 支持多行页脚与 `quote_max_lines`，微博文案最多 5 行，页脚两行（博主+日期 / 签到天数）。
+- **配置**：`checkin` 组新增 `mode`（`quote`/`weibo`，默认 `quote`）；`/溯源状态` 新增签到模式、文案条数与可配对数。
+- **测试**：新增微博文案解析/去重/映射表往返/签到微博模式/文案导入用例；全量 **412 passed**，`ruff check` 全绿。
+
 ## 1.7.17（2026-10-31，回传链路修复与审查加固）
 
 - **修复（高）**：`guarded_request` 对 `ClientResponse.release()` 误用了 `await`。真实 aiohttp 里该方法是同步的，任何 3xx 重定向都会在跟随第一跳时抛 `TypeError`；早期测试替身写成 async 掩盖了这一点。现改为同步调用，并用真实 aiohttp 重定向实测覆盖。

@@ -88,6 +88,20 @@ class _Video:
         return cls(url=url)
 
 
+class _File:
+    """File 组件替身：name + 本地路径，get_file 直接返回路径。"""
+
+    def __init__(self, name="", file="", url=""):
+        self.name = name
+        self.file = file
+        self.url = url
+
+    async def get_file(self, allow_return_url=False):
+        if allow_return_url and self.url:
+            return self.url
+        return self.file
+
+
 def _command(name, alias=None):
     """模拟 filter.command：装饰后原样返回函数，并记录命令名/别名便于断言。"""
     normalized_alias = set(alias or ())
@@ -180,6 +194,7 @@ _install(
     Plain=_Plain,
     At=_At,
     Video=_Video,
+    File=_File,
 )
 _install("astrbot.api.star", Context=_Context, Star=_Star, register=_register)
 _install("astrbot.core")

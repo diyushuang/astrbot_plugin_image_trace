@@ -573,7 +573,7 @@
   "checkin": {
     "description": "每日签到",
     "type": "object",
-    "hint": "每天首次 /签到 计入连续/累计天数；同日重复签到天数不变，但仍会重新取图取句。默认本地合成「边框 + 随机语句」卡片；字体缺失或下载失败自动退化为「缩略图 + 文字」。依赖「随机图」组的图床地址。",
+    "hint": "每天首次 /签到 计入连续/累计天数；同日重复签到天数不变，但仍会重新取图取句。「图文呈现方式」决定合不合成卡片，「签到取图模式」决定用缩略图还是原图——这两项与「随机图」组的 send_thumbnail 互相独立，互不影响。字体缺失或取图失败会自动降级为「图片 + 文字」。依赖「随机图」组的图床地址。",
     "items": {
       "enabled": {
         "description": "【选填】启用每日签到",
@@ -581,6 +581,17 @@
         "default": true,
         "obvious_hint": true,
         "hint": "关闭后 /签到 只提示功能已关闭。"
+      },
+      "mode": {
+        "description": "【选填】签到内容模式",
+        "type": "string",
+        "options": [
+          "quote",
+          "weibo"
+        ],
+        "default": "quote",
+        "obvious_hint": true,
+        "hint": "quote=随机图 + 随机语句（现有行为）；weibo=随机取一条微博文案及其图库对应图片，卡片显示博主与发博日期、不显示链接。文案放 data/plugin_data/astrbot_plugin_image_trace/weibo/（CSV 或 MD），或用 /签到文案导入 上传；精确配图由 scripts/build_weibo_map.py 生成 weibo_post_map.json，签到只读本地表不请求微博。"
       },
       "render_mode": {
         "description": "【选填】图文呈现方式",
@@ -591,7 +602,18 @@
         ],
         "default": "card",
         "obvious_hint": true,
-        "hint": "card=本地合成带边框+语句的卡片（单条图文，需下载缩略图）；simple=缩略图 + 文字语句（不做卡片合成；图片仍按推送通道交付，auto 下 OneBot 可能本地下载压缩）。"
+        "hint": "card=本地合成带边框+语句的卡片（单条图文，需先取一张图再合成）；simple=不合成，直接把图片 + 文字语句发出去（图片仍按推送通道交付，auto 下 OneBot 可能本地下载压缩）。用缩略图还是原图由下一项「签到取图模式」决定。"
+      },
+      "image_mode": {
+        "description": "【选填】签到取图模式",
+        "type": "string",
+        "options": [
+          "thumbnail",
+          "original"
+        ],
+        "default": "thumbnail",
+        "obvious_hint": true,
+        "hint": "thumbnail=用图床 720px 缩略图（体积小、发送快，推荐）；original=用原图（画质全尺寸，代价是下载与上传都更慢，QQ 官方机器人还可能撞 5MB 直传上限）。该选项只作用于 /签到，与「随机图」组的 send_thumbnail 完全独立、互不影响。card 模式下两种取值都会合成卡片（原图会先降采样到最长边 1440px）。"
       },
       "border_px": {
         "description": "【选填】卡片边框宽度（像素）",

@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -127,7 +128,9 @@ FONT_CANDIDATES: tuple[str, ...] = (
 # 参与合成的源图最长边：签到发的是缩略图，正常 720px；万一替身查不到退回
 # 原图（可能 4K），也要把画布控制在可控体积内。
 POSTER_MAX_SIDE = 1440
-# 防解压炸弹：与 features.py 的 _MAX_LOAD_PIXELS 同一量级
+# 防解压炸弹：与 features.py 的 _MAX_LOAD_PIXELS 同一量级。JPEG 会先用
+# Image.draft 做 DCT 缩放（见 compose_poster），这里的闸门只挡「降采样也救不了」
+# 的格式——PNG 这类 draft 无效的图先比像素再解码。
 _MAX_LOAD_PIXELS = 50_000_000
 
 QUOTE_MAX_CHARS = 120
@@ -157,6 +160,30 @@ _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _TAG_RE = re.compile(r"<[^>]{0,200}>")
 _MD_MARKS_RE = re.compile(r"[*_`~]+")
 _EDGE_STRIP = " \t\r\n-—·…"
+
+# 中文字体（msyh / Noto CJK / 文泉驿）没有彩色 emoji 字形，直接绘制会变豆腐块
+# （实测「坠入秋日棕调氛围里🍂」在卡片上是「…里□」）。微博文案 emoji 极常见，
+# 卡片渲染前统一剔除；聊天消息里的原文不动。区间只覆盖真正的 emoji 区，
+# ★ ☀ ♪ 这类中文字体确实有字形的符号仍然保留。
+_EMOJI_RANGES: tuple[tuple[int, int], ...] = (
+    (0x1F000, 0x1FAFF),  # 表情 / 手势 / 交通 / 旗帜 / 补充符号
+    (0x2700, 0x27BF),  # 装饰符号（✅ ✂ ❤ 等）
+    (0xFE00, 0xFE0F),  # 变体选择符 VS1-VS16
+    (0x200D, 0x200D),  # 零宽连接符（组合 emoji）
+    (0x20E3, 0x20E3),  # 键帽组合符
+    (0xE0020, 0xE007F),  # 标签字符（旗帜子序列）
+)
+
+
+def strip_emoji(text: str) -> str:
+    """去掉字体渲染不出的 emoji，避免卡片上出现豆腐块。"""
+    kept = [
+        char
+        for char in str(text or "")
+        if not any(low <= ord(char) <= high for low, high in _EMOJI_RANGES)
+    ]
+    return re.sub(r"[ \t]{2,}", " ", "".join(kept)).strip()
+
 
 try:  # Pillow >= 9.1
     _RESAMPLE = Image.Resampling.LANCZOS
@@ -414,24 +441,41 @@ def resolve_font_path(explicit: str = "") -> str | None:
 
 
 def wrap_text(text: str, font, max_width: int, max_lines: int = 3) -> list[str]:
-    """按像素宽度逐字折行；超过 max_lines 时末行加省略号并停止。"""
+    """按像素宽度逐字折行；超过 max_lines 时末行加省略号并停止。
+
+    ``\\n`` 视为**硬换行**，不参与宽度计算。微博文案本身是多行（解析时特意
+    保留换行），若把换行符当普通字符塞进行里，``drawer.textlength`` 会抛
+    ``ValueError: can't measure length of multiline text``，整张卡片合成失败
+    并静默降级成轻量模式（2026-11-02 实测）。所以先按物理行切段，段内再按
+    像素折行，行数预算全局共享。
+    """
     body = str(text or "").strip()
     if not body:
         return []
     width = max(1, int(max_width))
+    limit = max(1, int(max_lines))
     lines: list[str] = []
-    current = ""
-    for char in body:
-        if font.getlength(current + char) <= width:
-            current += char
+    for paragraph in body.splitlines():
+        paragraph = paragraph.strip()
+        if not paragraph:
             continue
-        if len(lines) + 1 < max_lines:
-            lines.append(current)
-            current = char
-        else:
-            lines.append((current.rstrip() or body[:1]) + "…")
+        current = ""
+        for char in paragraph:
+            if font.getlength(current + char) <= width:
+                current += char
+                continue
+            if len(lines) + 1 < limit:
+                lines.append(current)
+                current = char
+            else:
+                lines.append((current.rstrip() or paragraph[:1]) + "…")
+                return lines
+        if not current:
+            continue
+        if len(lines) >= limit:
+            # 行数预算已用完，最后一行补省略号收尾
+            lines[-1] = (lines[-1].rstrip() or paragraph[:1]) + "…"
             return lines
-    if current:
         lines.append(current)
     return lines
 
@@ -443,20 +487,34 @@ def compose_poster(
     footer: str,
     font_path: str = "",
     border_px: int = 0,
+    quote_max_lines: int = 3,
 ) -> bytes | None:
     """把缩略图合成「白边 + 下方留白写句」的卡片 JPEG；失败返回 None。
 
     画布宽度跟随图片，边框与字号按宽度比例自适应，因此 720px 缩略图与
     1440px 原图都能得到相近的视觉比例。留白区高度由实际折行数决定，
     1 行与 3 行语句各自居中，不会出现固定高度导致的空白过多。
+
+    footer 支持多行（``\n`` 分隔）：微博模式第一行放博主+发博日期，第二行放
+    签到天数；每行独立折行，避免长文本溢出画布。
+    quote_max_lines 供微博文案使用：正文比随机短句长，可放宽到 5 行；正文里的
+    硬换行按原样保留，emoji 会被剔除（中文字体渲染成豆腐块，见 ``strip_emoji``）。
     """
     resolved_font = resolve_font_path(font_path)
     if resolved_font is None:
         return None
     try:
         with Image.open(io.BytesIO(image_bytes)) as source:
+            # 先让解码器按 DCT 缩放输出：JPEG 支持 1/2、1/4、1/8 直接解出小图，
+            # 手机长图（线上实测 8736×11648）也能在几十 ms 内拿到 ~2000px 的尺寸，
+            # 不必先按 1 亿像素整图解码。draft 只对 JPEG 有效，其余格式原样返回，
+            # 由下一行的像素闸门兜住解压炸弹。
+            with contextlib.suppress(Exception):  # 失去加速不影响正确性
+                source.draft("RGB", (POSTER_MAX_SIDE, POSTER_MAX_SIDE))
             if source.width * source.height > _MAX_LOAD_PIXELS:
-                logger.warning(f"签到卡片源图像素过大，跳过合成: {source.size}")
+                logger.warning(
+                    f"签到卡片源图像素过大且无法降采样，跳过合成: {source.size}"
+                )
                 return None
             source.seek(0)
             image = ImageOps.exif_transpose(source)
@@ -489,12 +547,30 @@ def compose_poster(
         footer_font = ImageFont.truetype(resolved_font, footer_size)
 
         text_width = max(120, width - border * 2)
-        lines = wrap_text(quote, font, text_width, max_lines=3)
+        max_quote_lines = max(1, min(8, int(quote_max_lines or 3)))
+        lines = wrap_text(strip_emoji(quote), font, text_width, max_lines=max_quote_lines)
         if not lines:
             lines = ["今天的每一步，都算数。"]
+        footer_raw = [
+            line.strip() for line in strip_emoji(footer).splitlines() if line.strip()
+        ]
+        if footer_raw:
+            footer_lines: list[str] = []
+            for line in footer_raw:
+                wrapped = wrap_text(line, footer_font, text_width, max_lines=2)
+                footer_lines.extend(wrapped or [""])
+        else:
+            footer_lines = [""]
         line_height = font_size + round(font_size * 0.45)
+        footer_line_height = footer_size + round(footer_size * 0.35)
         gap_quote_footer = max(8, round(font_size * 0.5))
-        canvas_height = height + border * 3 + line_height * len(lines) + gap_quote_footer + footer_size
+        canvas_height = (
+            height
+            + border * 3
+            + line_height * len(lines)
+            + gap_quote_footer
+            + footer_line_height * len(footer_lines)
+        )
         canvas = Image.new("RGB", (width + border * 2, canvas_height), _BG_COLOR)
         canvas.paste(image, (border, border))
         drawer = ImageDraw.Draw(canvas)
@@ -514,13 +590,15 @@ def compose_poster(
             )
             top += line_height
         top += gap_quote_footer
-        footer_width = drawer.textlength(footer, font=footer_font)
-        drawer.text(
-            (max(0, (canvas.width - footer_width) // 2), top),
-            footer,
-            fill=_FOOTER_COLOR,
-            font=footer_font,
-        )
+        for line in footer_lines:
+            footer_width = drawer.textlength(line, font=footer_font)
+            drawer.text(
+                (max(0, (canvas.width - footer_width) // 2), top),
+                line,
+                fill=_FOOTER_COLOR,
+                font=footer_font,
+            )
+            top += footer_line_height
 
         output = io.BytesIO()
         canvas.save(output, format="JPEG", quality=88, optimize=True)
