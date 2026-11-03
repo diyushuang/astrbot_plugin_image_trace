@@ -6,7 +6,7 @@ Step 1 已把配置读取/迁移收口到 `config/`，并把 `main` 上的同名
 依赖，同时把默认值再分散一份。这里用 AST 静态检查挡住两类回归：
 
 1. 访问 main 的私有配置方法（`._cfg`、`._bucket_config` 等）；
-2. 新模块反向 import `main`。
+2. 新模块反向 import `main`（`from main import x` 与 `import main` 两种写法都拦）。
 
 同一文件里自己定义的同类方法（例如 `ImageBedClient._bool_cfg` 只是本地真值解析）
 不算绕过，避免误报。测试里对 `main._LAYOUT_VERSION` 等兼容符号的引用不在扫描范围。
@@ -86,6 +86,12 @@ class _FacadeBypassVisitor(ast.NodeVisitor):
             self.violations.append(f"{self.rel}:{node.lineno} 反向 import {node.module}")
         self.generic_visit(node)
 
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            if alias.name.split(".")[-1] == "main":
+                self.violations.append(f"{self.rel}:{node.lineno} 反向 import {alias.name}")
+        self.generic_visit(node)
+
     def _is_local_shadow(self, node: ast.Attribute) -> bool:
         """self._x / cls._x 且当前类自己定义了 _x：属于本文件内部方法，不是 main 的。"""
         if not isinstance(node.value, ast.Name) or node.value.id not in {"self", "cls"}:
@@ -119,3 +125,11 @@ def test_main_keeps_config_delegate_methods():
         name for name in PRIVATE_CONFIG_METHODS if not hasattr(ImageTracePlugin, name)
     )
     assert not missing, f"main 缺少配置薄委托方法: {missing}"
+
+
+def test_guard_detects_both_import_forms() -> None:
+    """守护规则自检：`from main import x` 与 `import main` 都必须被拦。"""
+    visitor = _FacadeBypassVisitor(Path("demo/new_module.py"))
+    visitor.visit(ast.parse("from main import foo\nimport main\nimport pkg.main as m\n"))
+    assert len(visitor.violations) == 3
+    assert any("import main" in item for item in visitor.violations)
