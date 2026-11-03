@@ -51,7 +51,6 @@ try:
         DOWNLOAD_CHUNK_SIZE,
         DOWNLOAD_TIMEOUT,
         MEMORY_DOWNLOAD_MAX_BYTES,
-        ONEBOT_IMAGE_TIMEOUT,
         PLAN_TOTAL_TIMEOUT,
         PROBE_CONCURRENCY,
         PROBE_TIMEOUT,
@@ -61,15 +60,42 @@ try:
         SCALED_VERIFY_COOLDOWN_SECONDS,
         SCAN_CONCURRENCY,
         TMP_MAX_AGE_SECONDS,
-        as_float,
         as_int,
-        bool_or,
-        is_blank,
         is_qq_image_bed_host,
         read_bytes,
         sanitize_error_text,
-        truthy,
     )
+    from .config.loader import (
+        bool_cfg,
+        bucket_config,
+        checkin_settings,
+        delivery_config,
+        dict_group,
+        effective_bed_cfg,
+        encode_options,
+        engine_choice,
+        ensure_group_cfg,
+        first_value,
+        float_cfg,
+        int_cfg,
+        napcat_delivery_cfg,
+        onebot_image_timeout,
+        qq_delivery_cfg,
+        qq_upload_config,
+        random_settings,
+        scalar_cfg,
+        scan_dirs,
+        vector_index_on_register,
+        verify_scaled,
+    )
+    from .config.migrations import (
+        BUCKET_MODES,
+        LAYOUT_VERSION,
+        SCALAR_PATHS,
+        migrate_bucket_config,
+        migrate_config_layout,
+    )
+    from .config.typed import DEFAULT_BASIC, DEFAULT_LIMITS
     from .features import (
         ImageFeatures,
         avif_available,
@@ -88,7 +114,6 @@ try:
         CompressionEvidence,
         DeliveryTarget,
         SendOutcome,
-        bounded_int,
         build_imgbed_file_url,
         build_original_url,
         build_scaled_url,
@@ -98,7 +123,6 @@ try:
         compression_evidence,
         content_length_from_headers,
         deduplicate_vector_hits,
-        delivery_settings,
         delivery_target,
         is_napcat_parseable_url,
         is_public_http_url,
@@ -108,7 +132,6 @@ try:
         prefer_url_direct,
         prepare_image_bytes,
         qq_upload_safe_image,
-        qq_upload_settings,
         send_diagnosis,
         sniff_image_format,
         upgrade_to_https,
@@ -116,7 +139,6 @@ try:
     from .library import ImageLibrary
     from .media_history import MediaHistory
     from .random_media import (
-        RANDOM_ENDPOINT_DEFAULT,
         RandomMediaClient,
         RandomMediaError,
         clean_display_name,
@@ -151,7 +173,6 @@ except ImportError:  # 兼容插件以独立模块方式加载
         DOWNLOAD_CHUNK_SIZE,
         DOWNLOAD_TIMEOUT,
         MEMORY_DOWNLOAD_MAX_BYTES,
-        ONEBOT_IMAGE_TIMEOUT,
         PLAN_TOTAL_TIMEOUT,
         PROBE_CONCURRENCY,
         PROBE_TIMEOUT,
@@ -161,15 +182,42 @@ except ImportError:  # 兼容插件以独立模块方式加载
         SCALED_VERIFY_COOLDOWN_SECONDS,
         SCAN_CONCURRENCY,
         TMP_MAX_AGE_SECONDS,
-        as_float,
         as_int,
-        bool_or,
-        is_blank,
         is_qq_image_bed_host,
         read_bytes,
         sanitize_error_text,
-        truthy,
     )
+    from config.loader import (  # type: ignore[no-redef]
+        bool_cfg,
+        bucket_config,
+        checkin_settings,
+        delivery_config,
+        dict_group,
+        effective_bed_cfg,
+        encode_options,
+        engine_choice,
+        ensure_group_cfg,
+        first_value,
+        float_cfg,
+        int_cfg,
+        napcat_delivery_cfg,
+        onebot_image_timeout,
+        qq_delivery_cfg,
+        qq_upload_config,
+        random_settings,
+        scalar_cfg,
+        scan_dirs,
+        vector_index_on_register,
+        verify_scaled,
+    )
+    from config.migrations import (  # type: ignore[no-redef]
+        BUCKET_MODES,
+        LAYOUT_VERSION,
+        SCALAR_PATHS,
+        migrate_bucket_config,
+        migrate_config_layout,
+    )
+    from config.typed import DEFAULT_BASIC, DEFAULT_LIMITS  # type: ignore[no-redef]
     from features import (  # type: ignore[no-redef]
         ImageFeatures,
         avif_available,
@@ -188,7 +236,6 @@ except ImportError:  # 兼容插件以独立模块方式加载
         CompressionEvidence,
         DeliveryTarget,
         SendOutcome,
-        bounded_int,
         build_imgbed_file_url,
         build_original_url,
         build_scaled_url,
@@ -198,7 +245,6 @@ except ImportError:  # 兼容插件以独立模块方式加载
         compression_evidence,
         content_length_from_headers,
         deduplicate_vector_hits,
-        delivery_settings,
         delivery_target,
         is_napcat_parseable_url,
         is_public_http_url,
@@ -208,7 +254,6 @@ except ImportError:  # 兼容插件以独立模块方式加载
         prefer_url_direct,
         prepare_image_bytes,
         qq_upload_safe_image,
-        qq_upload_settings,
         send_diagnosis,
         sniff_image_format,
         upgrade_to_https,
@@ -216,7 +261,6 @@ except ImportError:  # 兼容插件以独立模块方式加载
     from library import ImageLibrary  # type: ignore[no-redef]
     from media_history import MediaHistory  # type: ignore[no-redef]
     from random_media import (  # type: ignore[no-redef]
-        RANDOM_ENDPOINT_DEFAULT,
         RandomMediaClient,
         RandomMediaError,
         clean_display_name,
@@ -237,6 +281,10 @@ except ImportError:  # 兼容插件以独立模块方式加载
         map_is_stale,
         parse_weibo_text,
     )
+
+# 兼容旧测试/外部引用：这些常量已迁到 config.migrations，main 只保留别名。
+_LAYOUT_VERSION = LAYOUT_VERSION
+_SCALAR_PATHS = SCALAR_PATHS
 
 PLUGIN_NAME = "astrbot_plugin_image_trace"
 # 扫描目录认可的图片扩展名。TIFF 由 Pillow 原生支持；AVIF 只有 Pillow 11.3+
@@ -263,49 +311,9 @@ QQ_TRANSCODE_MAX_PIXELS = 50_000_000
 # ----------------------------------------------------------------------
 # 配置布局（1.7.14）：同类项合并进 basic / delivery / limits 三个组。
 # 旧布局（顶层散项 + image_delivery / qq_upload 两组）继续可读——新键优先、
-# 旧键回落，启动时由 _migrate_config_layout 落盘迁移，用户无需手动改配置。
+# 旧键回落。映射表、版本号与迁移实现已收口到 config/migrations.py，
+# main 只保留同名薄委托。
 # ----------------------------------------------------------------------
-
-# 旧顶层键 → (新组, 新字段)
-_SCALAR_PATHS: dict[str, tuple[str, str]] = {
-    "search_engine": ("basic", "search_engine"),
-    "scan_dirs": ("basic", "scan_dirs"),
-    "similarity_threshold": ("basic", "hash_similarity_threshold"),
-    "hash_size": ("basic", "hash_size"),
-    "top_n": ("basic", "top_n"),
-    "max_images_per_query": ("basic", "max_images_per_query"),
-    "ai_verify": ("basic", "ai_verify"),
-    "register_admin_only": ("basic", "register_admin_only"),
-    "max_download_mb": ("limits", "max_download_mb"),
-    "remote_hash_enabled": ("limits", "remote_hash_enabled"),
-    "remote_hash_ttl": ("limits", "remote_hash_ttl"),
-    "remote_hash_max_points": ("limits", "remote_hash_max_points"),
-}
-
-# 当前配置布局版本（写在隐藏项 config_layout 里，避免重复迁移覆盖用户新值）
-_LAYOUT_VERSION = "3"
-
-# 旧 image_delivery 字段 → delivery 组里的 NapCat 字段
-_NAPCAT_KEY_MAP: dict[str, str] = {
-    "mode": "napcat_mode",
-    "max_side": "napcat_max_side",
-    "quality": "napcat_quality",
-    "verify_scaled": "napcat_verify_scaled",
-    "scaled_url_style": "napcat_scaled_url_style",
-    "target_kb": "napcat_target_kb",
-    "webp": "napcat_webp",
-    "onebot_image_timeout": "napcat_timeout",
-}
-
-# 旧 qq_upload 字段 → delivery 组里的 QQ 官方字段
-_QQ_KEY_MAP: dict[str, str] = {
-    "mode": "qq_mode",
-    "direct_max_mb": "qq_native_max_mb",
-    "auto_prefer": "qq_auto_prefer",
-    "url_max_mb": "qq_url_max_mb",
-    "max_upload_mb": "qq_max_upload_mb",
-    "on_failure": "qq_on_failure",
-}
 
 
 
@@ -342,43 +350,8 @@ class ResolvedImage:
     features: ImageFeatures | None = None
 
 
-# 储存桶（对象存储）独立配置组；v1.2.x 曾作为 image_bed 的模式，迁移见
-# _migrate_bucket_config。完整判定与 image_bed.py 的 _require / 公开直链
-# 校验口径一致：缺任何一项上传都必然回退本地副本，不满足就不优先于图床
-BUCKET_MODES = ("cloudflare_r2", "oracle_oci")
-BUCKET_REQUIRED = {
-    "cloudflare_r2": (
-        "r2_account_id",
-        "r2_access_key_id",
-        "r2_secret_access_key",
-        "r2_bucket",
-        "r2_public_base_url",
-    ),
-    "oracle_oci": (
-        "oci_namespace",
-        "oci_region",
-        "oci_access_key_id",
-        "oci_secret_access_key",
-        "oci_bucket",
-    ),
-}
-# v1.2.x image_bed 组里可能遗留的储存桶字段（迁移时搬走并清理）
-BUCKET_LEGACY_FIELDS = (
-    "r2_account_id",
-    "r2_access_key_id",
-    "r2_secret_access_key",
-    "r2_bucket",
-    "r2_endpoint",
-    "r2_public_base_url",
-    "oci_namespace",
-    "oci_region",
-    "oci_access_key_id",
-    "oci_secret_access_key",
-    "oci_bucket",
-    "oci_endpoint",
-    "oci_public_bucket",
-    "oci_public_base_url",
-)
+# 储存桶（对象存储）的常量与完整判定在 config/migrations.py、config/loader.py；
+# 这里保留注释以说明 _bucket_config 的薄委托来源。
 
 
 class ImageTracePlugin(Star):
@@ -396,22 +369,28 @@ class ImageTracePlugin(Star):
         # pHash 十六进制长度 = phash_hex_len(hash_size)（packbits 补齐到字节
         # 边界）；hash_size 必须为 4 的倍数，否则长度公式与旧数据对不上，
         # 全库记录都会被判为不匹配、索引静默清空
-        hash_size = as_int(self._cfg("hash_size"), 16)
+        hash_size = as_int(self._cfg("hash_size"), DEFAULT_BASIC.hash_size)
         if not 4 <= hash_size <= 32 or hash_size % 4 != 0:
             logger.warning(
                 f"hash_size 配置值 {hash_size} 无效（须为 4~32 之间 4 的倍数，"
                 "如 8/16/24/32），已回退为默认 16。"
             )
-            hash_size = 16
+            hash_size = DEFAULT_BASIC.hash_size
         self.hash_size = hash_size
         self.library = ImageLibrary(
             os.path.join(self.data_dir, "library.db"),
             expected_phash_hex_len=phash_hex_len(hash_size),
         )
-        self.hash_threshold = max(0.0, min(1.0, self._float_cfg("similarity_threshold", 0.85)))
+        self.hash_threshold = max(
+            0.0,
+            min(1.0, self._float_cfg("similarity_threshold", DEFAULT_BASIC.hash_similarity_threshold)),
+        )
         # 配置上限：这两个值直接放大网络请求量与消息长度，手改离谱值时必须收敛
-        self.top_n = max(0, min(50, self._int_cfg("top_n", 3)))
-        self.max_images_per_query = max(1, min(10, self._int_cfg("max_images_per_query", 3)))
+        self.top_n = max(0, min(50, self._int_cfg("top_n", DEFAULT_BASIC.top_n)))
+        self.max_images_per_query = max(
+            1,
+            min(10, self._int_cfg("max_images_per_query", DEFAULT_BASIC.max_images_per_query)),
+        )
         # v1.2.x 的储存桶配置先迁移，再合并（储存桶完整时优先于图床）
         self._migrate_bucket_config()
         self._bed_cfg = self._effective_bed_cfg()
@@ -484,17 +463,19 @@ class ImageTracePlugin(Star):
         而不是 vector.enabled——只配 Qdrant、不配 embedding 的纯哈希部署同样
         应该能用图床哈希索引。
         """
-        return self._bool_cfg("remote_hash_enabled", True) and bool(
+        return self._bool_cfg("remote_hash_enabled", DEFAULT_LIMITS.remote_hash_enabled) and bool(
             getattr(self.vector, "qdrant_ready", False)
         )
 
     def _remote_hash_ttl(self) -> int:
         """缓存最长有效期（秒）。缓存新鲜时启动/溯源都不重新拉取。"""
-        return max(300, self._int_cfg("remote_hash_ttl", 21600))
+        return max(300, self._int_cfg("remote_hash_ttl", DEFAULT_LIMITS.remote_hash_ttl))
 
     def _remote_hash_max_points(self) -> int:
         """拉取上限（0 = 不限）。用于先小样本验证链路，再放开全量。"""
-        return max(0, self._int_cfg("remote_hash_max_points", 0))
+        return max(
+            0, self._int_cfg("remote_hash_max_points", DEFAULT_LIMITS.remote_hash_max_points)
+        )
 
     def _remote_hash_cache_fresh(self) -> bool:
         """本地缓存是否仍在 remote_hash_ttl 有效期内且确实有可用条目。
@@ -564,214 +545,55 @@ class ImageTracePlugin(Star):
     # ------------------------------------------------------------------
 
     def _dict_cfg(self, key: str) -> dict:
-        """取对象型配置；手工改坏配置（非 dict）时退化为空 dict 而不是抛错。"""
-        value = self.config.get(key)
-        return value if isinstance(value, dict) else {}
+        """取对象型配置；实现见 config.loader.dict_group。"""
+        return dict_group(self.config, key)
 
     def _ensure_group(self, name: str) -> dict:
-        """取（必要时创建）对象型配置组，迁移与新键写入共用。"""
-        group = self.config.get(name)
-        if not isinstance(group, dict):
-            group = {}
-            self.config[name] = group
-        return group
+        """取（必要时创建）对象型配置组，实现见 config.migrations。"""
+        return ensure_group_cfg(self.config, name)
 
     def _cfg(self, key: str):
-        """读标量配置：新布局（basic / limits）优先，回落旧顶层键。
-
-        迁移未执行（配置被手改、或用户回滚过版本）时旧键仍能生效；两处都有值时
-        以新键为准，避免"面板改了不生效"。
-        """
-        group, field = _SCALAR_PATHS.get(key, ("", key))
-        if group:
-            value = self._dict_cfg(group).get(field)
-            if not is_blank(value):
-                return value
-        return self.config.get(key)
+        """读标量配置：新布局（basic / limits）优先，回落旧顶层键。"""
+        return scalar_cfg(self.config, key)
 
     def _int_cfg(self, key: str, default: int) -> int:
-        return as_int(self._cfg(key), default)
+        return int_cfg(self.config, key, default)
 
     def _float_cfg(self, key: str, default: float) -> float:
-        return as_float(self._cfg(key), default)
+        return float_cfg(self.config, key, default)
 
     def _bool_cfg(self, key: str, default: bool) -> bool:
         """布尔配置：未配置（缺键/空串/null）时取默认值，与数值配置口径一致。"""
-        return bool_or(self._cfg(key), default)
+        return bool_cfg(self.config, key, default)
 
     def _migrate_config_layout(self) -> None:
-        """把旧布局搬进 basic / delivery / limits（一次性，带版本标记）。
-
-        为什么不「删旧键」：AstrBot 加载插件配置时会按 schema 删除已不存在的键
-        （AstrBotConfig.check_config_integrity 会丢掉 refer_conf 之外的键），键名
-        一改，用户的旧值在插件初始化**之前**就已经被清成默认值了。所以旧键继续以
-        「隐藏镜像」的形式留在 schema 里（condition 恒假，面板不显示），迁移只做
-        搬移 + 打标记，之后不再覆盖——用户此后在面板改的新值不会被旧值盖回去。
-
-        旧值优先于新键：新键在首次加载时已被 schema 默认值填满，此时「新键非空」
-        不代表用户改过，只有旧键才是用户真实设置。
-        """
-        if str(self.config.get("config_layout") or "") == _LAYOUT_VERSION:
-            return
-        moved = False
-        for legacy, (group, field) in _SCALAR_PATHS.items():
-            value = self.config.get(legacy)
-            if is_blank(value):
-                continue
-            self._ensure_group(group)[field] = value
-            moved = True
-        for legacy_group, key_map in (
-            ("image_delivery", _NAPCAT_KEY_MAP),
-            ("qq_upload", _QQ_KEY_MAP),
-        ):
-            legacy_items = self.config.get(legacy_group)
-            if not isinstance(legacy_items, dict):
-                continue
-            target = self._ensure_group("delivery")
-            for old_key, new_key in key_map.items():
-                value = legacy_items.get(old_key)
-                if not is_blank(value):
-                    target[new_key] = value
-                    moved = True
-        self.config["config_layout"] = _LAYOUT_VERSION
-        try:
-            self.config.save_config()
-        except Exception as exc:  # 保存失败不影响本次会话
-            logger.warning(f"配置布局迁移写入失败（重启后会自动重试）: {exc}")
-        if moved:
-            logger.info("配置已迁移到新布局：basic / delivery / limits（旧键保留为隐藏镜像）")
+        """把旧布局搬进 basic / delivery / limits；实现见 config.migrations。"""
+        migrate_config_layout(self.config)
 
     def _napcat_delivery_cfg(self) -> dict:
-        """推送通道（NapCat）配置，键名沿用 delivery_settings 的入参约定。
-
-        delivery.napcat_* 优先，逐项回落旧 image_delivery.*（迁移未执行时也能用）。
-        """
-        new = self._dict_cfg("delivery")
-        old = self._dict_cfg("image_delivery")
-        return {
-            "mode": self._first_value(new.get("napcat_mode"), old.get("mode")),
-            "max_side": self._first_value(new.get("napcat_max_side"), old.get("max_side")),
-            "quality": self._first_value(new.get("napcat_quality"), old.get("quality")),
-            "scaled_url_style": self._first_value(
-                new.get("napcat_scaled_url_style"), old.get("scaled_url_style")
-            ),
-            "verify_scaled": self._first_value(
-                new.get("napcat_verify_scaled"), old.get("verify_scaled")
-            ),
-            "target_kb": self._first_value(new.get("napcat_target_kb"), old.get("target_kb")),
-            "webp": self._first_value(new.get("napcat_webp"), old.get("webp")),
-            "onebot_image_timeout": self._first_value(
-                new.get("napcat_timeout"), old.get("onebot_image_timeout")
-            ),
-        }
+        """推送通道（NapCat）配置，实现见 config.loader.napcat_delivery_cfg。"""
+        return napcat_delivery_cfg(self.config)
 
     def _qq_delivery_cfg(self) -> dict:
-        """推送通道（QQ 官方）配置，键名沿用 qq_upload_settings 的入参约定。"""
-        new = self._dict_cfg("delivery")
-        old = self._dict_cfg("qq_upload")
-        return {
-            "mode": self._first_value(new.get("qq_mode"), old.get("mode")),
-            "direct_max_mb": self._first_value(
-                new.get("qq_native_max_mb"), old.get("direct_max_mb")
-            ),
-            "auto_prefer": self._first_value(
-                new.get("qq_auto_prefer"), old.get("auto_prefer")
-            ),
-            "url_max_mb": self._first_value(new.get("qq_url_max_mb"), old.get("url_max_mb")),
-            "max_upload_mb": self._first_value(
-                new.get("qq_max_upload_mb"), old.get("max_upload_mb")
-            ),
-            "on_failure": self._first_value(
-                new.get("qq_on_failure"), old.get("on_failure")
-            ),
-        }
+        """推送通道（QQ 官方）配置，实现见 config.loader.qq_delivery_cfg。"""
+        return qq_delivery_cfg(self.config)
 
     @staticmethod
     def _first_value(*values):
         """取第一个非空值（0 / False 是合法配置，不能按假值跳过）。"""
-        for value in values:
-            if not is_blank(value):
-                return value
-        return None
+        return first_value(*values)
 
     def _migrate_bucket_config(self) -> None:
-        """v1.2.x 升级迁移（幂等）：image_bed 组里的储存桶模式与字段搬到
-        独立的 storage_bucket 组。
-
-        v1.3.0 起 image_bed.mode 不再含 cloudflare_r2 / oracle_oci（二者
-        移入 storage_bucket 组），老配置只在 image_bed 组里存在，启动时
-        搬一次；storage_bucket 已有 mode 时只清理残留不覆盖用户新配置。
-        """
-        bed = self.config.get("image_bed")
-        if not isinstance(bed, dict):
-            return
-        legacy_mode = str(bed.get("mode") or "").strip()
-        if legacy_mode not in BUCKET_MODES:
-            return
-        bucket = self.config.get("storage_bucket")
-        if not isinstance(bucket, dict):
-            bucket = {}
-            self.config["storage_bucket"] = bucket
-        if not bucket.get("mode"):
-            bucket["mode"] = legacy_mode
-            for key in BUCKET_LEGACY_FIELDS:
-                value = bed.get(key)
-                if value not in (None, "", False):
-                    bucket[key] = value
-        # 旧下拉里已没有储存桶选项，归位 local；r2_*/oci_* 字段也不在
-        # image_bed 组的 schema 里了，一并清掉避免残留
-        bed["mode"] = "local"
-        for key in BUCKET_LEGACY_FIELDS:
-            bed.pop(key, None)
-        try:
-            self.config.save_config()
-        except Exception as e:
-            # 保存失败只影响持久化：本次会话已用迁移后的内存配置，
-            # 重启后同一条迁移会再次执行（幂等）
-            logger.warning(f"储存桶配置迁移写入失败（重启后会自动重试）: {e}")
-        logger.info(
-            f"已把 v1.2.x 图床配置中的储存桶设置（{legacy_mode}）迁移到 "
-            "storage_bucket 组，image_bed 组回归图床模式 local。"
-        )
+        """v1.2.x 储存桶配置迁移；实现见 config.migrations。"""
+        migrate_bucket_config(self.config)
 
     def _bucket_config(self) -> dict | None:
-        """储存桶配置完整时返回可并入图床配置的 dict（含 mode），否则 None。
-
-        完整 = mode 已选 + 必填项齐全 + 公开直链条件满足（R2 需
-        r2_public_base_url，OCI 需公共桶或自定义公开地址二选一）：
-        缺任一项上传都必然回退本地副本，优先于图床只会白费一次必败上传。
-        """
-        raw = self._dict_cfg("storage_bucket")
-        mode = str(raw.get("mode") or "").strip()
-        if mode not in BUCKET_MODES:
-            return None
-        missing = [
-            f"storage_bucket.{k}" for k in BUCKET_REQUIRED[mode] if is_blank(raw.get(k))
-        ]
-        if (
-            mode == "oracle_oci"
-            and not truthy(raw.get("oci_public_bucket"))
-            and is_blank(raw.get("oci_public_base_url"))
-        ):
-            missing.append(
-                "storage_bucket.oci_public_bucket / oci_public_base_url（公开直链二选一）"
-            )
-        if missing:
-            logger.warning(
-                f"储存桶 {mode} 配置不完整（缺 {'、'.join(missing)}），登记原图将改用图床设置。"
-            )
-            return None
-        cfg = dict(raw)
-        cfg["mode"] = mode
-        return cfg
+        """储存桶配置完整时返回可并入图床配置的 dict（含 mode），否则 None。"""
+        return bucket_config(self.config)
 
     def _effective_bed_cfg(self) -> dict:
         """合并储存桶与图床两组配置：储存桶配置完整时优先（覆盖 mode 与字段）。"""
-        bed = dict(self._dict_cfg("image_bed"))
-        bucket = self._bucket_config()
-        if bucket is not None:
-            bed.update(bucket)
-        return bed
+        return effective_bed_cfg(self.config)
 
     def _bed_mode(self) -> str:
         """生效的存储模式（storage_bucket 优先合并后的图床配置）。"""
@@ -790,22 +612,13 @@ class ImageTracePlugin(Star):
 
     def _engine_choice(self) -> str:
         """当前检索引擎：hash | vector | auto（vector 优先，失败/未命中回退 hash）。"""
-        choice = str(self._cfg("search_engine") or "auto").strip().lower()
-        return choice if choice in ("hash", "vector", "auto") else "auto"
+        return engine_choice(self.config)
 
     def _vector_index_on_register(self) -> bool:
-        value = self._dict_cfg("vector_search").get("vector_index_on_register")
-        if is_blank(value):
-            return True
-        return truthy(value)
+        return vector_index_on_register(self.config)
 
     def _scan_dirs(self) -> list:
-        raw = self._cfg("scan_dirs")
-        if isinstance(raw, str):  # 手工配置成单个路径字符串时按一个目录处理
-            raw = [raw]
-        if not isinstance(raw, list):
-            return []
-        return [d.strip() for d in raw if isinstance(d, str) and d.strip()]
+        return scan_dirs(self.config)
 
     # ------------------------------------------------------------------
     # 图片提取与解析
@@ -935,7 +748,7 @@ class ImageTracePlugin(Star):
 
     def _download_limit_bytes(self) -> int:
         """回传兜底下载的大小上限（字节）：limits.max_download_mb。"""
-        return max(1, self._int_cfg("max_download_mb", 20)) * 1024 * 1024
+        return max(1, self._int_cfg("max_download_mb", DEFAULT_LIMITS.max_download_mb)) * 1024 * 1024
 
     @staticmethod
     def _download_timeout() -> aiohttp.ClientTimeout:
@@ -1180,19 +993,15 @@ class ImageTracePlugin(Star):
 
     def _verify_scaled(self) -> bool:
         """delivery.napcat_verify_scaled：图床缩放是否实测校验，未配置时默认开启。"""
-        raw = self._napcat_delivery_cfg().get("verify_scaled")
-        return True if is_blank(raw) else truthy(raw)
+        return verify_scaled(self.config)
 
     def _onebot_image_timeout(self) -> int:
         """delivery.napcat_timeout：OneBot image 段的 timeout 字段（秒）。
 
-        该字段是协议端（NapCat 等）下载网络图片的窗口，不是插件的出网超时。
-        未配置或填了非数字时用 common.ONEBOT_IMAGE_TIMEOUT；其余值收敛到
-        [10, 300]——填 0 会落到 10 而不是原样写 0，否则等于告诉协议端「立刻
-        放弃下载」，图片必然拉不到。
+        实现与默认值见 config.loader.onebot_image_timeout；填 0 会落到 10，
+        不会原样写 0（否则等于告诉协议端「立刻放弃下载」）。
         """
-        raw = self._napcat_delivery_cfg().get("onebot_image_timeout")
-        return bounded_int(raw, ONEBOT_IMAGE_TIMEOUT, 10, 300)
+        return onebot_image_timeout(self.config)
 
     async def _get_http(self) -> GuardedHttpClient:
         if self._http is None:
@@ -1221,52 +1030,11 @@ class ImageTracePlugin(Star):
             pass
 
     def _delivery_config(self) -> tuple[str, int, int, str]:
-        return delivery_settings(self._napcat_delivery_cfg())
+        return delivery_config(self.config)
 
     def _random_settings(self) -> dict:
-        """归一化随机图配置组（random_media）。
-
-        与其它配置组同源：数值用 common 的容错解析、布尔用真值表、空串按未
-        配置处理。缺 base_url 时不在这里拦截，交由 RandomMediaClient 抛
-        RandomMediaError，使“未配置”提示集中在一处。
-
-        default_dir 支持单个目录或用 `,` 分隔的目录池：图床的 /random 只收单一
-        dir，池用于「不指定目录时尽量覆盖整库」——见 pick_default_directory。
-
-        lan_base_url（内网直连）非空时：随机接口改走内网源，其主机进入本实例
-        的私网白名单（仅豁免该主机的私网地址拒绝，其它 SSRF 校验照旧）；
-        每次归一化都重写本实例白名单，配置改动后热重载即可生效。
-        """
-        raw = self._dict_cfg("random_media")
-        lan_base = str(raw.get("lan_base_url") or "").strip()
-        lan_host = ""
-        if lan_base:
-            parsed_lan = urlsplit(lan_base)
-            if parsed_lan.scheme in ("http", "https") and parsed_lan.netloc:
-                lan_host = (parsed_lan.hostname or "").lower()
-            else:
-                logger.warning(f"random_media.lan_base_url 不是有效的 http(s) 地址，已忽略: {lan_base}")
-                lan_base = ""
-        self._allowed_private_hosts.clear()
-        if lan_host:
-            self._allowed_private_hosts.add(lan_host)
-        timeout = as_float(raw.get("timeout"), 10.0)
-        if timeout <= 0:
-            # 0/负数会让请求立即超时，回退默认值
-            timeout = 10.0
-        return {
-            "base_url": str(raw.get("base_url") or "").strip(),
-            "lan_base_url": lan_base,
-            "api_endpoint": str(raw.get("api_endpoint") or RANDOM_ENDPOINT_DEFAULT).strip()
-            or RANDOM_ENDPOINT_DEFAULT,
-            "api_token": str(raw.get("api_token") or "").strip(),
-            "default_dir": str(raw.get("default_dir") or "").strip(),
-            "timeout": timeout,
-            "retry_count": bounded_int(raw.get("retry_count"), 3, 0, 10),
-            "show_file_info": bool_or(raw.get("show_file_info"), True),
-            "enable_llm": bool_or(raw.get("enable_llm"), True),
-            "send_thumbnail": bool_or(raw.get("send_thumbnail"), True),
-        }
+        """归一化随机图配置组（random_media）；实现见 config.loader。"""
+        return random_settings(self.config, self._allowed_private_hosts)
 
     @staticmethod
     def _lan_url_hosts(settings: dict) -> tuple[str, ...]:
@@ -1308,41 +1076,8 @@ class ImageTracePlugin(Star):
         return self._random_media_client
 
     def _checkin_settings(self) -> dict:
-        """归一化每日签到配置（checkin 组）。
-
-        所有取值都做范围收敛：面板被手改成离谱数字（如边框 9999、时区 99）时，
-        按边界值生效而不是把非法值传进合成/日期计算。
-        """
-        raw = self._dict_cfg("checkin")
-        headers = raw.get("quote_api_headers")
-        source = str(raw.get("quote_source") or "").strip().lower()
-        mode = str(raw.get("mode") or "").strip().lower()
-        image_mode = str(raw.get("image_mode") or "").strip().lower()
-        return {
-            "enabled": bool_or(raw.get("enabled"), True),
-            "mode": "weibo" if mode == "weibo" else "quote",
-            "render_mode": "simple"
-            if str(raw.get("render_mode") or "").strip().lower() == "simple"
-            else "card",
-            # 签到自己的取图口径，与 random_media.send_thumbnail 独立：那边管
-            # /随机图、/随机视频 发哪张，这边只管 /签到 发哪张/拿哪张合成。
-            "image_mode": "original" if image_mode == "original" else "thumbnail",
-            # 签到文字两个开关，互相独立：
-            # show_quote=卡片/消息里要不要那句随机语句（微博模式下是文案），
-            #   关掉就是「只有美图 + 签到信息」；
-            # show_sender=签到文字里要不要带上签到者昵称。
-            "show_quote": bool_or(raw.get("show_quote"), True),
-            "show_sender": bool_or(raw.get("show_sender"), True),
-            "border_px": max(0, min(200, as_int(raw.get("border_px"), 0))),
-            "utc_offset_hours": max(-12, min(14, as_int(raw.get("utc_offset_hours"), 8))),
-            "quote_source": source if source in {"api", "mixed"} else "builtin",
-            "quote_local_text": str(raw.get("quote_local_text") or ""),
-            "quote_api_url": str(raw.get("quote_api_url") or "").strip(),
-            "quote_json_path": str(raw.get("quote_json_path") or "").strip(),
-            "quote_api_headers": headers if isinstance(headers, dict) else {},
-            "quote_timeout": max(1, min(30, as_int(raw.get("quote_timeout"), 5))),
-            "font_path": str(raw.get("font_path") or "").strip(),
-        }
+        """归一化每日签到配置（checkin 组）；实现见 config.loader。"""
+        return checkin_settings(self.config)
 
     @staticmethod
     def _checkin_today(offset_hours: int) -> date:
@@ -1776,9 +1511,7 @@ class ImageTracePlugin(Star):
 
     def _encode_options(self) -> tuple[int, bool]:
         """本地压缩进阶选项：目标体积上限（字节，0 表示不限制）与 WebP 输出。"""
-        raw = self._napcat_delivery_cfg()
-        target_kb = bounded_int(raw.get("target_kb"), 0, 0, 10240)
-        return target_kb * 1024, truthy(raw.get("webp"))
+        return encode_options(self.config)
 
     @staticmethod
     def _known_bytes(block: dict) -> int:
@@ -2245,7 +1978,7 @@ class ImageTracePlugin(Star):
             hits, candidate_lines = await asyncio.to_thread(
                 self._merged_hash_candidates, feats.phash, max(5, top_n)
             )
-            if hits and self._bool_cfg("ai_verify", False):
+            if hits and self._bool_cfg("ai_verify", DEFAULT_BASIC.ai_verify):
                 hits = await self._ai_verify(local_path, hits)
 
             if hits:
@@ -2595,7 +2328,7 @@ class ImageTracePlugin(Star):
     @filter.command("登记原图", alias={"原图登记"})
     async def register_image(self, event: AstrMessageEvent):
         """将消息或引用中的图片作为原图登记入库（默认仅管理员）"""
-        if self._bool_cfg("register_admin_only", True) and not event.is_admin():
+        if self._bool_cfg("register_admin_only", DEFAULT_BASIC.register_admin_only) and not event.is_admin():
             yield event.plain_result("⛔ 仅管理员可登记原图（可在插件配置中修改）。")
             return
 
@@ -2762,7 +2495,7 @@ class ImageTracePlugin(Star):
         lines.append(f"· 扫描目录：{len(scan_dirs)} 个")
         lines.append(self._remote_hash_line())
         lines.append(await self._weibo_status_line())
-        lines.append(f"· AI 复核：{'开' if self._bool_cfg('ai_verify', False) else '关'}")
+        lines.append(f"· AI 复核：{'开' if self._bool_cfg('ai_verify', DEFAULT_BASIC.ai_verify) else '关'}")
         yield event.plain_result("\n".join(lines))
 
     def _remote_hash_line(self) -> str:
@@ -4405,8 +4138,8 @@ class ImageTracePlugin(Star):
     # ------------------------------------------------------------------
 
     def _qq_upload_config(self) -> tuple[str, int, int, str, int, str]:
-        """推送通道（QQ 官方）配置归一化，语义见 image_delivery.qq_upload_settings。"""
-        return qq_upload_settings(self._qq_delivery_cfg())
+        """推送通道（QQ 官方）配置归一化，实现见 config.loader.qq_upload_config。"""
+        return qq_upload_config(self.config)
 
     @staticmethod
     def _qq_send_target(event: AstrMessageEvent) -> tuple[str, str] | None:
