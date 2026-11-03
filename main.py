@@ -114,7 +114,6 @@ try:
         choose_qq_upload_channel,
         classify_send_error,
         compression_evidence,
-        deduplicate_vector_hits,
         delivery_target,
         is_napcat_parseable_url,
         is_public_http_url,
@@ -149,9 +148,17 @@ try:
         strip_leading_decoration,
         swap_url_origin,
     )
+    from .search import (
+        AutoSearchEngine,
+        HashSearchEngine,
+        QueryImage,
+        SearchHit,
+        VectorSearchEngine,
+        miss_message,
+    )
     from .storage import StorageRegistry
     from .url_guard import read_limited_bytes
-    from .vector_search import VectorEngine, VectorEngineError
+    from .vector_search import VectorEngine
     from .weibo_posts import (
         WeiboPost,
         load_post_map,
@@ -237,7 +244,6 @@ except ImportError:  # 兼容插件以独立模块方式加载
         choose_qq_upload_channel,
         classify_send_error,
         compression_evidence,
-        deduplicate_vector_hits,
         delivery_target,
         is_napcat_parseable_url,
         is_public_http_url,
@@ -272,9 +278,17 @@ except ImportError:  # 兼容插件以独立模块方式加载
         strip_leading_decoration,
         swap_url_origin,
     )
+    from search import (  # type: ignore[no-redef]
+        AutoSearchEngine,
+        HashSearchEngine,
+        QueryImage,
+        SearchHit,
+        VectorSearchEngine,
+        miss_message,
+    )
     from storage import StorageRegistry  # type: ignore[no-redef]
     from url_guard import read_limited_bytes  # type: ignore[no-redef]
-    from vector_search import VectorEngine, VectorEngineError  # type: ignore[no-redef]
+    from vector_search import VectorEngine  # type: ignore[no-redef]
     from weibo_posts import (  # type: ignore[no-redef]
         WeiboPost,
         load_post_map,
@@ -1638,58 +1652,38 @@ class ImageTracePlugin(Star):
 
     @staticmethod
     def _miss_message(fail_line: str, candidates: list, empty_note: str = "") -> str:
-        """未命中回复的统一拼装：阈值提示 + 可选的“最接近候选”或空库说明。"""
-        if candidates:
-            return "\n".join([fail_line, "最接近的候选："] + candidates)
-        if empty_note:
-            return f"{fail_line}\n{empty_note}"
-        return fail_line
+        """未命中回复的统一拼装（实现已迁到 search.base，保留同名薄委托）。"""
+        return miss_message(fail_line, candidates, empty_note)
+
+    def _hash_engine(self) -> HashSearchEngine:
+        """按当前实例状态构造哈希合并引擎（属性动态读取，兼容测试替换）。"""
+        return HashSearchEngine(
+            self.library,
+            self.remote_hash,
+            threshold=self.hash_threshold,
+            top_n=self.top_n,
+            remote_enabled=self.remote_hash_on,
+        )
+
+    def _vector_engine(self) -> VectorSearchEngine:
+        return VectorSearchEngine(self.vector, top_n=self.top_n)
+
+    def _auto_engine(self) -> AutoSearchEngine:
+        return AutoSearchEngine(
+            self._vector_engine(),
+            self._hash_engine(),
+            hash_pool_size=self._hash_pool_size,
+            want=max(5, self.top_n),
+        )
 
     def _merged_hash_candidates(self, phash: str, want: int) -> tuple:
-        """把本地图库与图床镜像两条腿的候选**按相似度合并**后返回。
-
-        为什么要合并而不是「本地先查、没中再查图床」：两条腿各有偏科。本地图库
-        是扫描来的、可能只有几百张，但能拿到本地路径参与后续压缩/回传；图床镜像
-        有两万多张、覆盖面大，却只有直链。若按顺序短路，会出现「本地有一条 0.86
-        的低质命中、图床有一条 0.99 的完美命中，却只报前者」——用户看到的是
-        「溯源命中了」但拿到的不是最像的那张。
-
-        返回 (hits, cand_lines)：hits 是达阈值且已按相似度降序的候选（本地优先
-        同分），cand_lines 是未命中时展示的「最接近候选」文本行。
-
-        两条腿各自独立 try：图床那条是纯本地矩阵运算、本地那条要碰 SQLite，
-        任一腿出错都不该让整条检索失败。
-        """
-        merged: list = []
-        try:
-            for m in self.library.search(phash, want):
-                merged.append((float(m.similarity), "local", m))
-        except Exception as exc:
-            logger.warning(f"本地图库哈希检索失败（继续用图床索引）: {exc}")
-        if self.remote_hash_on() and not self.remote_hash.is_empty:
-            try:
-                for m in self.remote_hash.search(phash, want):
-                    merged.append((float(m.similarity), "remote", m))
-            except Exception as exc:
-                logger.warning(f"图床哈希索引检索失败（继续用本地图库）: {exc}")
-        # 相似度降序；同分时本地靠前（本地能给出路径，回传链路更短）
-        merged.sort(key=lambda item: (-item[0], 0 if item[1] == "local" else 1))
-        hits = [m for sim, _src, m in merged if sim >= self.hash_threshold]
-        cand_lines = []
-        if self.top_n > 0:
-            for sim, _src, m in merged[: self.top_n]:
-                note = self._candidate_note(m)
-                cand_lines.append(
-                    f"· #{m.id} 相似度 {sim * 100:.1f}%{f'（{note}）' if note else ''}"
-                )
-        return hits, cand_lines
+        """两条腿合并检索（实现已迁到 search.hash_engine，签名与返回不变）。"""
+        result = self._hash_engine().merged_candidates(phash, want)
+        return result.hits, result.candidate_lines
 
     def _candidate_note(self, match) -> str:
-        """候选行的括注：本地腿用 note，图床腿用文件名（note 恒为空）。"""
-        note = (getattr(match, "note", "") or "").strip()
-        if note:
-            return note
-        return (getattr(match, "file_name", "") or "").strip()
+        """候选行括注（实现已迁到 search.hash_engine，保留同名薄委托）。"""
+        return HashSearchEngine.candidate_note(match)
 
     async def _trace_hash(
         self, event: AstrMessageEvent, seg, resolved: ResolvedImage | None = None
@@ -1699,7 +1693,6 @@ class ImageTracePlugin(Star):
         resolved 为 ResolvedImage（可能已带 features/MIME）；传了它表示调用方
         已解析过这张图，本方法不负责删除临时文件（由调用方统一清理）。
         """
-        threshold = self.hash_threshold
         top_n = self.top_n
         owns_temp = resolved is None
         if resolved is None:
@@ -1721,26 +1714,35 @@ class ImageTracePlugin(Star):
             hits, candidate_lines = await asyncio.to_thread(
                 self._merged_hash_candidates, feats.phash, max(5, top_n)
             )
-            if hits and self._bool_cfg("ai_verify", DEFAULT_BASIC.ai_verify):
-                hits = await self._ai_verify(local_path, hits)
-
-            if hits:
-                async for result in self._hash_hit_result(event, hits[0]):
-                    yield result
-                return
-
-            yield event.plain_result(
-                self._miss_message(
-                    f"❌ 图库中未找到相似度达标的原图（阈值 {threshold * 100:.0f}%）。",
-                    candidate_lines,
-                )
-            )
+            async for result in self._hash_outcome_delivery(
+                event, local_path, hits, candidate_lines
+            ):
+                yield result
         except Exception as e:
             logger.error(f"图片溯源处理失败: {e}", exc_info=True)
             yield event.plain_result("⚠️ 处理图片时出错，详情请查看机器人日志。")
         finally:
             if owns_temp and resolved is not None and resolved.is_tmp:
                 self._remove_quiet(resolved.path)
+
+    async def _hash_outcome_delivery(
+        self, event: AstrMessageEvent, query_path: str, hits: list, candidate_lines: list
+    ) -> AsyncGenerator:
+        """哈希候选的统一渲染：AI 复核（仅哈希腿）→ 命中回传或未命中提示。"""
+        if hits and self._bool_cfg("ai_verify", DEFAULT_BASIC.ai_verify):
+            hits = await self._ai_verify(query_path, hits)
+
+        if hits:
+            async for result in self._hash_hit_result(event, hits[0]):
+                yield result
+            return
+
+        yield event.plain_result(
+            self._miss_message(
+                f"❌ 图库中未找到相似度达标的原图（阈值 {self.hash_threshold * 100:.0f}%）。",
+                candidate_lines,
+            )
+        )
 
     async def _hash_hit_result(self, event: AstrMessageEvent, best) -> AsyncGenerator:
         """把一条哈希命中渲染成回复（本地腿与图床腿共用）。
@@ -1796,47 +1798,20 @@ class ImageTracePlugin(Star):
         重复下载/解码，且临时文件由调用方统一清理；其中的 MIME 会直接交给
         embed_file，省掉为同一张图再取一次格式的解码。
         """
-        top_n = self.top_n
         owns_temp = resolved is None
         if resolved is None:
             resolved = await self._resolve_local(seg, probe=self._probe_mime)
         try:
             if not resolved.path:
                 return "nofile", event.plain_result(resolved.message)
-            local_path = resolved.path
-            vector = await self.vector.embed_file(local_path, mime=resolved.mime or None)
-            hits = await self.vector.search(
-                vector, limit=self.vector.top_k, with_vector=True
+            outcome = await self._vector_engine().search_outcome(
+                QueryImage(path=resolved.path, mime=resolved.mime)
             )
-            # 取回的全部达标命中（不止最高分那张），按相似度降序输出；
-            # 数量上限即 top_k，需要更多就调大该配置
-            good = sorted(
-                (h for h in hits if h["score"] >= self.vector.threshold),
-                key=lambda h: h["score"],
-                reverse=True,
-            )
-            if good:
-                good = deduplicate_vector_hits(good, self.vector.duplicate_threshold)
-                return "hit", self._vector_hits_delivery(event, good)
-            candidate_lines = [
-                f"· {h['payload'].get('file_name') or str(h['id']).rsplit('/', 1)[-1]}"
-                f" 相似度 {h['score'] * 100:.1f}%"
-                for h in hits[:top_n]
-            ]
-            return "miss", event.plain_result(
-                self._miss_message(
-                    f"❌ 向量库中未找到相似度达标的原图"
-                    f"（阈值 {self.vector.threshold * 100:.0f}%）。",
-                    candidate_lines,
-                    empty_note="（向量库中暂无图床图片，等待图床上传侧钩子入库）",
-                )
-            )
-        except VectorEngineError as e:
-            logger.warning(f"向量检索出错: {getattr(e, 'detail', e)}")
-            return "error", str(e)
-        except Exception:
-            logger.error("向量检索异常", exc_info=True)
-            return "error", "内部错误（详见机器人日志）"
+            if outcome.kind == "hit":
+                return "hit", self._vector_hits_delivery(event, outcome.hits)
+            if outcome.kind == "miss":
+                return "miss", event.plain_result(outcome.miss_text)
+            return "error", outcome.error
         finally:
             if owns_temp and resolved.is_tmp:
                 self._remove_quiet(resolved.path)
@@ -1867,32 +1842,44 @@ class ImageTracePlugin(Star):
             yield event.plain_result(resolved.message)
             return
         try:
-            kind, item = await self._vector_search_one(event, seg, resolved=resolved)
-            if kind == "hit":
-                async for result in item:
+            feats = resolved.features
+            if feats is None:
+                feats = await asyncio.to_thread(
+                    compute_features, resolved.path, self.hash_size
+                )
+            outcome = await self._auto_engine().search_outcome(
+                QueryImage(path=resolved.path, mime=resolved.mime, phash=feats.phash)
+            )
+            vector = outcome.vector
+            if vector.kind == "hit":
+                async for result in self._vector_hits_delivery(event, vector.hits):
                     yield result
                 return
-            if kind == "nofile":
-                yield item
+            if vector.kind == "nofile":
+                yield event.plain_result(resolved.message)
                 return
-            hash_empty = self._hash_pool_size() == 0
-            if kind == "miss":
-                yield item
-                if hash_empty:
+            if vector.kind == "miss":
+                yield event.plain_result(vector.miss_text)
+                if outcome.hash is None:
                     yield event.plain_result("（哈希图库为空，无兜底可执行）")
                     return
                 yield event.plain_result("尝试哈希比对：")
             else:  # error
-                logger.info(f"auto 引擎回退哈希：{item}")
-                if hash_empty:
+                logger.info(f"auto 引擎回退哈希：{vector.error}")
+                if outcome.hash is None:
                     yield event.plain_result(
                         "⚠️ 向量引擎不可用，且哈希图库为空，无兜底可执行。"
                         "可发送 /登记原图 或执行 /溯源重扫 建库。"
                     )
                     return
                 yield event.plain_result("⚠️ 向量引擎不可用，改用哈希比对：")
-            async for it in self._trace_hash(event, seg, resolved=resolved):
-                yield it
+            async for item in self._hash_outcome_delivery(
+                event,
+                resolved.path,
+                outcome.hash.hits,
+                outcome.hash.candidate_lines,
+            ):
+                yield item
         finally:
             if resolved.is_tmp:
                 self._remove_quiet(resolved.path)
@@ -1906,6 +1893,11 @@ class ImageTracePlugin(Star):
         _yield_delivery 的统一入口（一条消息含多图），逐图配文由 mark_compressed
         按各回传路径的实际压缩情形写入，因此不再重复命中提示标题。
         """
+        # SearchHit 保留原始 Qdrant dict 于 raw；这里复原成旧结构，投递语义不变。
+        hits = [
+            hit.raw if isinstance(hit, SearchHit) and isinstance(hit.raw, dict) else hit
+            for hit in hits
+        ]
         total_hits = sum(int(hit.get("duplicate_count") or 1) for hit in hits)
         duplicate_count = total_hits - len(hits)
         multi = len(hits) > 1
