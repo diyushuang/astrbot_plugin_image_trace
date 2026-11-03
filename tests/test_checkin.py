@@ -600,6 +600,19 @@ async def test_checkin_settings_defaults_for_text_switches(make_plugin):
     assert off["show_sender"] is False
 
 
+async def test_checkin_line_drops_emoji_only_name(make_plugin):
+    """昵称全是 emoji 时，页脚不能剩一个孤零零的「·」。"""
+    from types import SimpleNamespace
+
+    plugin = make_plugin()
+    outcome = SimpleNamespace(streak=3, total=10)
+
+    assert plugin._checkin_line("小双", outcome) == "小双 · 连续签到 3 天 · 累计 10 天"
+    assert plugin._checkin_line("小双🍂", outcome) == "小双 · 连续签到 3 天 · 累计 10 天"
+    assert plugin._checkin_line("🍂🍂", outcome) == "连续签到 3 天 · 累计 10 天"
+    assert plugin._checkin_line("", outcome) == "连续签到 3 天 · 累计 10 天"
+
+
 async def test_checkin_import_writes_file(make_plugin, make_event, data_dir, tmp_path):
     """管理员导入 CSV 后文件落到 weibo/，回复包含条数。"""
     import astrbot.api.message_components as Comp

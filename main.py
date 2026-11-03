@@ -43,7 +43,7 @@ from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 try:
-    from .checkin_card import DEFAULT_QUOTES, QuoteLibrary, compose_poster
+    from .checkin_card import DEFAULT_QUOTES, QuoteLibrary, compose_poster, strip_emoji
     from .checkin_store import CheckinStore
     from .common import (
         AI_VERIFY_MAX_CANDIDATES,
@@ -138,7 +138,12 @@ try:
         parse_weibo_text,
     )
 except ImportError:  # 兼容插件以独立模块方式加载
-    from checkin_card import DEFAULT_QUOTES, QuoteLibrary, compose_poster  # type: ignore[no-redef]
+    from checkin_card import (  # type: ignore[no-redef]
+        DEFAULT_QUOTES,
+        QuoteLibrary,
+        compose_poster,
+        strip_emoji,
+    )
     from checkin_store import CheckinStore  # type: ignore[no-redef]
     from common import (  # type: ignore[no-redef]
         AI_VERIFY_MAX_CANDIDATES,
@@ -1362,9 +1367,16 @@ class ImageTracePlugin(Star):
         return name
 
     def _checkin_line(self, name: str, outcome) -> str:
-        """签到信息行：带昵称时「小双 · 连续签到 3 天 · 累计 10 天」。"""
+        """签到信息行：带昵称时「小双 · 连续签到 3 天 · 累计 10 天」。
+
+        卡片页脚专用，所以昵称先过一遍 ``strip_emoji``：``compose_poster`` 本来
+        也会剔除，但那是**整段页脚**统一处理——昵称全是 emoji 时（「🍂🍂」）
+        拼好的 ``· 连续签到 3 天`` 会剩下一个孤零零的分隔符。这里先判定「昵称
+        剥完还有没有可见字」，没有就整段省略；消息文字里的昵称不受影响。
+        """
         detail = f"连续签到 {outcome.streak} 天 · 累计 {outcome.total} 天"
-        return f"{name} · {detail}" if name else detail
+        visible = strip_emoji(name).strip(" ·…")
+        return f"{visible} · {detail}" if visible else detail
 
     def _quote_library(self) -> QuoteLibrary:
         """惰性构造语句库；文本框留空时读取 quotes.txt，缺失则用内置语句初始化。"""
