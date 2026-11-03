@@ -32,7 +32,6 @@ import secrets
 import shutil
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, unquote, urlencode, urlparse
 
@@ -42,11 +41,13 @@ try:
     from .common import USER_AGENT, as_int, read_bytes, truthy
     from .http_client import GuardedHttpClient
     from .s3_store import S3CompatClient
+    from .storage.protocol import StoreResult
     from .url_guard import read_limited_text
 except ImportError:  # 兼容插件以独立模块方式加载
     from common import USER_AGENT, as_int, read_bytes, truthy  # type: ignore[no-redef]
     from http_client import GuardedHttpClient  # type: ignore[no-redef]
     from s3_store import S3CompatClient  # type: ignore[no-redef]
+    from storage.protocol import StoreResult  # type: ignore[no-redef]
     from url_guard import read_limited_text  # type: ignore[no-redef]
 
 try:
@@ -63,12 +64,7 @@ MODE_OCI = "oracle_oci"
 MODE_CFB = "cloudflare_imgbed"
 
 
-@dataclass
-class StoreResult:
-    ok: bool
-    url: str | None = None  # 图床直链（若有）
-    file_path: str | None = None  # 本地文件路径（若有）
-    message: str = ""
+# 存储结果类型已迁到 storage/protocol.py，这里沿用导入名以保持向后兼容。
 
 
 def extract_json_path(data: Any, path: str) -> Any:
