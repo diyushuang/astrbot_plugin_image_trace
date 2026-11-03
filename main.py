@@ -1322,6 +1322,12 @@ class ImageTracePlugin(Star):
             # 签到自己的取图口径，与 random_media.send_thumbnail 独立：那边管
             # /随机图、/随机视频 发哪张，这边只管 /签到 发哪张/拿哪张合成。
             "image_mode": "original" if image_mode == "original" else "thumbnail",
+            # 签到文字两个开关，互相独立：
+            # show_quote=卡片/消息里要不要那句随机语句（微博模式下是文案），
+            #   关掉就是「只有美图 + 签到信息」；
+            # show_sender=签到文字里要不要带上签到者昵称。
+            "show_quote": bool_or(raw.get("show_quote"), True),
+            "show_sender": bool_or(raw.get("show_sender"), True),
             "border_px": max(0, min(200, as_int(raw.get("border_px"), 0))),
             "utc_offset_hours": max(-12, min(14, as_int(raw.get("utc_offset_hours"), 8))),
             "quote_source": source if source in {"api", "mixed"} else "builtin",
@@ -1337,6 +1343,28 @@ class ImageTracePlugin(Star):
     def _checkin_today(offset_hours: int) -> date:
         """按配置的 UTC 偏移算出「今天」，与服务器本地时区无关。"""
         return datetime.now(timezone(timedelta(hours=offset_hours))).date()
+
+    @staticmethod
+    def _checkin_sender_name(event: AstrMessageEvent, limit: int = 16) -> str:
+        """签到者昵称：取不到就返回空串，任何异常都不该打断签到。
+
+        昵称由协议端（QQ / OneBot）给出，长度与内容都不可控：这里只做空白
+        折叠与限长，emoji 留给 ``compose_poster`` 在绘制前剔除——聊天消息里
+        的昵称可以带 emoji，卡片上不行（中文字体没有彩色 emoji 字形）。
+        """
+        try:
+            raw = str(event.get_sender_name() or "")
+        except Exception:
+            return ""
+        name = " ".join(raw.split())
+        if len(name) > limit:
+            name = name[:limit].rstrip() + "…"
+        return name
+
+    def _checkin_line(self, name: str, outcome) -> str:
+        """签到信息行：带昵称时「小双 · 连续签到 3 天 · 累计 10 天」。"""
+        detail = f"连续签到 {outcome.streak} 天 · 累计 {outcome.total} 天"
+        return f"{name} · {detail}" if name else detail
 
     def _quote_library(self) -> QuoteLibrary:
         """惰性构造语句库；文本框留空时读取 quotes.txt，缺失则用内置语句初始化。"""
@@ -2991,7 +3019,8 @@ class ImageTracePlugin(Star):
             "· /随机图 [目录] —— 从图床随机取一张图片并回传\n"
             "· /随机视频 [目录] —— 从图床随机取一个视频并回传\n"
             "· /签到 —— 每日签到领取一张带边框的卡片（每天首次计入天数，同日重复只换图不涨天数，可 /打卡）；"
-            "checkin.mode=weibo 时改为“微博文案 + 对应图库图片”，卡片显示博主与发博日期\n"
+            "checkin.mode=weibo 时改为“微博文案 + 对应图库图片”，卡片显示博主与发博日期；"
+            "checkin.show_quote=false 时只发美图 + 签到信息，checkin.show_sender 控制是否带签到者昵称\n"
             "· /签到文案导入 —— 管理员：把微博文案 CSV/MD 作为附件发送，导入插件数据目录\n"
             "· /原图 [文件名] —— 取原图：带文件名时直接到图床按名取（无需先回传），"
             "不带文件名取本会话最近回传的原图\n"
@@ -3772,6 +3801,7 @@ class ImageTracePlugin(Star):
             font_path=settings["font_path"],
             border_px=settings["border_px"],
             quote_max_lines=quote_max_lines,
+            show_quote=bool(settings.get("show_quote", True)),
         )
         if not image_bytes:
             return None
@@ -3913,10 +3943,13 @@ class ImageTracePlugin(Star):
     async def _weibo_status_line(self) -> str:
         settings = self._checkin_settings()
         # 两个维度各自独立，状态行里都报出来，省得用户改完不知道生效在哪一层：
-        # render_mode=合不合成，image_mode=用缩略图还是原图。
+        # render_mode=合不合成，image_mode=用缩略图还是原图。文字/昵称两个
+        # 开关同样常被改错（以为关掉文字会把签到信息也关掉），一并报出。
         shape = (
             f"{'合成卡片' if settings['render_mode'] == 'card' else '图文直发'}"
             f"，取图：{'原图' if settings['image_mode'] == 'original' else '缩略图'}"
+            f"，文字：{'显示' if settings['show_quote'] else '不显示'}"
+            f"，昵称：{'显示' if settings['show_sender'] else '不显示'}"
         )
         if settings["mode"] != "weibo":
             return f"· 签到模式：quote（随机图 + 随机语句；{shape}）"
@@ -4013,7 +4046,11 @@ class ImageTracePlugin(Star):
         ``checkin.image_mode=thumbnail`` 时可当合成源（原图模式要求用原图），
         否则按 ``_checkin_card_source`` 现查——合成用小图，不能拿 send_url 兜底
         （它可能是原图）。
+
+        ``checkin.show_quote`` 关掉时（只要美图 + 签到信息）：卡片不画语句区，
+        轻量模式的正文也只留 header / simple_text，不再拼 💬 那一行。
         """
+        show_quote = bool(settings.get("show_quote", True))
         remember = (
             [{"url": original_url, "file_name": block_name}] if original_url else []
         )
@@ -4025,7 +4062,7 @@ class ImageTracePlugin(Star):
                 )
             path = await self._checkin_card_path(
                 source,
-                quote,
+                quote if show_quote else "",
                 footer,
                 settings,
                 quote_max_lines=quote_max_lines,
@@ -4046,7 +4083,9 @@ class ImageTracePlugin(Star):
                     self._remove_quiet(path)
                 return
             logger.warning("签到卡片合成失败，改用轻量模式")
-        text = simple_text or f"{header}\n💬 {quote}"
+        text = simple_text or header
+        if show_quote and quote:
+            text = f"{text}\n💬 {quote}"
         async for result in self._yield_delivery(
             event,
             text,
@@ -4081,13 +4120,18 @@ class ImageTracePlugin(Star):
             logger.error(f"签到记录写入失败: {exc}")
             yield event.plain_result("签到记录写入失败，请稍后再试。")
             return
+        # 昵称（checkin.show_sender）同时进消息文字与卡片页脚；取不到就整行省略。
+        name = self._checkin_sender_name(event) if settings["show_sender"] else ""
+        who = f"{name} " if name else ""
         if outcome.already:
             header = (
-                f"📅 今日已签到 · 连续 {outcome.streak} 天（累计 {outcome.total} 天）"
+                f"📅 {who}今日已签到 · 连续 {outcome.streak} 天"
+                f"（累计 {outcome.total} 天）"
             )
         else:
             header = (
-                f"✅ 签到成功 · 连续 {outcome.streak} 天（累计 {outcome.total} 天）"
+                f"✅ {who}签到成功 · 连续 {outcome.streak} 天"
+                f"（累计 {outcome.total} 天）"
             )
 
         random_settings = self._random_settings()
@@ -4104,10 +4148,11 @@ class ImageTracePlugin(Star):
                 candidate = None
             if candidate is not None:
                 post, send_url, original_url, image_name, local_thumb = candidate
-                quote = post.text
+                # show_quote=False 时整段文案都不进卡片/消息，只留「美图 + 签到信息」
+                quote = post.text if settings["show_quote"] else ""
                 footer = (
                     f"{post.account_display} · {post.date_display}\n"
-                    f"连续签到 {outcome.streak} 天 · 累计 {outcome.total} 天"
+                    f"{self._checkin_line(name, outcome)}"
                 )
                 block_name = (
                     clean_display_name(image_name)
@@ -4117,7 +4162,6 @@ class ImageTracePlugin(Star):
                 )
                 simple_text = (
                     f"{header}\n📝 {post.account_display} · {post.date_display}"
-                    f"\n💬 {quote}"
                 )
                 async for result in self._deliver_checkin(
                     event,
@@ -4157,13 +4201,17 @@ class ImageTracePlugin(Star):
                 )
             return
 
-        try:
-            quote = await self._quote_library().pick()
-        except Exception as exc:
-            # 语句文件损坏/非 UTF-8/接口构造失败都不该让签到整体失败
-            logger.warning(f"签到语句获取失败，使用内置语句: {exc}")
-            quote = random.choice(DEFAULT_QUOTES)
-        footer = f"连续签到 {outcome.streak} 天 · 累计 {outcome.total} 天"
+        if settings["show_quote"]:
+            try:
+                quote = await self._quote_library().pick()
+            except Exception as exc:
+                # 语句文件损坏/非 UTF-8/接口构造失败都不该让签到整体失败
+                logger.warning(f"签到语句获取失败，使用内置语句: {exc}")
+                quote = random.choice(DEFAULT_QUOTES)
+        else:
+            # 关掉文字时不取句：省掉一次在线接口请求，卡片也没有文字区可画
+            quote = ""
+        footer = self._checkin_line(name, outcome)
         block_name = original_name or clean_display_name(original_url) or "今日签到"
         async for result in self._deliver_checkin(
             event,

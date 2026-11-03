@@ -615,6 +615,19 @@
         "obvious_hint": true,
         "hint": "thumbnail=用图床 720px 缩略图（体积小、发送快，推荐）；original=用原图（画质全尺寸，代价是下载与上传都更慢，QQ 官方机器人还可能撞 5MB 直传上限）。该选项只作用于 /签到，与「随机图」组的 send_thumbnail 完全独立、互不影响。card 模式下两种取值都会合成卡片（原图会先降采样到最长边 1440px）。"
       },
+      "show_quote": {
+        "description": "【选填】显示签到文字",
+        "type": "bool",
+        "default": true,
+        "obvious_hint": true,
+        "hint": "true=卡片/消息里带那句文字（quote 模式是随机语句，weibo 模式是微博文案）；false=只发美图和签到信息（连续/累计天数），卡片连文字区一起省掉，也不会再去请求语句接口。"
+      },
+      "show_sender": {
+        "description": "【选填】显示签到者昵称",
+        "type": "bool",
+        "default": true,
+        "hint": "true=在签到文字里带上发送者昵称（消息首行「✅ 昵称 签到成功…」+ 卡片页脚「昵称 · 连续签到 3 天 · 累计 10 天」）；false=只显示天数。昵称超长会截断到 16 字，卡片上不渲染 emoji。"
+      },
       "border_px": {
         "description": "【选填】卡片边框宽度（像素）",
         "type": "int",

@@ -5,7 +5,7 @@
 
 **群聊里随手转发的一张图，一键找回它的原图。**
 
-[![version](https://img.shields.io/badge/version-1.7.20-blue?style=flat-square)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.7.21-blue?style=flat-square)](./CHANGELOG.md)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4?style=flat-square)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat-square)](./LICENSE)
@@ -46,7 +46,7 @@ _An AstrBot plugin that traces a reposted, compressed or cropped image back to i
 | 🧩 **一次一条** | 向量命中的多张相似图合并为**一条**消息，配文集中在开头（带 `1.`/`2.` 序号）、图片连续排在末尾，避免 QQ 把图片裁成正方形缩略图 |
 | 🗂️ **多种存储** | 图床副本 / 通用 HTTP 图床（Lsky Pro、EasyImages、Chevereto…）/ CloudFlare-ImgBed / Cloudflare R2 / 甲骨文 OCI |
 | 🎲 **随机图** | `/随机图`、`/随机视频` 从图床随机接口取图回传，并可被 LLM 工具 `sendRandomMedia` 调用 |
-| 📅 **每日签到** | `/签到` 每天首次计入连续/累计天数；同日重复签到天数不变，但仍会回传一张新的随机卡片/图片。两个维度各自独立：**合不合成**（`card` 卡片 / `simple` 图文直发）与**用哪张图**（`thumbnail` 缩略图 / `original` 原图，与 `/随机图` 的 `send_thumbnail` 互不影响）；`checkin.mode=weibo` 时改为「微博文案 + 图库对应图」，卡片显示博主与发博日期、不显示链接 |
+| 📅 **每日签到** | `/签到` 每天首次计入连续/累计天数；同日重复签到天数不变，但仍会回传一张新的随机卡片/图片。三个维度各自独立：**合不合成**（`card` 卡片 / `simple` 图文直发）、**用哪张图**（`thumbnail` 缩略图 / `original` 原图，与 `/随机图` 的 `send_thumbnail` 互不影响）、**写不写文字**（`checkin.show_quote` 关掉后只发美图 + 签到信息；`checkin.show_sender` 控制是否带签到者昵称）；`checkin.mode=weibo` 时改为「微博文案 + 图库对应图」，卡片显示博主与发博日期、不显示链接 |
 | 🖼️ **`/原图` 直取** | 从会话历史找回原图，或按文件名直接到图床取；默认原图 URL 直传、不下载不本地中转。QQ 官方机器人拿不到公网直链时按上传通道降级（固定 `bytes` 或本地转码图会先落盘） |
 | 🧹 **名字自动净化** | 配文前缀（`🖼️`/`🎬`/序号）与图床改名痕迹（毫秒时间戳、`@`→`_`）在展示与直查前统一剥净，复制配文当文件名也能取到图 |
 | 🛡️ **安全加固** | 插件自身发起的全部出网（下载兜底、图床 / 对象存储 / Qdrant / 随机图 / 语句接口）经 SSRF 防护（逐跳校验 + IP 钉扎 + 响应限长）；密钥字段在配置面板标记为 secret。平台适配器自身的上传/拉流请求由其负责，不经过本插件的 `url_guard` |
@@ -110,7 +110,7 @@ flowchart LR
 | `/原图修复` | - | 清理会话历史里带配文前缀（`🖼️` / `🎬` / 序号）的旧记录，修复后 `/原图` 才能命中 | 所有人 |
 | `/随机图 [目录]` | `/随机图片` | 从图床随机图接口取一张随机图片并回传 | 所有人 |
 | `/随机视频 [目录]` | - | 从图床随机图接口取一段随机视频并回传 | 所有人 |
-| `/签到` | `/打卡` | 每日签到：首次计入天数；同日重复签到天数不变，但仍回传新的卡片/图片。呈现方式（合成卡片 / 图文直发）与取图方式（缩略图 / 原图）各自独立配置，且不影响 `/随机图`；`checkin.mode=weibo` 时回传「微博文案 + 图库对应图」 | 所有人 |
+| `/签到` | `/打卡` | 每日签到：首次计入天数；同日重复签到天数不变，但仍回传新的卡片/图片。呈现方式（合成卡片 / 图文直发）、取图方式（缩略图 / 原图）、是否写文字与是否带昵称各自独立配置，且不影响 `/随机图`；`checkin.mode=weibo` 时回传「微博文案 + 图库对应图」 | 所有人 |
 | `/签到文案导入` | `/签到文案上传` | 管理员：把微博文案 CSV/MD 作为附件发送，导入插件数据目录；映射表由 `scripts/build_weibo_map.py` 生成 | 管理员 |
 | `/溯源状态` | - | 查看图库统计与配置摘要 | 所有人 |
 | `/溯源重扫 [force]` | - | 扫描 `scan_dirs` 目录建立/更新索引；`force` 重建全部 | 管理员 |
@@ -194,6 +194,8 @@ flowchart LR
 | `checkin.mode` | `quote` | `quote`=随机图 + 随机语句（现有行为）/ `weibo`=随机取一条微博文案及其图库对应图片；卡片显示博主与发博日期、不显示链接 |
 | `checkin.render_mode` | `card` | **合不合成**：`card`=本地合成「边框 + 语句」卡片（单条图文）/ `simple`=不合成，图片 + 文字语句直接发（图片仍按推送通道交付，`auto` 下 OneBot 可能本地下载压缩） |
 | `checkin.image_mode` | `thumbnail` | **用哪张图**（只作用于 `/签到`，与 `random_media.send_thumbnail` 互不影响）：`thumbnail`=图床 720px 缩略图（快）/ `original`=原图（全尺寸，下载与上传都更慢）；两种取值在 `card` 模式下都会合成卡片（原图先降采样到最长边 1440px） |
+| `checkin.show_quote` | `true` | **写不写文字**：`true`=卡片/消息里带那句文字（`quote` 模式随机语句 / `weibo` 模式微博文案）；`false`=只发**美图 + 签到信息**（连续/累计天数），卡片连文字区一起省掉，也不再请求语句接口 |
+| `checkin.show_sender` | `true` | **带不带昵称**：`true`=消息首行「✅ 昵称 签到成功…」+ 卡片页脚「昵称 · 连续签到 3 天 · 累计 10 天」；`false`=只显示天数。昵称按 16 字截断，卡片上不渲染 emoji |
 | `checkin.border_px` | `0` | 卡片边框宽度；`0`=按图片宽度自动（约 4.5%，最小 12px） |
 | `checkin.utc_offset_hours` | `8` | 签到日期按该 UTC 偏移计算（默认北京时间，每天 0 点刷新） |
 | `checkin.quote_source` | `builtin` | `builtin`=只用本地 `quotes.txt` / `api`=优先在线语句接口，失败回退本地 / `mixed`=每次随机本地或在线，在线失败回退本地 |
@@ -533,6 +535,7 @@ QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条
 - **emoji 不会出现在卡片上**：中文字体没有彩色 emoji 字形，画上去就是豆腐块。卡片渲染前会自动剔除 emoji（聊天消息里的原文保留），`★ ♪` 这类字体有字形的符号不受影响。
 - 想改语句：在配置面板「本地语句」多行文本框中直接粘贴（每行一句，`#` 开头为注释），保存并重载插件即可；也可以编辑 `data/plugin_data/astrbot_plugin_image_trace/quotes.txt`。文本框非空时优先使用文本框内容，留空才读取文件。
 - 想换在线语句服务：把 `checkin.quote_source` 设为 `api`（在线优先）或 `mixed`（本地/在线随机），`quote_api_url` 填接口地址，`quote_json_path` 按返回填路径——一言 `hitokoto`、今日诗词 `data.content`、纯文本接口留空；需要 Token/Referer 时用 `checkin.quote_api_headers`。接口失败会自动回退本地语句库，不影响签到。
+- **只想发美图、不要那句字**：把 `checkin.show_quote` 设为 `false`。卡片会连文字区一起省掉，只剩「图片 + 签到天数」（`simple` 模式下也只发图片和签到信息），并且不再请求语句接口。想让签到文字带上谁签到的，`checkin.show_sender`（默认开）会在消息首行与卡片页脚拼上发送者昵称，如「小双 · 连续签到 3 天 · 累计 10 天」；昵称超过 16 字会截断，emoji 不上卡片。
 
 </details>
 

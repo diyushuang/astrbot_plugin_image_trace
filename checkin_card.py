@@ -488,6 +488,7 @@ def compose_poster(
     font_path: str = "",
     border_px: int = 0,
     quote_max_lines: int = 3,
+    show_quote: bool = True,
 ) -> bytes | None:
     """把缩略图合成「白边 + 下方留白写句」的卡片 JPEG；失败返回 None。
 
@@ -499,6 +500,9 @@ def compose_poster(
     签到天数；每行独立折行，避免长文本溢出画布。
     quote_max_lines 供微博文案使用：正文比随机短句长，可放宽到 5 行；正文里的
     硬换行按原样保留，emoji 会被剔除（中文字体渲染成豆腐块，见 ``strip_emoji``）。
+    show_quote=False 时整块文字区都不画（``checkin.show_quote`` 关掉的场景）：
+    卡片只剩「美图 + 页脚签到信息」，底部留白仅一个 border，不会留下一条
+    本该写字的空白带。
     """
     resolved_font = resolve_font_path(font_path)
     if resolved_font is None:
@@ -548,9 +552,11 @@ def compose_poster(
 
         text_width = max(120, width - border * 2)
         max_quote_lines = max(1, min(8, int(quote_max_lines or 3)))
-        lines = wrap_text(strip_emoji(quote), font, text_width, max_lines=max_quote_lines)
-        if not lines:
-            lines = ["今天的每一步，都算数。"]
+        lines: list[str] = []
+        if show_quote:
+            lines = wrap_text(strip_emoji(quote), font, text_width, max_lines=max_quote_lines)
+            if not lines:
+                lines = ["今天的每一步，都算数。"]
         footer_raw = [
             line.strip() for line in strip_emoji(footer).splitlines() if line.strip()
         ]
@@ -564,11 +570,13 @@ def compose_poster(
         line_height = font_size + round(font_size * 0.45)
         footer_line_height = footer_size + round(footer_size * 0.35)
         gap_quote_footer = max(8, round(font_size * 0.5))
+        quote_block_height = (
+            line_height * len(lines) + gap_quote_footer if lines else 0
+        )
         canvas_height = (
             height
             + border * 3
-            + line_height * len(lines)
-            + gap_quote_footer
+            + quote_block_height
             + footer_line_height * len(footer_lines)
         )
         canvas = Image.new("RGB", (width + border * 2, canvas_height), _BG_COLOR)
@@ -589,7 +597,8 @@ def compose_poster(
                 font=font,
             )
             top += line_height
-        top += gap_quote_footer
+        if lines:
+            top += gap_quote_footer
         for line in footer_lines:
             footer_width = drawer.textlength(line, font=footer_font)
             drawer.text(

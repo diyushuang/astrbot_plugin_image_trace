@@ -469,6 +469,137 @@ async def test_checkin_weibo_mode_falls_back_when_no_image(
     assert "FALLBACK" in text
 
 
+def test_compose_poster_without_quote_skips_text_area():
+    """show_quote=False 的卡片只剩「美图 + 页脚」，不能留一条空白文字带。"""
+    if resolve_font_path("") is None:
+        pytest.skip("当前环境没有可用的中文字体")
+
+    buffer = io.BytesIO()
+    PILImage.effect_noise((320, 240), 40).convert("RGB").save(buffer, "JPEG")
+    data = buffer.getvalue()
+    footer = "连续签到 3 天 · 累计 5 天"
+
+    with_quote = compose_poster(data, quote="今天的每一步，都算数。", footer=footer)
+    without = compose_poster(data, quote="", footer=footer, show_quote=False)
+
+    assert with_quote and without
+    with PILImage.open(io.BytesIO(with_quote)) as full:
+        full_size = full.size
+    with PILImage.open(io.BytesIO(without)) as bare:
+        assert bare.width == full_size[0], "关掉文字只该减高度，不该改宽度"
+        assert bare.height < full_size[1], "关掉文字后画布应更矮（文字区整块省掉）"
+
+
+async def test_checkin_flow_hides_quote_and_shows_sender(
+    make_plugin, make_event, monkeypatch
+):
+    """show_quote=False：只发美图 + 签到信息，且不再去取语句（省一次接口请求）。"""
+    plugin = make_plugin(checkin={"render_mode": "simple", "show_quote": False})
+    event = make_event("/签到", platform="telegram", sender_id="u1")
+
+    async def fake_candidate(_directory, _settings, *, thumbnail=None):
+        return (
+            "https://img.example.com/file/thumb.jpg",
+            "https://img.example.com/file/orig.jpg",
+            "orig.jpg",
+        )
+
+    monkeypatch.setattr(plugin, "_random_image_candidate", fake_candidate)
+
+    def should_not_pick():
+        pytest.fail("show_quote=False 时不应再取语句")
+
+    monkeypatch.setattr(plugin, "_quote_library", should_not_pick)
+
+    jpeg = io.BytesIO()
+    PILImage.effect_noise((64, 64), 32).convert("RGB").save(jpeg, "JPEG")
+
+    async def fake_prepare(_blocks, *, compress):
+        assert compress is True
+        return [(jpeg.getvalue(), True)]
+
+    monkeypatch.setattr(plugin, "_prepare_delivery_blocks", fake_prepare)
+
+    results = []
+    async for result in plugin.checkin(event):
+        results.append(result)
+
+    text = "".join(getattr(segment, "text", "") for segment in results[0].chain)
+    assert "签到成功" in text
+    assert "测试用户" in text, "show_sender 默认开启，文字里要带昵称"
+    assert "连续 1 天" in text
+    assert "💬" not in text, "关掉文字后不能再拼语句那一行"
+
+
+async def test_checkin_flow_hides_sender_name(make_plugin, make_event, monkeypatch):
+    """show_sender=False：文字里只剩天数，不带昵称。"""
+    import astrbot_plugin_image_trace.main as main_module
+
+    plugin = make_plugin(checkin={"render_mode": "simple", "show_sender": False})
+    event = make_event("/签到", platform="telegram", sender_id="u1")
+
+    async def fake_candidate(_directory, _settings, *, thumbnail=None):
+        return (
+            "https://img.example.com/file/thumb.jpg",
+            "https://img.example.com/file/orig.jpg",
+            "orig.jpg",
+        )
+
+    monkeypatch.setattr(plugin, "_random_image_candidate", fake_candidate)
+
+    def broken_library():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(plugin, "_quote_library", broken_library)
+    monkeypatch.setattr(main_module.random, "choice", lambda _seq: "FALLBACK")
+
+    jpeg = io.BytesIO()
+    PILImage.effect_noise((64, 64), 32).convert("RGB").save(jpeg, "JPEG")
+
+    async def fake_prepare(_blocks, *, compress):
+        assert compress is True
+        return [(jpeg.getvalue(), True)]
+
+    monkeypatch.setattr(plugin, "_prepare_delivery_blocks", fake_prepare)
+
+    results = []
+    async for result in plugin.checkin(event):
+        results.append(result)
+
+    text = "".join(getattr(segment, "text", "") for segment in results[0].chain)
+    assert "签到成功" in text
+    assert "FALLBACK" in text
+    assert "测试用户" not in text, "关掉昵称后不该出现发送者名字"
+
+
+async def test_checkin_sender_name_normalizes_and_truncates(make_plugin, make_event):
+    """昵称来自协议端：空白折叠 + 超长截断，缺方法时退回空串。"""
+    plugin = make_plugin()
+    event = make_event("/签到", sender_id="u1")
+    event.get_sender_name = lambda: "  小  双\n二号  "
+    assert plugin._checkin_sender_name(event) == "小 双 二号"
+
+    event.get_sender_name = lambda: "长" * 40
+    trimmed = plugin._checkin_sender_name(event)
+    assert len(trimmed) == 17 and trimmed.endswith("…")
+
+    def boom():
+        raise RuntimeError("no name")
+
+    event.get_sender_name = boom
+    assert plugin._checkin_sender_name(event) == ""
+
+
+async def test_checkin_settings_defaults_for_text_switches(make_plugin):
+    """两个新开关默认都为真（升级即保持原行为 + 带昵称）。"""
+    settings = make_plugin()._checkin_settings()
+    assert settings["show_quote"] is True
+    assert settings["show_sender"] is True
+    off = make_plugin(checkin={"show_quote": False, "show_sender": "false"})._checkin_settings()
+    assert off["show_quote"] is False
+    assert off["show_sender"] is False
+
+
 async def test_checkin_import_writes_file(make_plugin, make_event, data_dir, tmp_path):
     """管理员导入 CSV 后文件落到 weibo/，回复包含条数。"""
     import astrbot.api.message_components as Comp
