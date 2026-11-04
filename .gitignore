@@ -18,3 +18,5 @@ data/
 .DS_Store
 Thumbs.db
 dist/
+coverage.json
+.coverage
