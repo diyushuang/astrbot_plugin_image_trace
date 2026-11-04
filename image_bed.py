@@ -37,18 +37,11 @@ from urllib.parse import quote, unquote, urlencode, urlparse
 
 import aiohttp
 
-try:
-    from .common import USER_AGENT, as_int, read_bytes, truthy
-    from .http_client import GuardedHttpClient
-    from .s3_store import S3CompatClient
-    from .storage.protocol import StoreResult
-    from .url_guard import read_limited_text
-except ImportError:  # 兼容插件以独立模块方式加载
-    from common import USER_AGENT, as_int, read_bytes, truthy  # type: ignore[no-redef]
-    from http_client import GuardedHttpClient  # type: ignore[no-redef]
-    from s3_store import S3CompatClient  # type: ignore[no-redef]
-    from storage.protocol import StoreResult  # type: ignore[no-redef]
-    from url_guard import read_limited_text  # type: ignore[no-redef]
+from .common import USER_AGENT, as_int, read_bytes, truthy
+from .http_client import GuardedHttpClient
+from .s3_store import S3CompatClient
+from .storage.protocol import StoreResult
+from .url_guard import read_limited_text
 
 try:
     from astrbot.api import logger

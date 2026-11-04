@@ -12,6 +12,9 @@
 - 可选使用当前会话的视觉大模型对哈希命中结果做二次复核（ai_verify 开关）。
 """
 
+# E402：下面的合成包引导必须先于包内相对导入执行（仅此一处例外）。
+# ruff: noqa: E402
+
 from __future__ import annotations
 
 import asyncio
@@ -41,283 +44,155 @@ from astrbot.api.star import Context, Star
 # astrbot_version ">=4.0.0" 兼容范围冲突，故保留此导入（AstrBot 官方插件生态通用做法）。
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
-try:
-    from .checkin_card import DEFAULT_QUOTES, QuoteLibrary, compose_poster, strip_emoji
-    from .checkin_store import CheckinStore
-    from .common import (
-        AI_VERIFY_MAX_CANDIDATES,
-        COMPRESS_CONCURRENCY,
-        MEMORY_DOWNLOAD_MAX_BYTES,
-        PLAN_TOTAL_TIMEOUT,
-        PROBE_CONCURRENCY,
-        QQ_URL_COOLDOWN_SECONDS,
-        SCALED_VERIFY_COOLDOWN_SECONDS,
-        TMP_MAX_AGE_SECONDS,
-        as_int,
-        read_bytes,
-        sanitize_error_text,
-    )
-    from .config.loader import (
-        bool_cfg,
-        bucket_config,
-        checkin_settings,
-        delivery_config,
-        dict_group,
-        effective_bed_cfg,
-        encode_options,
-        engine_choice,
-        ensure_group_cfg,
-        first_value,
-        float_cfg,
-        int_cfg,
-        napcat_delivery_cfg,
-        onebot_image_timeout,
-        qq_delivery_cfg,
-        qq_upload_config,
-        random_settings,
-        scalar_cfg,
-        scan_dirs,
-        vector_index_on_register,
-        verify_scaled,
-    )
-    from .config.migrations import (
-        BUCKET_MODES,
-        LAYOUT_VERSION,
-        SCALAR_PATHS,
-        migrate_bucket_config,
-        migrate_config_layout,
-    )
-    from .config.typed import DEFAULT_BASIC, DEFAULT_LIMITS
-    from .controllers import (
-        AdminController,
-        CheckinController,
-        OriginalController,
-        RandomController,
-        RegisterController,
-        TraceController,
-    )
-    from .delivery import (
-        ChainChannel,
-        DeliveryConfig,
-        DeliveryContext,
-        DeliveryProfile,
-        DeliveryRequest,
-        OneBotChannel,
-        QQOfficialChannel,
-        plan_delivery,
-    )
-    from .features import (
-        avif_available,
-        compute_features,
-        compute_features_with_mime,
-        heif_available,
-        image_bytes_ok,
-        image_file_ok,
-        image_mime,
-        phash_hex_len,
-    )
-    from .hash_index import REMOTE_HASH_PAYLOAD_KEYS, HashIndex
-    from .http_client import GuardedHttpClient
-    from .image_bed import MODE_CFB
-    from .image_delivery import (
-        CompressionEvidence,
-        DeliveryTarget,
-        SendOutcome,
-        build_imgbed_file_url,
-        build_original_url,
-        build_scaled_url,
-        choose_qq_upload_channel,
-        classify_send_error,
-        compression_evidence,
-        delivery_target,
-        is_public_http_url,
-        is_scaling_needed,
-        prefer_inline_bytes,
-        prefer_url_direct,
-        prepare_image_bytes,
-        qq_upload_safe_image,
-        send_diagnosis,
-        sniff_image_format,
-        upgrade_to_https,
-    )
-    from .library import ImageLibrary
-    from .media.image_source import (
-        ImageSource,
-        ResolvedImage,
-        decode_fail_message,
-        download_fail_message,
-        image_download_headers,
-        range_probe_headers,
-    )
-    from .media_history import MediaHistory
-    from .random_media import (
-        RandomMediaClient,
-        RandomMediaError,
-        clean_display_name,
-        is_thumbnail_url,
-        media_filename,
-        media_kind,
-        pick_default_directory,
-        swap_url_origin,
-    )
-    from .search import (
-        AutoSearchEngine,
-        HashSearchEngine,
-        QueryImage,
-        SearchHit,
-        VectorSearchEngine,
-        miss_message,
-    )
-    from .storage import StorageRegistry
-    from .url_guard import read_limited_bytes
-    from .vector_search import VectorEngine
-    from .weibo_posts import (
-        WeiboPost,
-        load_post_map,
-        load_posts_from_dir,
-        map_is_stale,
-    )
-except ImportError:  # 兼容插件以独立模块方式加载
-    from checkin_card import (  # type: ignore[no-redef]
-        DEFAULT_QUOTES,
-        QuoteLibrary,
-        compose_poster,
-        strip_emoji,
-    )
-    from checkin_store import CheckinStore  # type: ignore[no-redef]
-    from common import (  # type: ignore[no-redef]
-        AI_VERIFY_MAX_CANDIDATES,
-        COMPRESS_CONCURRENCY,
-        MEMORY_DOWNLOAD_MAX_BYTES,
-        PLAN_TOTAL_TIMEOUT,
-        PROBE_CONCURRENCY,
-        QQ_URL_COOLDOWN_SECONDS,
-        SCALED_VERIFY_COOLDOWN_SECONDS,
-        TMP_MAX_AGE_SECONDS,
-        as_int,
-        read_bytes,
-        sanitize_error_text,
-    )
-    from config.loader import (  # type: ignore[no-redef]
-        bool_cfg,
-        bucket_config,
-        checkin_settings,
-        delivery_config,
-        dict_group,
-        effective_bed_cfg,
-        encode_options,
-        engine_choice,
-        ensure_group_cfg,
-        first_value,
-        float_cfg,
-        int_cfg,
-        napcat_delivery_cfg,
-        onebot_image_timeout,
-        qq_delivery_cfg,
-        qq_upload_config,
-        random_settings,
-        scalar_cfg,
-        scan_dirs,
-        vector_index_on_register,
-        verify_scaled,
-    )
-    from config.migrations import (  # type: ignore[no-redef]
-        BUCKET_MODES,
-        LAYOUT_VERSION,
-        SCALAR_PATHS,
-        migrate_bucket_config,
-        migrate_config_layout,
-    )
-    from config.typed import DEFAULT_BASIC, DEFAULT_LIMITS  # type: ignore[no-redef]
-    from controllers import (  # type: ignore[no-redef]
-        AdminController,
-        CheckinController,
-        OriginalController,
-        RandomController,
-        RegisterController,
-        TraceController,
-    )
-    from delivery import (  # type: ignore[no-redef]
-        ChainChannel,
-        DeliveryConfig,
-        DeliveryContext,
-        DeliveryProfile,
-        DeliveryRequest,
-        OneBotChannel,
-        QQOfficialChannel,
-        plan_delivery,
-    )
-    from features import (  # type: ignore[no-redef]
-        avif_available,
-        compute_features,
-        compute_features_with_mime,
-        heif_available,
-        image_bytes_ok,
-        image_file_ok,
-        image_mime,
-        phash_hex_len,
-    )
-    from hash_index import REMOTE_HASH_PAYLOAD_KEYS, HashIndex  # type: ignore[no-redef]
-    from http_client import GuardedHttpClient  # type: ignore[no-redef]
-    from image_bed import MODE_CFB  # type: ignore[no-redef]
-    from image_delivery import (  # type: ignore[no-redef]
-        CompressionEvidence,
-        DeliveryTarget,
-        SendOutcome,
-        build_imgbed_file_url,
-        build_original_url,
-        build_scaled_url,
-        choose_qq_upload_channel,
-        classify_send_error,
-        compression_evidence,
-        delivery_target,
-        is_public_http_url,
-        is_scaling_needed,
-        prefer_inline_bytes,
-        prefer_url_direct,
-        prepare_image_bytes,
-        qq_upload_safe_image,
-        send_diagnosis,
-        sniff_image_format,
-        upgrade_to_https,
-    )
-    from library import ImageLibrary  # type: ignore[no-redef]
-    from media.image_source import (  # type: ignore[no-redef]
-        ImageSource,
-        ResolvedImage,
-        decode_fail_message,
-        download_fail_message,
-        image_download_headers,
-        range_probe_headers,
-    )
-    from media_history import MediaHistory  # type: ignore[no-redef]
-    from random_media import (  # type: ignore[no-redef]
-        RandomMediaClient,
-        RandomMediaError,
-        clean_display_name,
-        is_thumbnail_url,
-        media_filename,
-        media_kind,
-        pick_default_directory,
-        swap_url_origin,
-    )
-    from search import (  # type: ignore[no-redef]
-        AutoSearchEngine,
-        HashSearchEngine,
-        QueryImage,
-        SearchHit,
-        VectorSearchEngine,
-        miss_message,
-    )
-    from storage import StorageRegistry  # type: ignore[no-redef]
-    from url_guard import read_limited_bytes  # type: ignore[no-redef]
-    from vector_search import VectorEngine  # type: ignore[no-redef]
-    from weibo_posts import (  # type: ignore[no-redef]
-        WeiboPost,
-        load_post_map,
-        load_posts_from_dir,
-        map_is_stale,
-    )
+# 只保留一份导入清单：统一按包内相对导入。若插件被作为独立模块加载
+# （__package__ 为空），先向 sys.modules 注册一个指向本目录的合成包，
+# 使相对导入成立，从而不必再维护「包加载 / 平铺加载」两套清单。
+if __package__ in (None, ""):
+    import sys as _sys
+    import types as _types
+
+    _pkg_name = "astrbot_plugin_image_trace"
+    if _pkg_name not in _sys.modules:
+        _pkg = _types.ModuleType(_pkg_name)
+        _pkg.__path__ = [str(Path(__file__).resolve().parent)]
+        _sys.modules[_pkg_name] = _pkg
+    __package__ = _pkg_name
+
+from .checkin_card import DEFAULT_QUOTES, QuoteLibrary, compose_poster, strip_emoji
+from .checkin_store import CheckinStore
+from .common import (
+    AI_VERIFY_MAX_CANDIDATES,
+    COMPRESS_CONCURRENCY,
+    MEMORY_DOWNLOAD_MAX_BYTES,
+    PLAN_TOTAL_TIMEOUT,
+    PROBE_CONCURRENCY,
+    QQ_URL_COOLDOWN_SECONDS,
+    SCALED_VERIFY_COOLDOWN_SECONDS,
+    TMP_MAX_AGE_SECONDS,
+    as_int,
+    read_bytes,
+    sanitize_error_text,
+)
+from .config.loader import (
+    bool_cfg,
+    bucket_config,
+    checkin_settings,
+    delivery_config,
+    dict_group,
+    effective_bed_cfg,
+    encode_options,
+    engine_choice,
+    ensure_group_cfg,
+    first_value,
+    float_cfg,
+    int_cfg,
+    napcat_delivery_cfg,
+    onebot_image_timeout,
+    qq_delivery_cfg,
+    qq_upload_config,
+    random_settings,
+    scalar_cfg,
+    scan_dirs,
+    vector_index_on_register,
+    verify_scaled,
+)
+from .config.migrations import (
+    BUCKET_MODES,
+    LAYOUT_VERSION,
+    SCALAR_PATHS,
+    migrate_bucket_config,
+    migrate_config_layout,
+)
+from .config.typed import DEFAULT_BASIC, DEFAULT_LIMITS
+from .controllers import (
+    AdminController,
+    CheckinController,
+    OriginalController,
+    RandomController,
+    RegisterController,
+    TraceController,
+)
+from .delivery import (
+    ChainChannel,
+    DeliveryConfig,
+    DeliveryContext,
+    DeliveryProfile,
+    DeliveryRequest,
+    OneBotChannel,
+    QQOfficialChannel,
+    plan_delivery,
+)
+from .features import (
+    avif_available,
+    compute_features,
+    compute_features_with_mime,
+    heif_available,
+    image_bytes_ok,
+    image_file_ok,
+    image_mime,
+    phash_hex_len,
+)
+from .hash_index import REMOTE_HASH_PAYLOAD_KEYS, HashIndex
+from .http_client import GuardedHttpClient
+from .image_bed import MODE_CFB
+from .image_delivery import (
+    CompressionEvidence,
+    DeliveryTarget,
+    SendOutcome,
+    build_imgbed_file_url,
+    build_original_url,
+    build_scaled_url,
+    choose_qq_upload_channel,
+    classify_send_error,
+    compression_evidence,
+    delivery_target,
+    is_public_http_url,
+    is_scaling_needed,
+    prefer_inline_bytes,
+    prefer_url_direct,
+    prepare_image_bytes,
+    qq_upload_safe_image,
+    send_diagnosis,
+    sniff_image_format,
+    upgrade_to_https,
+)
+from .library import ImageLibrary
+from .media.image_source import (
+    ImageSource,
+    ResolvedImage,
+    decode_fail_message,
+    download_fail_message,
+    image_download_headers,
+    range_probe_headers,
+)
+from .media_history import MediaHistory
+from .random_media import (
+    RandomMediaClient,
+    RandomMediaError,
+    clean_display_name,
+    is_thumbnail_url,
+    media_filename,
+    media_kind,
+    pick_default_directory,
+    swap_url_origin,
+)
+from .search import (
+    AutoSearchEngine,
+    HashSearchEngine,
+    QueryImage,
+    SearchHit,
+    VectorSearchEngine,
+    miss_message,
+)
+from .storage import StorageRegistry
+from .url_guard import read_limited_bytes
+from .vector_search import VectorEngine
+from .weibo_posts import (
+    WeiboPost,
+    load_post_map,
+    load_posts_from_dir,
+    map_is_stale,
+)
 
 # 兼容旧测试/外部引用：这些常量已迁到 config.migrations，main 只保留别名。
 _LAYOUT_VERSION = LAYOUT_VERSION
