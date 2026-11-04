@@ -91,7 +91,16 @@ try:
         migrate_config_layout,
     )
     from .config.typed import DEFAULT_BASIC, DEFAULT_LIMITS
-    from .delivery import DeliveryConfig, DeliveryProfile, DeliveryRequest, plan_delivery
+    from .delivery import (
+        ChainChannel,
+        DeliveryConfig,
+        DeliveryContext,
+        DeliveryProfile,
+        DeliveryRequest,
+        OneBotChannel,
+        QQOfficialChannel,
+        plan_delivery,
+    )
     from .features import (
         avif_available,
         compute_features,
@@ -222,9 +231,13 @@ except ImportError:  # 兼容插件以独立模块方式加载
     )
     from config.typed import DEFAULT_BASIC, DEFAULT_LIMITS  # type: ignore[no-redef]
     from delivery import (  # type: ignore[no-redef]
+        ChainChannel,
         DeliveryConfig,
+        DeliveryContext,
         DeliveryProfile,
         DeliveryRequest,
+        OneBotChannel,
+        QQOfficialChannel,
         plan_delivery,
     )
     from features import (  # type: ignore[no-redef]
@@ -1444,6 +1457,14 @@ class ImageTracePlugin(Star):
             return
         target = self._delivery_target(event)
         self._remember_blocks(event, blocks if remember_blocks is None else remember_blocks)
+        request = DeliveryRequest(
+            header=header,
+            blocks=blocks,
+            mode_override=mode_override,
+            allow_local_fallback=allow_local_fallback,
+            mark_compressed=mark_compressed,
+            remember_blocks=remember_blocks,
+        )
         # 格式体检可能把假格式转成本地 JPEG（block["_tmp_owned"]）；这些临时文件
         # 只服务于本次投递，发送完成后必须删除，否则会随每次 /随机图、/原图 累积。
         owned_paths: list[str] = []
@@ -1455,6 +1476,7 @@ class ImageTracePlugin(Star):
                 blocks, handled = await self._offbox_pipeline(
                     event, header, blocks, mark_compressed=mark_compressed
                 )
+                request.blocks = blocks
                 owned_paths = [
                     str(block.get("path") or "")
                     for block in blocks
@@ -1471,15 +1493,6 @@ class ImageTracePlugin(Star):
             if mode_override is not None:
                 mode = mode_override
             # 决策收口到纯计划器：输入是请求/平台画像/配置，输出是候选步骤。
-            # 下面的执行分支仍按原顺序跑，Step 4a 不改变任何发送行为。
-            request = DeliveryRequest(
-                header=header,
-                blocks=blocks,
-                mode_override=mode_override,
-                allow_local_fallback=allow_local_fallback,
-                mark_compressed=mark_compressed,
-                remember_blocks=remember_blocks,
-            )
             plan = plan_delivery(
                 request,
                 DeliveryProfile.from_target(target),
@@ -1497,13 +1510,14 @@ class ImageTracePlugin(Star):
             # 回传计划最多只算一次：回退路径此前会重跑一遍规划，把同样的探测白做
             # 第二次（图床还会因此多做一次缩放处理）。
             url_plan: tuple[list[str], list[CompressionEvidence]] | None = None
+            ctx = DeliveryContext(
+                event=event, request=request, plan=plan, image_blocks=image_blocks
+            )
             if plan.direct_ok:
                 url_plan = await self._url_delivery_plan(image_blocks, max_side, mode, quality=quality, scaled_url_style=scaled_url_style)
-                urls, evidences = url_plan
-                if mark_compressed:
-                    self._mark_compressed_captions(blocks, evidences)
-                outcome = await self._send_via_onebot(event, header, blocks, urls)
-                if outcome is not SendOutcome.FAILED:
+                ctx.url_plan = url_plan
+                result = await OneBotChannel(self).deliver_url(ctx)
+                if result.outcome != "failed":
                     # SENT 已送达；UNKNOWN 可能已送达——两者都不能再发第二次
                     self._mark_event_sent(event)
                     if not self._defer_event_stop(event):
@@ -1513,76 +1527,34 @@ class ImageTracePlugin(Star):
             if plan.local_compress:
                 # OneBot 下 auto/bytes 直发压缩字节（混合载荷）：压缩结果
                 # 经 base64 段直达 QQ，不经协议端二次下载，压缩 100% 生效
-                outcome = await self._local_compress_delivery(
-                    event, header, blocks, image_blocks, mark_compressed=mark_compressed
-                )
-                if outcome is not None and outcome is not SendOutcome.FAILED:
+                result = await OneBotChannel(self).deliver_compressed(ctx)
+                if result.outcome != "failed":
                     # SENT 已送达；UNKNOWN 可能已送达——两者都不能再发第二次
                     self._mark_event_sent(event)
                     if not self._defer_event_stop(event):
                         event.stop_event()
                     return
-                # None=准备失败 或 FAILED=直发失败：字节路径已试过，整批改走 URL 链
+                # 准备失败 或 直发失败：字节路径已试过，整批改走 URL 链
                 logger.warning("OneBot 压缩直发未成功，改用标准消息链 URL 发送")
             elif plan.local_bytes_chain:
-                prepared = await self._prepare_delivery_blocks(
-                    image_blocks, compress=plan.prepare_compress
-                )
-                if prepared is not None:
-                    evidences = [
-                        CompressionEvidence.COMPRESSED if compressed else CompressionEvidence.ORIGINAL
-                        for _, compressed in prepared
-                    ]
-                    if mark_compressed:
-                        self._mark_compressed_captions(blocks, evidences)
-                    fallback_header = header
-                    if any(
-                        item is CompressionEvidence.COMPRESSED for item in evidences
-                    ):
-                        fallback_header += "（已压缩）"
-                    chain = self._mention_prefix(event)
-                    if fallback_header:
-                        chain.append(Comp.Plain((" " if chain else "") + fallback_header))
-                    image_index = 0
-                    for block in blocks:
-                        if block.get("text"):
-                            chain.append(Comp.Plain("\n" + str(block["text"])))
-                        if block.get("url") or block.get("path"):
-                            data, _ = prepared[image_index]
-                            chain.append(Comp.Image.fromBytes(data))
-                            image_index += 1
+                result = await ChainChannel(self).deliver_bytes(ctx)
+                if result.outcome != "failed":
                     self._mark_event_sent(event)
-                    yield event.chain_result(chain)
+                    yield event.chain_result(result.chain)
                     return
                 logger.warning("本地图片回退失败，改用标准消息链 URL 发送")
 
+            # 走到这里说明没有任何通道明确送达（UNKNOWN 已在上面按已送达拦截）。
             if self._event_already_sent(event):
                 return
             if url_plan is None:
                 url_plan = await self._url_delivery_plan(image_blocks, max_side, mode, quality=quality, scaled_url_style=scaled_url_style)
-            urls, evidences = url_plan
-            if mark_compressed:
-                self._mark_compressed_captions(blocks, evidences)
-            chain = self._mention_prefix(event)
-            if header:
-                chain.append(Comp.Plain((" " if chain else "") + header))
-            # urls / evidences 与 image_blocks（有 url 或 path 的 block）同序，
-            # 而本循环遍历的是全部 blocks（含纯文本 block）。因此计数必须按
-            # 「有图 block」推进，只对 url block 取用 urls——否则前面夹一张
-            # 只有 path 的图（格式体检转码产物）就会让后续 URL 用错下标。
-            image_index = 0
-            for block in blocks:
-                if block.get("text"):
-                    chain.append(Comp.Plain("\n" + str(block["text"])))
-                path = str(block.get("path") or "")
-                if block.get("url"):
-                    chain.append(Comp.Image.fromURL(urls[image_index]))
-                elif path:
-                    chain.append(Comp.Image.fromFileSystem(path))
-                if block.get("url") or path:
-                    image_index += 1
+            ctx.url_plan = url_plan
+            result = await ChainChannel(self).deliver_url(ctx)
+            if result.outcome == "failed":
+                return
             self._mark_event_sent(event)
-            yield event.chain_result(chain)
+            yield event.chain_result(result.chain)
         finally:
             # 生成器被消费完/关闭时执行：此时消息已由 OneBot 直发或由 respond
             # stage 发完，删除转码产物是安全的
@@ -3742,12 +3714,18 @@ class ImageTracePlugin(Star):
 
         返回 (最终 blocks, 是否已投递完毕)：handled 为真时调用方只需标记已
         发送并 stop_event，不要再走任何原生回传分支（否则会重复投递）。
+
+        实现已迁到 delivery.channels.QQOfficialChannel，保留同名薄委托。
         """
-        blocks = await self._offbox_rewrite_blocks(blocks)
-        handled = await self._qq_upload_takeover(
-            event, header, blocks, mark_compressed=mark_compressed
+        return await QQOfficialChannel(self).run_offbox(
+            DeliveryContext(
+                event=event,
+                request=DeliveryRequest(
+                    header=header, blocks=blocks, mark_compressed=mark_compressed
+                ),
+                plan=None,
+            )
         )
-        return blocks, handled
 
     async def _offbox_rewrite_blocks(self, blocks: list[dict]) -> list[dict]:
         """对 blocks 里每个待发 URL 做官方富媒体格式体检，按需改写发送形态。
@@ -4213,23 +4191,10 @@ class ImageTracePlugin(Star):
         不走 event.send：那条路会把图片重新解析成 base64 交给 file_data 直传，
         正是本次要绕开的 5MB 限制。msg_seq 每条随机——被动回复中 (msg_id,
         msg_seq) 组合重复会被平台判失败。
+
+        实现已迁到 delivery.channels.QQOfficialChannel，保留同名薄委托。
         """
-        api = event.bot.api
-        message_id = str(
-            getattr(getattr(event, "message_obj", None), "message_id", "") or ""
-        ).strip()
-        payload = {
-            "msg_type": 7,
-            "media": media,
-            "content": content or None,
-            "msg_id": message_id or None,
-            "msg_seq": random.randint(1, 10000),
-        }
-        kind, session_id = target
-        if kind == "group":
-            await api.post_group_message(group_openid=session_id, **payload)
-        else:
-            await api.post_c2c_message(openid=session_id, **payload)
+        await QQOfficialChannel(self).post_media(event, target, content, media)
 
     async def _qq_notify(
         self, event: AstrMessageEvent, target: tuple[str, str], text: str

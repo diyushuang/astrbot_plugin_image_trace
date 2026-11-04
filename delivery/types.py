@@ -35,6 +35,7 @@ class DeliveryResult:
     sent_count: int = 0
     evidence: list[Any] = field(default_factory=list)
     fallback_reason: str = ""
+    chain: list[Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,7 @@ class DeliveryContext:
     request: DeliveryRequest
     plan: Any
     image_blocks: list[dict] = field(default_factory=list)
+    url_plan: Any = None
 
 
 @runtime_checkable
