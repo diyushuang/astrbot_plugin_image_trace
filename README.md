@@ -142,7 +142,7 @@ flowchart LR
 >
 > **按需显隐与折叠**：储存桶组选择 `cloudflare_r2` / `oracle_oci` 后才展开对应字段，图床组选择 `generic_http` / `cloudflare_imgbed` 后才展开；进阶项收在各组的「更多配置」折叠区（WebUI 原生 `collapsed`），默认收起。被隐藏字段的已填值保留，切换模式不丢失。
 >
-> **旧配置自动迁移**：1.7.14 起同类项已合并到上述分组（如 `image_delivery.mode` → `delivery.napcat_mode`、`qq_upload.*` → `delivery.qq_*`、`top_n` → `basic.top_n`、`max_download_mb` → `limits.max_download_mb`）。插件启动时自动搬移并保留旧值，无需手动改。旧键仍以**隐藏项**留在 schema 里（AstrBot 加载时会按 schema 删除不存在的键，故不能直接改名），面板不显示，后续版本会移除。
+> **旧配置自动迁移**：1.7.14 起同类项已合并到上述分组（如 `image_delivery.mode` → `delivery.napcat_mode`、`qq_upload.*` → `delivery.qq_*`、`top_n` → `basic.top_n`、`max_download_mb` → `limits.max_download_mb`）。插件启动时自动搬移并保留旧值，无需手动改。旧键仍以**隐藏项**留在 schema 里（AstrBot 加载时会按 schema 删除不存在的键，故不能直接改名），面板不显示。**这 15 个隐藏旧键不会在后续版本移除**：配置剪枝发生在插件初始化之前，删掉它们会让尚未迁移的老用户在迁移读取旧值前就丢配置；只有在确认全部存量用户都已迁移后才谈得上退役。
 
 ### 基础配置
 

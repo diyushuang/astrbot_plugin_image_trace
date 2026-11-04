@@ -12,9 +12,25 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
+from astrbot_plugin_image_trace.config.migrations import SCALAR_PATHS
 from astrbot_plugin_image_trace.main import _LAYOUT_VERSION
+
+SCHEMA_PATH = Path(__file__).resolve().parents[1] / "_conf_schema.json"
+
+# 15 个隐藏旧键：12 个顶层散项 + 2 个旧配置组 + 布局版本标记。
+# 它们不能从 schema 删除——AstrBot 在插件初始化前就按 schema 丢弃未声明键，
+# 删掉后老用户的旧值会在 migrate_config_layout 读到之前消失。
+HIDDEN_LEGACY_KEYS = (
+    *SCALAR_PATHS,
+    "image_delivery",
+    "qq_upload",
+    "config_layout",
+)
 
 
 def test_migration_moves_legacy_scalars_into_groups(make_plugin):
@@ -121,3 +137,40 @@ def test_scalar_paths_cover_every_moved_key(legacy, group, field):
     from astrbot_plugin_image_trace.main import _SCALAR_PATHS
 
     assert _SCALAR_PATHS[legacy] == (group, field)
+
+
+def test_hidden_legacy_keys_are_still_declared():
+    """15 个隐藏旧键必须继续声明：删掉会让升级用户的旧值在迁移前被 schema 清空。"""
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    assert len(HIDDEN_LEGACY_KEYS) == 15
+    for key in HIDDEN_LEGACY_KEYS:
+        assert key in schema, f"旧键 {key} 不能从 _conf_schema.json 删除"
+        assert schema[key].get("invisible") is True, f"旧键 {key} 必须保持隐藏"
+
+
+_LEGACY_SCALAR_VALUES = {
+    "search_engine": "hash",
+    "scan_dirs": ["C:\\imgs"],
+    "similarity_threshold": 0.9,
+    "hash_size": 8,
+    "top_n": 5,
+    "max_images_per_query": 2,
+    "ai_verify": True,
+    "register_admin_only": False,
+    "max_download_mb": 30,
+    "remote_hash_enabled": False,
+    "remote_hash_ttl": 600,
+    "remote_hash_max_points": 100,
+}
+
+
+@pytest.mark.parametrize(("legacy", "target"), sorted(SCALAR_PATHS.items()))
+def test_every_legacy_scalar_migrates_to_the_correct_new_key(
+    make_plugin, legacy, target
+):
+    """12 个顶层旧键逐个钉住：迁移后新组里的新键取值等于旧值。"""
+    value = _LEGACY_SCALAR_VALUES[legacy]
+    group, field = target
+    plugin = make_plugin(**{legacy: value})
+    assert plugin.config[group][field] == value
+    assert plugin.config["config_layout"] == _LAYOUT_VERSION
