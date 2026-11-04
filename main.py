@@ -91,6 +91,7 @@ try:
         migrate_config_layout,
     )
     from .config.typed import DEFAULT_BASIC, DEFAULT_LIMITS
+    from .delivery import DeliveryConfig, DeliveryProfile, DeliveryRequest, plan_delivery
     from .features import (
         avif_available,
         compute_features,
@@ -115,7 +116,6 @@ try:
         classify_send_error,
         compression_evidence,
         delivery_target,
-        is_napcat_parseable_url,
         is_public_http_url,
         is_scaling_needed,
         prefer_inline_bytes,
@@ -221,6 +221,12 @@ except ImportError:  # 兼容插件以独立模块方式加载
         migrate_config_layout,
     )
     from config.typed import DEFAULT_BASIC, DEFAULT_LIMITS  # type: ignore[no-redef]
+    from delivery import (  # type: ignore[no-redef]
+        DeliveryConfig,
+        DeliveryProfile,
+        DeliveryRequest,
+        plan_delivery,
+    )
     from features import (  # type: ignore[no-redef]
         avif_available,
         compute_features,
@@ -245,7 +251,6 @@ except ImportError:  # 兼容插件以独立模块方式加载
         classify_send_error,
         compression_evidence,
         delivery_target,
-        is_napcat_parseable_url,
         is_public_http_url,
         is_scaling_needed,
         prefer_inline_bytes,
@@ -1465,28 +1470,36 @@ class ImageTracePlugin(Star):
             mode, max_side, quality, scaled_url_style = self._delivery_config()
             if mode_override is not None:
                 mode = mode_override
-            image_blocks = [block for block in blocks if block.get("url") or block.get("path")]
-            raw_urls = [str(block["url"]) for block in image_blocks if block.get("url")]
-            all_urls = bool(image_blocks) and len(raw_urls) == len(image_blocks)
-            direct_mode = mode in {"url", "url-scaled"}
-            # URL 直发条件：模式允许 + 全是 URL + 能走 OneBot + 所有 URL 扩展名
-            # 能被协议端解析出宽高（否则 QQ 侧拿不到尺寸，体验差）。
-            # url-scaled 模式下默认走 URL 直传；若 QQ 协议端会剥离查询参数导致
-            # 图床返回原图，可把 scaled_url_style 改为 "cf-path"（路径式，参数
-            # 嵌在路径里不会被剥离，但需图床域名开启 Cloudflare Image Resizing）。
-            direct_ok = (
-                direct_mode
-                and all_urls
-                and target.direct_send
-                and (mode == "url" or all(is_napcat_parseable_url(u) for u in raw_urls))
+            # 决策收口到纯计划器：输入是请求/平台画像/配置，输出是候选步骤。
+            # 下面的执行分支仍按原顺序跑，Step 4a 不改变任何发送行为。
+            request = DeliveryRequest(
+                header=header,
+                blocks=blocks,
+                mode_override=mode_override,
+                allow_local_fallback=allow_local_fallback,
+                mark_compressed=mark_compressed,
+                remember_blocks=remember_blocks,
             )
+            plan = plan_delivery(
+                request,
+                DeliveryProfile.from_target(target),
+                DeliveryConfig(
+                    mode=mode,
+                    max_side=max_side,
+                    quality=quality,
+                    scaled_url_style=scaled_url_style,
+                ),
+            )
+            mode, max_side = plan.mode, plan.max_side
+            quality, scaled_url_style = plan.quality, plan.scaled_url_style
+            image_blocks = [block for block in blocks if block.get("url") or block.get("path")]
 
             # 回传计划最多只算一次：回退路径此前会重跑一遍规划，把同样的探测白做
             # 第二次（图床还会因此多做一次缩放处理）。
-            plan: tuple[list[str], list[CompressionEvidence]] | None = None
-            if direct_ok:
-                plan = await self._url_delivery_plan(image_blocks, max_side, mode, quality=quality, scaled_url_style=scaled_url_style)
-                urls, evidences = plan
+            url_plan: tuple[list[str], list[CompressionEvidence]] | None = None
+            if plan.direct_ok:
+                url_plan = await self._url_delivery_plan(image_blocks, max_side, mode, quality=quality, scaled_url_style=scaled_url_style)
+                urls, evidences = url_plan
                 if mark_compressed:
                     self._mark_compressed_captions(blocks, evidences)
                 outcome = await self._send_via_onebot(event, header, blocks, urls)
@@ -1497,66 +1510,57 @@ class ImageTracePlugin(Star):
                         event.stop_event()
                     return
 
-            if allow_local_fallback and not self._event_already_sent(event):
-                should_compress = mode in {"auto", "bytes"} or (
-                    mode == "url-scaled"
-                    and any(block.get("path") for block in image_blocks)
+            if plan.local_compress:
+                # OneBot 下 auto/bytes 直发压缩字节（混合载荷）：压缩结果
+                # 经 base64 段直达 QQ，不经协议端二次下载，压缩 100% 生效
+                outcome = await self._local_compress_delivery(
+                    event, header, blocks, image_blocks, mark_compressed=mark_compressed
                 )
-                # 走 URL 直传但没能直发成功：既包括 FAILED 后的回退，也包括扩展名
-                # 让协议端解析不了宽高、压根没尝试直发的情形（改本地压缩成 JPEG 再发）
-                onebot_failed = target.direct_send and direct_mode and all_urls
-                if should_compress or onebot_failed:
-                    if mode in {"auto", "bytes"} and target.direct_send:
-                        # OneBot 下 auto/bytes 直发压缩字节（混合载荷）：压缩结果
-                        # 经 base64 段直达 QQ，不经协议端二次下载，压缩 100% 生效
-                        outcome = await self._local_compress_delivery(
-                            event, header, blocks, image_blocks, mark_compressed=mark_compressed
-                        )
-                        if outcome is not None and outcome is not SendOutcome.FAILED:
-                            # SENT 已送达；UNKNOWN 可能已送达——两者都不能再发第二次
-                            self._mark_event_sent(event)
-                            if not self._defer_event_stop(event):
-                                event.stop_event()
-                            return
-                        # None=准备失败 或 FAILED=直发失败：字节路径已试过，整批改走 URL 链
-                        logger.warning("OneBot 压缩直发未成功，改用标准消息链 URL 发送")
-                    else:
-                        prepared = await self._prepare_delivery_blocks(
-                            image_blocks, compress=mode != "url"
-                        )
-                        if prepared is not None:
-                            evidences = [
-                                CompressionEvidence.COMPRESSED if compressed else CompressionEvidence.ORIGINAL
-                                for _, compressed in prepared
-                            ]
-                            if mark_compressed:
-                                self._mark_compressed_captions(blocks, evidences)
-                            fallback_header = header
-                            if any(
-                                item is CompressionEvidence.COMPRESSED for item in evidences
-                            ):
-                                fallback_header += "（已压缩）"
-                            chain = self._mention_prefix(event)
-                            if fallback_header:
-                                chain.append(Comp.Plain((" " if chain else "") + fallback_header))
-                            image_index = 0
-                            for block in blocks:
-                                if block.get("text"):
-                                    chain.append(Comp.Plain("\n" + str(block["text"])))
-                                if block.get("url") or block.get("path"):
-                                    data, _ = prepared[image_index]
-                                    chain.append(Comp.Image.fromBytes(data))
-                                    image_index += 1
-                            self._mark_event_sent(event)
-                            yield event.chain_result(chain)
-                            return
-                        logger.warning("本地图片回退失败，改用标准消息链 URL 发送")
+                if outcome is not None and outcome is not SendOutcome.FAILED:
+                    # SENT 已送达；UNKNOWN 可能已送达——两者都不能再发第二次
+                    self._mark_event_sent(event)
+                    if not self._defer_event_stop(event):
+                        event.stop_event()
+                    return
+                # None=准备失败 或 FAILED=直发失败：字节路径已试过，整批改走 URL 链
+                logger.warning("OneBot 压缩直发未成功，改用标准消息链 URL 发送")
+            elif plan.local_bytes_chain:
+                prepared = await self._prepare_delivery_blocks(
+                    image_blocks, compress=plan.prepare_compress
+                )
+                if prepared is not None:
+                    evidences = [
+                        CompressionEvidence.COMPRESSED if compressed else CompressionEvidence.ORIGINAL
+                        for _, compressed in prepared
+                    ]
+                    if mark_compressed:
+                        self._mark_compressed_captions(blocks, evidences)
+                    fallback_header = header
+                    if any(
+                        item is CompressionEvidence.COMPRESSED for item in evidences
+                    ):
+                        fallback_header += "（已压缩）"
+                    chain = self._mention_prefix(event)
+                    if fallback_header:
+                        chain.append(Comp.Plain((" " if chain else "") + fallback_header))
+                    image_index = 0
+                    for block in blocks:
+                        if block.get("text"):
+                            chain.append(Comp.Plain("\n" + str(block["text"])))
+                        if block.get("url") or block.get("path"):
+                            data, _ = prepared[image_index]
+                            chain.append(Comp.Image.fromBytes(data))
+                            image_index += 1
+                    self._mark_event_sent(event)
+                    yield event.chain_result(chain)
+                    return
+                logger.warning("本地图片回退失败，改用标准消息链 URL 发送")
 
             if self._event_already_sent(event):
                 return
-            if plan is None:
-                plan = await self._url_delivery_plan(image_blocks, max_side, mode, quality=quality, scaled_url_style=scaled_url_style)
-            urls, evidences = plan
+            if url_plan is None:
+                url_plan = await self._url_delivery_plan(image_blocks, max_side, mode, quality=quality, scaled_url_style=scaled_url_style)
+            urls, evidences = url_plan
             if mark_compressed:
                 self._mark_compressed_captions(blocks, evidences)
             chain = self._mention_prefix(event)
