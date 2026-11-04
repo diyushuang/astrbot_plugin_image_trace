@@ -51,10 +51,7 @@ try:
         PLAN_TOTAL_TIMEOUT,
         PROBE_CONCURRENCY,
         QQ_URL_COOLDOWN_SECONDS,
-        RESCAN_BATCH_SIZE,
-        RESCAN_PROGRESS_EVERY,
         SCALED_VERIFY_COOLDOWN_SECONDS,
-        SCAN_CONCURRENCY,
         TMP_MAX_AGE_SECONDS,
         as_int,
         read_bytes,
@@ -91,6 +88,14 @@ try:
         migrate_config_layout,
     )
     from .config.typed import DEFAULT_BASIC, DEFAULT_LIMITS
+    from .controllers import (
+        AdminController,
+        CheckinController,
+        OriginalController,
+        RandomController,
+        RegisterController,
+        TraceController,
+    )
     from .delivery import (
         ChainChannel,
         DeliveryConfig,
@@ -149,12 +154,10 @@ try:
         RandomMediaClient,
         RandomMediaError,
         clean_display_name,
-        extract_directory,
         is_thumbnail_url,
         media_filename,
         media_kind,
         pick_default_directory,
-        strip_leading_decoration,
         swap_url_origin,
     )
     from .search import (
@@ -173,7 +176,6 @@ try:
         load_post_map,
         load_posts_from_dir,
         map_is_stale,
-        parse_weibo_text,
     )
 except ImportError:  # 兼容插件以独立模块方式加载
     from checkin_card import (  # type: ignore[no-redef]
@@ -190,10 +192,7 @@ except ImportError:  # 兼容插件以独立模块方式加载
         PLAN_TOTAL_TIMEOUT,
         PROBE_CONCURRENCY,
         QQ_URL_COOLDOWN_SECONDS,
-        RESCAN_BATCH_SIZE,
-        RESCAN_PROGRESS_EVERY,
         SCALED_VERIFY_COOLDOWN_SECONDS,
-        SCAN_CONCURRENCY,
         TMP_MAX_AGE_SECONDS,
         as_int,
         read_bytes,
@@ -230,6 +229,14 @@ except ImportError:  # 兼容插件以独立模块方式加载
         migrate_config_layout,
     )
     from config.typed import DEFAULT_BASIC, DEFAULT_LIMITS  # type: ignore[no-redef]
+    from controllers import (  # type: ignore[no-redef]
+        AdminController,
+        CheckinController,
+        OriginalController,
+        RandomController,
+        RegisterController,
+        TraceController,
+    )
     from delivery import (  # type: ignore[no-redef]
         ChainChannel,
         DeliveryConfig,
@@ -288,12 +295,10 @@ except ImportError:  # 兼容插件以独立模块方式加载
         RandomMediaClient,
         RandomMediaError,
         clean_display_name,
-        extract_directory,
         is_thumbnail_url,
         media_filename,
         media_kind,
         pick_default_directory,
-        strip_leading_decoration,
         swap_url_origin,
     )
     from search import (  # type: ignore[no-redef]
@@ -312,7 +317,6 @@ except ImportError:  # 兼容插件以独立模块方式加载
         load_post_map,
         load_posts_from_dir,
         map_is_stale,
-        parse_weibo_text,
     )
 
 # 兼容旧测试/外部引用：这些常量已迁到 config.migrations，main 只保留别名。
@@ -448,6 +452,16 @@ class ImageTracePlugin(Star):
             memory_limit_bytes=lambda: MEMORY_DOWNLOAD_MAX_BYTES,
         )
         self._cleanup_tmp()
+        # 命令处理器实现在 controllers/；这里组装一次，main 只保留命令注册与
+        # 同名薄委托（测试对 plugin._xxx 的 monkeypatch 仍按实例属性生效）
+        self.controllers = SimpleNamespace(
+            trace=TraceController(self, self.config),
+            register=RegisterController(self, self.config),
+            original=OriginalController(self, self.config),
+            random=RandomController(self, self.config),
+            checkin=CheckinController(self, self.config),
+            admin=AdminController(self, self.config),
+        )
         # 先吃磁盘缓存（同步、瞬时），网络刷新交给生命周期钩子里的后台任务——
         # __init__ 里不能建 Task（此时还没有运行中的事件循环）
         cache_note = ""
@@ -1568,51 +1582,8 @@ class ImageTracePlugin(Star):
     @filter.command("溯源", alias={"找原图"})
     async def trace(self, event: AstrMessageEvent):
         """发送或引用一张图片，按当前引擎（hash/vector/auto）找出相似的原图并回传"""
-        self._maybe_start_remote_hash_refresh()  # 缓存过期才兜底刷新（幂等）
-        images = self._extract_images(event)
-        if not images:
-            yield event.plain_result(self._usage())
-            return
-        # 多图查询期间不能逐图 stop_event：AstrBot 调度器一旦看到 stopped 就会
-        # 中断当前生成器，后面的图片不会被处理。整轮结束后再统一 stop。
-        self._defer_event_stop(event, True)
-        try:
-            engine = self._engine_choice()
-            budget = self.max_images_per_query
-            if engine == "vector":
-                if not self.vector.enabled:
-                    yield event.plain_result(self.vector.config_hint())
-                    return
-                for seg in images[:budget]:
-                    self._reset_event_sent(event)
-                    async for item in self._trace_vector(event, seg):
-                        yield item
-                return
-            if engine == "auto" and self.vector.enabled:
-                for seg in images[:budget]:
-                    self._reset_event_sent(event)
-                    async for item in self._trace_auto(event, seg):
-                        yield item
-                return
-            # hash（或 auto 但向量引擎未配置）
-            if self._hash_pool_size() == 0:
-                empty_note = (
-                    "（向量引擎未启用：若图床侧已部署向量库，请检查 vector_search 配置）"
-                    if not self.vector.enabled
-                    else ""
-                )
-                yield event.plain_result(
-                    "图库还是空的：可发送 /登记原图 登记原图，"
-                    "或在插件配置 scan_dirs 填写图床目录后执行 /溯源重扫。" + empty_note
-                )
-                return
-            for seg in images[:budget]:
-                self._reset_event_sent(event)
-                async for item in self._trace_hash(event, seg):
-                    yield item
-        finally:
-            self._defer_event_stop(event, False)
-            event.stop_event()
+        async for result in self.controllers.trace.trace(event):
+            yield result
 
     # ------------------------------------------------------------------
     # 哈希引擎（原有 pHash 比对逻辑，行为保持不变）
@@ -2039,118 +2010,8 @@ class ImageTracePlugin(Star):
     @filter.command("登记原图", alias={"原图登记"})
     async def register_image(self, event: AstrMessageEvent):
         """将消息或引用中的图片作为原图登记入库（默认仅管理员）"""
-        if self._bool_cfg("register_admin_only", DEFAULT_BASIC.register_admin_only) and not event.is_admin():
-            yield event.plain_result("⛔ 仅管理员可登记原图（可在插件配置中修改）。")
-            return
-
-        images = self._extract_images(event)
-        if not images:
-            yield event.plain_result(
-                "请与图片同条消息发送 /登记原图 [备注]，或引用一张图片发送 /登记原图。"
-            )
-            return
-
-        note = self._strip_command(event.message_str, ("登记原图", "原图登记"))
-        seg = images[0]
-        local_path = ""
-        is_tmp = False
-        stored = None
-        db_saved = False
-        try:
-            resolved = await self._resolve_local(
-                seg,
-                probe=lambda path: compute_features_with_mime(path, self.hash_size),
-            )
-            local_path, is_tmp, fail_message = (
-                resolved.path,
-                resolved.is_tmp,
-                resolved.message,
-            )
-            if not local_path:
-                yield event.plain_result(fail_message)
-                return
-            size_bytes = os.path.getsize(local_path)
-            if size_bytes > self._download_limit_bytes():
-                yield event.plain_result("⚠️ 图片超过大小上限，已取消登记。")
-                return
-
-            feats = resolved.features
-            if feats is None:
-                feats = await asyncio.to_thread(compute_features, local_path, self.hash_size)
-            dup = self.library.find_by_phash(feats.phash)
-            if dup is not None:
-                yield event.plain_result(self._dup_message(dup))
-                return
-
-            stored = await self.storage.active.store(local_path)
-            row = {
-                "phash": feats.phash,
-                "dhash": feats.dhash,
-                "ahash": feats.ahash,
-                "width": feats.width,
-                "height": feats.height,
-                "file_size": size_bytes,
-                "image_url": stored.url or "",
-                "file_path": stored.file_path or "",
-                "source": "register",
-                "note": note,
-                "group_id": event.get_group_id() or "",
-                "sender_id": event.get_sender_id() or "",
-                "sender_name": event.get_sender_name() or "",
-            }
-            # 查重与插入在库方法的同一个锁区间内完成：上传期间的并发同图
-            # 登记不会产生重复行（不再依赖"检查与插入之间无 await"的约定）
-            entry_id, dup = await asyncio.to_thread(self.library.add_if_absent, row)
-            if dup is not None:
-                await self._cleanup_stored(stored)
-                yield event.plain_result(self._dup_message(dup))
-                return
-            db_saved = True
-            lines = [
-                f"✅ 已登记原图 #{entry_id}（{stored.message}）",
-                f"尺寸：{feats.width}x{feats.height}",
-            ]
-            if note:
-                lines.append(f"备注：{note}")
-            if stored.url:
-                lines.append(f"直链：{stored.url}")
-            if self.vector.enabled and self._vector_index_on_register():
-                if self._bed_mode() == MODE_CFB:
-                    # 图床侧钩子会把上传自动同步进向量库，无需插件再写一次
-                    logger.debug(
-                        "cloudflare_imgbed 模式：上传由图床侧钩子自动入库，跳过插件侧向量同步"
-                    )
-                elif not stored.url:
-                    # 本地副本模式没有可供回图的公开直链，向量命中后也无法回传
-                    logger.debug("当前图床模式没有公开直链，跳过向量同步")
-                else:
-                    try:
-                        await self.vector.upsert_file(
-                            local_path,
-                            # 内容指纹作为 point id：同图同 ID，与图床 URL 规则无关
-                            f"phash:{feats.phash}",
-                            stored.url,
-                            size_bytes,
-                            feats.width,
-                            feats.height,
-                            src=self.storage.active.src_path(stored.url),
-                            mime=resolved.mime,
-                        )
-                        lines.append("已同步至 Qdrant 向量库")
-                    except Exception as e:
-                        # 图片已上传、记录已入库，向量同步失败只是增量失败，
-                        # 不能让用户误以为整次登记失败
-                        logger.warning(f"登记原图向量同步失败: {e}")
-                        lines.append("（向量同步失败，可在图床侧触发钩子或对账补齐）")
-            yield event.plain_result("\n".join(lines))
-        except Exception as e:
-            if stored is not None and not db_saved:
-                await self._cleanup_stored(stored)
-            logger.error(f"登记原图失败: {e}", exc_info=True)
-            yield event.plain_result("⚠️ 登记失败，详情请查看机器人日志。")
-        finally:
-            if is_tmp:
-                self._remove_quiet(local_path)
+        async for result in self.controllers.register.register_image(event):
+            yield result
 
     @staticmethod
     def _dup_message(dup) -> str:
@@ -2174,40 +2035,8 @@ class ImageTracePlugin(Star):
     @filter.command("溯源状态")
     async def status(self, event: AstrMessageEvent):
         """查看图库统计与插件配置摘要"""
-        stats = self.library.stats()
-        scan_dirs = self._scan_dirs()
-        lines = [f"📚 图片溯源图库状态：共 {stats['total']} 条（索引 {stats['indexed']}）"]
-        if stats["skipped"]:
-            lines.append(
-                f"⚠️ 有 {stats['skipped']} 条因哈希精度不匹配未参与检索，"
-                "建议执行 /溯源重扫 force 重建。"
-            )
-        if stats["by_source"]:
-            lines.append(
-                "· 来源：" + "，".join(f"{k or '未知'} {v}" for k, v in stats["by_source"].items())
-            )
-        lines.append(
-            f"· pHash 精度：{self.hash_size * self.hash_size}bit（hash_size={self.hash_size}）"
-        )
-        lines.append(f"· 相似度阈值：{self.hash_threshold * 100:.0f}%")
-        lines.append(self._storage_line())
-        engine = self._engine_choice()
-        lines.append(f"· 检索引擎：{engine}（向量{'已启用' if self.vector.enabled else '未启用'}）")
-        if self.vector.enabled:
-            try:
-                vec_count = await self.vector.count()
-                count_text = f"{vec_count} 条"
-            except Exception as e:
-                # 原始错误可能包含内网地址/Key，只进日志，不进群聊
-                logger.warning(f"查询向量库点数失败: {e}")
-                count_text = "不可用（连接或鉴权异常，详情见机器人日志）"
-            lines.append(f"· 向量库：{self.vector.collection}，{count_text}")
-            lines.append(f"· Embed：{self.vector.embed_model} / {self.vector.image_input}")
-        lines.append(f"· 扫描目录：{len(scan_dirs)} 个")
-        lines.append(self._remote_hash_line())
-        lines.append(await self._weibo_status_line())
-        lines.append(f"· AI 复核：{'开' if self._bool_cfg('ai_verify', DEFAULT_BASIC.ai_verify) else '关'}")
-        yield event.plain_result("\n".join(lines))
+        async for result in self.controllers.trace.status(event):
+            yield result
 
     def _remote_hash_line(self) -> str:
         """/溯源状态 的图床哈希索引一行。
@@ -2263,167 +2092,15 @@ class ImageTracePlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def rescan(self, event: AstrMessageEvent):
         """扫描配置的本地图库目录，建立/更新索引（管理员）"""
-        try:
-            force = "force" in (event.message_str or "").lower()
-            valid_dirs = [os.path.abspath(d) for d in self._scan_dirs() if os.path.isdir(d)]
-            invalid = len(self._scan_dirs()) - len(valid_dirs)
-            if not valid_dirs:
-                yield event.plain_result(
-                    "未配置有效的扫描目录：请在插件配置 scan_dirs 中填写"
-                    "图片库/图床存储目录的绝对路径。"
-                )
-                return
-
-            # 目录遍历可能耗时很久，放到线程里避免阻塞事件循环
-            files, scanned_dirs = await asyncio.to_thread(self._collect_image_files, valid_dirs)
-            if force:
-                await asyncio.to_thread(self.library.delete_by_source, "scan")
-            known_paths = {
-                os.path.normcase(os.path.abspath(p))
-                for p in self.library.get_paths_for_source("scan")
-            }
-            # 一次性取回全部 pHash，在内存里去重，避免逐张查库；
-            # 即便跨任务并发重扫漏判，phash 唯一索引 + INSERT OR IGNORE 也能兜底
-            known_phashes = self.library.get_all_phash_hashes()
-            pending: list = []
-            added = skipped = failed = 0
-            total = len(files)
-            await event.send(
-                event.plain_result(f"开始扫描 {len(valid_dirs)} 个目录，共 {total} 张图片…")
-            )
-            concurrency = max(1, SCAN_CONCURRENCY)
-            processed = 0
-            next_report = RESCAN_PROGRESS_EVERY
-            for start in range(0, total, concurrency):
-                batch_paths = files[start : start + concurrency]
-                compute_paths = []
-                for path in batch_paths:
-                    if os.path.normcase(path) in known_paths:
-                        skipped += 1
-                    else:
-                        compute_paths.append(path)
-                if compute_paths:
-                    results = await asyncio.gather(
-                        *(
-                            asyncio.to_thread(compute_features, path, self.hash_size)
-                            for path in compute_paths
-                        ),
-                        return_exceptions=True,
-                    )
-                else:
-                    results = []
-                for path, result in zip(compute_paths, results, strict=True):
-                    if isinstance(result, asyncio.CancelledError):
-                        raise result
-                    if isinstance(result, BaseException):
-                        failed += 1
-                        logger.warning(f"扫描图片失败 {path}: {result}")
-                        continue
-                    feats = result
-                    if feats.phash in known_phashes:
-                        skipped += 1
-                        continue
-                    try:
-                        size_bytes = os.path.getsize(path)
-                    except OSError as e:
-                        failed += 1
-                        logger.warning(f"扫描图片失败 {path}: {e}")
-                        continue
-                    known_phashes.add(feats.phash)
-                    pending.append(
-                        {
-                            "phash": feats.phash,
-                            "dhash": feats.dhash,
-                            "ahash": feats.ahash,
-                            "width": feats.width,
-                            "height": feats.height,
-                            "file_size": size_bytes,
-                            "file_path": path,
-                            "source": "scan",
-                            "note": os.path.basename(path),
-                        }
-                    )
-                    # 批量写入（单事务），避免逐条提交拖慢扫描
-                    if len(pending) >= RESCAN_BATCH_SIZE:
-                        batch = list(pending)
-                        pending.clear()
-                        added += await asyncio.to_thread(
-                            self.library.add_many, batch, reload_cache=False
-                        )
-                processed += len(batch_paths)
-                if processed >= next_report:
-                    await event.send(
-                        event.plain_result(
-                            f"进度：{processed}/{total}，新增 {added + len(pending)}，"
-                            f"跳过 {skipped}，失败 {failed}"
-                        )
-                    )
-                    next_report = processed + RESCAN_PROGRESS_EVERY
-            if pending:
-                batch = list(pending)
-                pending.clear()
-                added += await asyncio.to_thread(self.library.add_many, batch, reload_cache=False)
-            if added:
-                await asyncio.to_thread(self.library.reload_cache)
-            # 只清理"本次成功遍历的目录"下的失效条目，目录临时掉线不清索引
-            removed = await asyncio.to_thread(
-                self.library.prune_scan_missing,
-                set(files),
-                set(scanned_dirs),
-            )
-            result = f"✅ 重扫完成：共 {total} 张，新增 {added}，跳过 {skipped}，失败 {failed}"
-            if removed:
-                result += f"，清理失效条目 {removed}"
-            failed_dirs = len(valid_dirs) - len(scanned_dirs)
-            if failed_dirs:
-                result += f"（注意：{failed_dirs} 个目录扫描失败已跳过）"
-            elif invalid > 0:
-                result += f"（注意：{invalid} 个配置目录无效已忽略）"
-            yield event.plain_result(result)
-        except Exception as e:
-            logger.error(f"重扫失败: {e}", exc_info=True)
-            yield event.plain_result("⚠️ 重扫失败，详情请查看机器人日志。")
+        async for result in self.controllers.admin.rescan(event):
+            yield result
 
     @filter.command("溯源删除")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def delete_entry(self, event: AstrMessageEvent, entry_id: int):
         """按编号删除图库条目（管理员）"""
-        try:
-            row = self.library.get(entry_id)
-            if row is None:
-                yield event.plain_result(f"未找到编号 #{entry_id} 的条目。")
-                return
-            await asyncio.to_thread(self.library.delete, entry_id)
-        except Exception as e:
-            logger.error(f"删除条目 #{entry_id} 失败: {e}", exc_info=True)
-            yield event.plain_result("⚠️ 删除失败，详情请查看机器人日志。")
-            return
-        notes: list = []
-        # best-effort 清理插件侧写入的向量点（同图同 ID，按内容指纹派生）；
-        # 图床侧钩子写入的点使用图床自身的 key 约定，其清理需在图床侧完成
-        if self.vector.enabled and row["phash"]:
-            try:
-                await self.vector.delete_point(f"phash:{row['phash']}")
-                notes.append("向量点已清除")
-            except Exception as e:
-                logger.warning(f"删除向量点失败 #{entry_id}: {e}")
-                notes.append("向量点清除失败（详情见日志）")
-        if row["image_url"]:
-            try:
-                if await self.storage.active.delete(row["image_url"]):
-                    notes.append("远端对象已删除")
-            except Exception as e:
-                logger.warning(f"删除远端对象失败 #{entry_id}: {e}")
-        self._remove_local_copy(row)
-        # 展示只用备注：file_path / image_url 可能含服务器目录或内网地址，
-        # 管理员命令的回执同样会进群聊，细节只写日志
-        desc = row["note"] or "无备注"
-        logger.info(
-            f"/溯源删除 #{entry_id}: note={row['note'] or ''} "
-            f"path={row['file_path'] or ''} url={row['image_url'] or ''}"
-        )
-        suffix = ("，" + "、".join(notes)) if notes else ""
-        yield event.plain_result(f"✅ 已删除 #{entry_id}（{desc}）{suffix}")
+        async for result in self.controllers.admin.delete_entry(event, entry_id):
+            yield result
 
     def _remove_local_copy(self, row) -> None:
         """删除登记流程产生的本地副本（仅限插件 images/ 目录内，绝不碰扫描目录的原图）。"""
@@ -2462,7 +2139,8 @@ class ImageTracePlugin(Star):
     @filter.command("溯源帮助")
     async def trace_help(self, event: AstrMessageEvent):
         """图片溯源插件使用帮助"""
-        yield event.plain_result(self._usage())
+        async for result in self.controllers.trace.trace_help(event):
+            yield result
 
     def _usage(self) -> str:
         return (
@@ -2493,27 +2171,19 @@ class ImageTracePlugin(Star):
     @filter.command("随机图", alias={"随机图片"})
     async def random_image(self, event: AstrMessageEvent):
         """从图床随机取一张图片并回传（可带目录，如 /随机图 风景）"""
-        settings = self._random_settings()
-        directory, parsed_type = extract_directory(event.message_str or "")
-        async for result in self._random_media_delivery(
-            event, directory, parsed_type or "image", settings
-        ):
+        async for result in self.controllers.random.random_image(event):
             yield result
 
     @filter.command("随机视频")
     async def random_video(self, event: AstrMessageEvent):
         """从图床随机取一个视频并回传（可带目录，如 /随机视频 风景）"""
-        settings = self._random_settings()
-        directory, parsed_type = extract_directory(event.message_str or "")
-        async for result in self._random_media_delivery(
-            event, directory, parsed_type or "video", settings
-        ):
+        async for result in self.controllers.random.random_video(event):
             yield result
 
     @filter.command("签到", alias={"打卡"})
     async def checkin(self, event: AstrMessageEvent):
         """每日签到，领取一张带边框与随机语句的随机缩略图"""
-        async for result in self._checkin_flow(event):
+        async for result in self.controllers.checkin.checkin(event):
             yield result
 
     @staticmethod
@@ -2535,109 +2205,8 @@ class ImageTracePlugin(Star):
     @filter.command("签到文案导入", alias={"签到文案上传"})
     async def checkin_import(self, event: AstrMessageEvent):
         """管理员：导入微博文案 CSV/MD 到插件数据目录。"""
-        if not event.is_admin():
-            yield event.plain_result("仅管理员可导入签到文案。")
-            return
-        segment = self._first_file_segment(event)
-        if segment is None:
-            yield event.plain_result(
-                "请把 CSV 或 MD 文件作为附件发送，并在同一条消息中发送 /签到文案导入。"
-            )
-            return
-        name = os.path.basename(str(getattr(segment, "name", "") or "")).strip()
-        try:
-            getter = getattr(segment, "get_file", None)
-            if callable(getter):
-                try:
-                    target = await getter(allow_return_url=True)
-                except TypeError:  # 旧版本 get_file 可能没有该关键字
-                    target = await getter()
-            else:
-                target = str(getattr(segment, "file", "") or "")
-            if not target:
-                yield event.plain_result("无法读取文件内容，请重新发送附件。")
-                return
-            if str(target).lower().startswith(("http://", "https://")):
-                data = await self._download_bytes(str(target))
-            else:
-                data = await asyncio.to_thread(read_bytes, str(target))
-        except Exception as exc:
-            logger.warning(f"签到文案导入读取失败: {exc}")
-            yield event.plain_result(f"读取文件失败：{sanitize_error_text(exc)}")
-            return
-        if len(data) > 4 * 1024 * 1024:
-            yield event.plain_result("文件超过 4MB，请拆分后再导入。")
-            return
-        try:
-            text = data.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            try:
-                text = data.decode("utf-8")
-            except UnicodeDecodeError:
-                yield event.plain_result("文件不是 UTF-8 编码，无法解析。")
-                return
-        extension = os.path.splitext(name)[1].lower()
-        if extension not in {".csv", ".md", ".markdown"}:
-            first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
-            if "序号" in first_line and "发布时间" in first_line:
-                extension = ".csv"
-            elif first_line.startswith("# 微博原创文案"):
-                extension = ".md"
-            else:
-                yield event.plain_result(
-                    "无法识别文件格式：只支持 CSV（序号,发布时间,来源,文案,微博链接）"
-                    "或微博原创文案 MD 导出。"
-                )
-                return
-        base = os.path.basename(name) or f"weibo_import_{secrets.token_hex(4)}{extension}"
-        base = base.replace("/", "_").replace("\\", "_").strip()
-        if not base or base in {".", ".."} or not base.lower().endswith(
-            (".csv", ".md", ".markdown")
-        ):
-            base = f"weibo_import_{secrets.token_hex(4)}{extension}"
-        parsed = parse_weibo_text(text, base)
-        if not parsed:
-            yield event.plain_result("未解析到任何微博文案，请检查文件内容。")
-            return
-        try:
-            await asyncio.to_thread(os.makedirs, self.weibo_dir, exist_ok=True)
-            final_path = os.path.join(self.weibo_dir, base)
-            temp_path = f"{final_path}.tmp"
-
-            def write_text() -> None:
-                with open(temp_path, "w", encoding="utf-8") as handle:
-                    handle.write(text)
-                os.replace(temp_path, final_path)
-
-            await asyncio.to_thread(write_text)
-        except OSError as exc:
-            logger.warning(f"签到文案导入写入失败: {exc}")
-            yield event.plain_result(f"写入失败：{sanitize_error_text(exc)}")
-            return
-        self._weibo_posts_cache = None
-        self._weibo_meta_cache = {}
-        self._weibo_signature = None
-        accounts = sorted({post.account for post in parsed})
-        dates = sorted({post.date for post in parsed})
-        account_text = "、".join(accounts[:5]) + ("…" if len(accounts) > 5 else "")
-        date_text = f"{dates[0][:4]}-{dates[0][4:6]}-{dates[0][6:]}" if dates else "-"
-        if dates and dates[-1] != dates[0]:
-            date_text += f" ~ {dates[-1][:4]}-{dates[-1][4:6]}-{dates[-1][6:]}"
-        map_path = self._weibo_map_path()
-        map_note = "映射表未生成：签到时会按同账号同日图片回退，建议运行 scripts/build_weibo_map.py。"
-        if os.path.isfile(map_path):
-            map_posts, _generated, map_meta = await asyncio.to_thread(load_post_map, map_path)
-            if map_is_stale(map_path, self.weibo_dir):
-                map_note = "源文件已更新，映射表比源文件旧；请重新运行 scripts/build_weibo_map.py。"
-            else:
-                map_note = (
-                    f"映射表：{len(map_posts)} 条，可配对 "
-                    f"{int(map_meta.get('matched_count') or 0)} 条。"
-                )
-        yield event.plain_result(
-            f"✅ 已导入 {base}：{len(parsed)} 条文案，账号 {account_text}，"
-            f"日期 {date_text}。\n{map_note}"
-        )
+        async for result in self.controllers.checkin.checkin_import(event):
+            yield result
 
     def _imgbed_base(self) -> str:
         """/原图 直查用的图床站点地址（取第一个配置完整的）。
@@ -2954,19 +2523,8 @@ class ImageTracePlugin(Star):
 
         只管历史，**不动图床**：前缀从来不是图床里的真实文件，脏的只是本地键。
         """
-        cleaned = self._repair_history_keys()
-        if not cleaned:
-            yield event.plain_result(
-                "✅ 会话历史里没有带前缀的脏记录，无需修复。\n"
-                "（前台提示文案本插件从不写入文件，无需清理）"
-            )
-            return
-        logger.info(f"/原图修复 清理了 {cleaned} 条带前缀的会话历史键")
-        yield event.plain_result(
-            f"✅ 已清理 {cleaned} 条带前缀的会话历史记录。\n"
-            "现在可以重新「引用那张图 + /原图」取原图了；"
-            "若仍取不到，再引用一次 /随机图 刚发出的图重试。"
-        )
+        async for result in self.controllers.original.original_repair(event):
+            yield result
 
     def _repair_history_keys(self) -> int:
         """把会话历史里带装饰前缀的键改名成干净形态；返回处理条数。
@@ -2980,94 +2538,7 @@ class ImageTracePlugin(Star):
     @filter.command("原图")
     async def original_image(self, event: AstrMessageEvent):
         """重发最近回传过的图片的原图；也可直接按文件名到图床取（/原图 风景.jpg）"""
-        session = self._session_key(event)
-        query = self._strip_command(event.message_str or "", ("原图",)).strip(" \t:：,，")
-        name = ""
-        url = ""
-        # 引用图里的**原始**直链/名字：保留 `thumbnails/` 路径段，供缩略图判定与
-        # 反查使用（反查要拼出与 Qdrant payload 同形的完整缩略图直链）
-        quoted = ""
-        # 取值来源，只用于日志：历史命中 / 按名直查 / 缩略图反查。
-        # 线上排查时「/原图 到底走了哪条路」是最关键的一条信息，而历史命中
-        # 这条最常见、却原本一行日志都不打，导致日志里完全看不到命令执行过。
-        source = "history"
-        if query:
-            status, payload = self.history.find(session, query)
-            if status == "ambiguous":
-                candidates = "、".join(payload[:5])
-                yield event.plain_result(f"匹配到多张图片，请写出更完整的文件名：{candidates}")
-                return
-            if status == "found":
-                name, url = payload
-            else:
-                # 历史没命中时 query 会退化成**直查图床的文件名/相对路径**，此时它
-                # 可能自带装饰前缀——最常见的是用户从配文里复制粘贴（配文是
-                # `🖼️ 名字`，复制过来就带了 `🖼️ `）。不清洗就会拼出
-                # `/file/🖼️%20名字` 而必然 404。命中历史的分支无需清洗：
-                # 历史键本就是干净文件名（1.6.1 起写入时即已清洗）。
-                #
-                # 这里用 strip_leading_decoration 而**不是** clean_display_name：
-                # 后者靠 media_filename 取末段，会把用户手写的多级相对路径
-                # （`7、综艺节目/…/海报.jpg`）削成裸文件名——图床按裸名取不到，
-                # 于是「用户给足了信息反而查不到」。前者原地剥前缀、保住目录。
-                query = strip_leading_decoration(query) or query
-        else:
-            latest = self.history.latest(session)
-            if latest is not None:
-                name, url = latest
-            else:
-                # 会话里没有回传记录：退化为「按消息/引用图里的文件名直查图床」
-                quoted = self._first_image_candidate(event)
-                query = clean_display_name(quoted) or ""
-
-        if not url:
-            if not query:
-                yield event.plain_result(self._original_usage())
-                return
-            source = "lookup"
-            name, url, message = await self._lookup_imgbed_file(query, quoted=quoted)
-            if not url:
-                yield event.plain_result(message)
-                return
-        elif is_thumbnail_url(url):
-            # 兜底：历史里若因任何原因（旧版本写入、外部注入）存进了缩略图直链，
-            # 也要在发出前反查回原图。正常路径下历史记的是原图（见 _yield_delivery
-            # 的 remember_blocks），这里是防御，不依赖上游一定正确。
-            original_name, original_url = await self._original_from_thumbnail(
-                self._bed_file_id(url) or name
-            )
-            if original_url:
-                logger.info(f"/原图 历史命中缩略图，已反查回原图: {url} -> {original_url}")
-                name, url = original_name, original_url
-                source = "history-thumb-reverse"
-            else:
-                yield event.plain_result(
-                    f"本会话记录的「{name}」是缩略图，且查不到它对应的原图；"
-                    "可先用 /溯源 命中该图后再发 /原图。"
-                )
-                return
-        # R6：/原图 只发 URL、不落地字节——剥离 ImgBed 处理参数还原未处理原文件，
-        # 并强制 url 通道 + 禁用本地回退
-        final_url = build_original_url(url)
-        # 最后一次校验：走到这里说明上游每一条路径都「自认为」拿到的是原图，
-        # 但只要最终直链仍指向缩略图目录，就绝不能发出去——静默发出一张 720px
-        # 小图，用户只会觉得「/原图 又没生效」，比明确报错难排查得多。
-        if is_thumbnail_url(final_url):
-            logger.warning(f"/原图 最终直链仍是缩略图，已拒绝发送: {final_url}")
-            yield event.plain_result(
-                f"取到的「{name}」仍是图床里的缩略图直链，已中止发送；"
-                "请改用原图文件名，或先 /溯源 命中该图后再发 /原图。"
-            )
-            return
-        logger.info(f"/原图 发出（来源={source}）: {name} <- {final_url}")
-        block = {"url": final_url, "file_name": name}
-        async for result in self._yield_delivery(
-            event,
-            f"🖼️ {name}（原图）",
-            [block],
-            mode_override="url",
-            allow_local_fallback=False,
-        ):
+        async for result in self.controllers.original.original_image(event):
             yield result
 
     async def _random_media_delivery(
@@ -4299,15 +3770,9 @@ class ImageTracePlugin(Star):
             directory(string): 目录路径，指定从哪个目录获取随机媒体，可选。
             content_type(string): 内容类型，可选值为 image 或 video，可选。
         """
-        settings = self._random_settings()
-        if not settings["enable_llm"]:
-            yield event.plain_result("LLM 调用随机媒体已被禁用，请使用 /随机图 或 /随机视频 命令")
-            return
-        parsed_directory, parsed_type = extract_directory(event.message_str or "")
-        if directory is None and parsed_directory:
-            directory = parsed_directory
-        content_type = (parsed_type or content_type or "image").strip().lower()
-        async for result in self._random_media_delivery(event, directory, content_type, settings):
+        async for result in self.controllers.random.send_random_media(
+            event, directory, content_type
+        ):
             yield result
 
     # ------------------------------------------------------------------

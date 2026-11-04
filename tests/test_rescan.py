@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-from astrbot_plugin_image_trace import main as main_module
+from astrbot_plugin_image_trace.controllers import admin as admin_module
 
 
 def _fake_features_factory(lock: threading.Lock, state: dict):
@@ -46,7 +46,8 @@ async def test_rescan_runs_bounded_concurrency_and_dedupes_phash(
 
     lock = threading.Lock()
     state = {"active": 0, "peak": 0}
-    monkeypatch.setattr(main_module, "compute_features", _fake_features_factory(lock, state))
+    # 重扫已迁到 controllers.admin，patch 点随之移动（断言不变）
+    monkeypatch.setattr(admin_module, "compute_features", _fake_features_factory(lock, state))
 
     plugin = make_plugin(scan_dirs=[str(scan_dir)])
     event = make_event("/溯源重扫")
