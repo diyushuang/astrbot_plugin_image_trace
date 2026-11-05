@@ -16,7 +16,7 @@ from pathlib import Path
 PLUGIN_NAME = "astrbot_plugin_image_trace"
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 # 运行时代码包：新增子包时只改这里
-RUNTIME_PACKAGES = ("config", "controllers", "delivery", "media", "search", "storage")
+RUNTIME_PACKAGES = ("config", "controllers", "delivery", "media", "search", "services", "storage")
 # 非代码运行所需文件：新增/删除时只改这里
 DATA_FILES = (
     "CHANGELOG.md",
