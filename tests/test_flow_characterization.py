@@ -15,6 +15,7 @@ import pytest
 from PIL import Image as PILImage
 
 from astrbot_plugin_image_trace import main as main_module
+from astrbot_plugin_image_trace.image_delivery import build_imgbed_file_url
 from astrbot_plugin_image_trace.library import MatchResult
 from astrbot_plugin_image_trace.random_media import RandomMediaError
 from astrbot_plugin_image_trace.search.base import SearchOutcome
@@ -357,9 +358,7 @@ async def test_lookup_imgbed_file_directory_name_uses_bed_path(make_plugin, monk
         original_by_file_name=should_not_lookup,
         original_info_for_thumb_name=should_not_lookup,
     )
-    candidate = main_module.build_imgbed_file_url(
-        plugin._imgbed_base(), "风景/海边.jpg"
-    )
+    candidate = build_imgbed_file_url(plugin._imgbed_base(), "风景/海边.jpg")
 
     async def fake_probe(url, *_args, **_kwargs):
         assert url == candidate
@@ -378,7 +377,7 @@ async def test_lookup_imgbed_file_directory_name_uses_bed_path(make_plugin, monk
 async def test_lookup_imgbed_file_probe_failure_still_returns_url(make_plugin, monkeypatch):
     """探测结果未知（网络异常）不拦，仍把直链交给回传。"""
     plugin = _bed_plugin(make_plugin)
-    candidate = main_module.build_imgbed_file_url(plugin._imgbed_base(), "海边.jpg")
+    candidate = build_imgbed_file_url(plugin._imgbed_base(), "海边.jpg")
 
     async def unknown_probe(_url, *_args, **_kwargs):
         return None, None

@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import contextlib
 import hashlib
 import io
 import os
@@ -58,7 +57,7 @@ if __package__ in (None, ""):
         _sys.modules[_pkg_name] = _pkg
     __package__ = _pkg_name
 
-from .checkin_card import DEFAULT_QUOTES, QuoteLibrary, compose_poster, strip_emoji
+from .checkin_card import QuoteLibrary, compose_poster, strip_emoji
 from .checkin_store import CheckinStore
 from .common import (
     AI_VERIFY_MAX_CANDIDATES,
@@ -124,8 +123,6 @@ from .delivery import (
 )
 from .features import (
     avif_available,
-    compute_features,
-    compute_features_with_mime,
     heif_available,
     image_bytes_ok,
     image_file_ok,
@@ -139,7 +136,6 @@ from .image_delivery import (
     CompressionEvidence,
     DeliveryTarget,
     SendOutcome,
-    build_imgbed_file_url,
     build_original_url,
     build_scaled_url,
     choose_qq_upload_channel,
@@ -168,21 +164,22 @@ from .media.image_source import (
 from .media_history import MediaHistory
 from .random_media import (
     RandomMediaClient,
-    RandomMediaError,
     clean_display_name,
     is_thumbnail_url,
     media_filename,
-    media_kind,
-    pick_default_directory,
     swap_url_origin,
 )
 from .search import (
     AutoSearchEngine,
     HashSearchEngine,
-    QueryImage,
-    SearchHit,
     VectorSearchEngine,
     miss_message,
+)
+from .services import (
+    CheckinService,
+    OriginalService,
+    RandomService,
+    TraceService,
 )
 from .storage import StorageRegistry
 from .url_guard import read_limited_bytes
@@ -350,6 +347,22 @@ class ImageTracePlugin(Star):
         logger.info(
             f"图片溯源插件已加载，当前图库共 {self.library.count()} 条，"
             f"引擎={engine} {vector_note}{bucket_note}{cache_note}"
+        )
+
+        # R1：业务流程服务。服务只接收 host 门面，不反向 import main；
+        # 原有 self._xxx 委托仍保留，测试的 monkeypatch 点不变。
+        self.services = SimpleNamespace(
+            trace=TraceService(
+                host=self,
+                bool_cfg=lambda key, default=None: self._bool_cfg(key, default),
+            ),
+            checkin=CheckinService(
+                host=self,
+                checkin_settings=lambda: self._checkin_settings(),
+                random_settings=lambda: self._random_settings(),
+            ),
+            random=RandomService(host=self),
+            original=OriginalService(host=self),
         )
 
     # ------------------------------------------------------------------
@@ -1507,317 +1520,43 @@ class ImageTracePlugin(Star):
         """候选行括注（实现已迁到 search.hash_engine，保留同名薄委托）。"""
         return HashSearchEngine.candidate_note(match)
 
-    async def _trace_hash(
-        self, event: AstrMessageEvent, seg, resolved: ResolvedImage | None = None
-    ) -> AsyncGenerator:
-        """哈希检索；resolved 供 auto 引擎复用已解析的本地文件（含清理责任）。
+    async def _trace_hash(self, event: AstrMessageEvent, seg, resolved: ResolvedImage | None=None) -> AsyncGenerator:
+        # R1：流程主体在 services/trace.py，main 只留同名薄委托。
+        async for result in self.services.trace._trace_hash(event, seg, resolved):
+            yield result
 
-        resolved 为 ResolvedImage（可能已带 features/MIME）；传了它表示调用方
-        已解析过这张图，本方法不负责删除临时文件（由调用方统一清理）。
-        """
-        top_n = self.top_n
-        owns_temp = resolved is None
-        if resolved is None:
-            resolved = await self._resolve_local(
-                seg,
-                probe=lambda path: compute_features_with_mime(path, self.hash_size),
-            )
-        local_path = resolved.path
-        try:
-            if not local_path:
-                yield event.plain_result(resolved.message)
-                return
-
-            feats = resolved.features
-            if feats is None:
-                feats = await asyncio.to_thread(compute_features, local_path, self.hash_size)
-            # 至少取回 5 条候选：即便 top_n 配置为 0/较小值，AI 复核也需要
-            # 足够的候选池才能剔除误报
-            hits, candidate_lines = await asyncio.to_thread(
-                self._merged_hash_candidates, feats.phash, max(5, top_n)
-            )
-            async for result in self._hash_outcome_delivery(
-                event, local_path, hits, candidate_lines
-            ):
-                yield result
-        except Exception as e:
-            logger.error(f"图片溯源处理失败: {e}", exc_info=True)
-            yield event.plain_result("⚠️ 处理图片时出错，详情请查看机器人日志。")
-        finally:
-            if owns_temp and resolved is not None and resolved.is_tmp:
-                self._remove_quiet(resolved.path)
-
-    async def _hash_outcome_delivery(
-        self, event: AstrMessageEvent, query_path: str, hits: list, candidate_lines: list
-    ) -> AsyncGenerator:
-        """哈希候选的统一渲染：AI 复核（仅哈希腿）→ 命中回传或未命中提示。"""
-        if hits and self._bool_cfg("ai_verify", DEFAULT_BASIC.ai_verify):
-            hits = await self._ai_verify(query_path, hits)
-
-        if hits:
-            async for result in self._hash_hit_result(event, hits[0]):
-                yield result
-            return
-
-        yield event.plain_result(
-            self._miss_message(
-                f"❌ 图库中未找到相似度达标的原图（阈值 {self.hash_threshold * 100:.0f}%）。",
-                candidate_lines,
-            )
-        )
+    async def _hash_outcome_delivery(self, event: AstrMessageEvent, query_path: str, hits: list, candidate_lines: list) -> AsyncGenerator:
+        # R1：流程主体在 services/trace.py，main 只留同名薄委托。
+        async for result in self.services.trace._hash_outcome_delivery(event, query_path, hits, candidate_lines):
+            yield result
 
     async def _hash_hit_result(self, event: AstrMessageEvent, best) -> AsyncGenerator:
-        """把一条哈希命中渲染成回复（本地腿与图床腿共用）。
-
-        两腿的差异只有两处：展示名（本地用备注、图床用文件名）与路径来源
-        （本地文件 vs 远端直链）。其余展示与回传逻辑完全一致，故合并到一处，
-        免得日后改一处漏一处。
-        """
-        title = f"✅ 溯源命中（相似度 {best.similarity * 100:.1f}%）#{best.id}"
-        label = self._candidate_note(best)
-        if label:
-            title += f" · {label}"
-        lines = []
-        if best.width and best.height:
-            lines.append(f"尺寸：{best.width}x{best.height}")
-        if best.created_at:
-            lines.append(f"入库时间：{best.created_at}")
-        block = {"text": " · ".join(lines)}
-        if best.width and best.height:
-            # 供回传计划判断是否需要图床缩放，以及压缩标识是否成立
-            block["width"] = best.width
-            block["height"] = best.height
-        if best.file_size and best.file_size > 0:
-            # 入库时记录的原图体积：回传计划据此免探测原图体积
-            block["size_bytes"] = int(best.file_size)
-        if best.image_url:
-            block["url"] = best.image_url
-        elif best.file_path and os.path.isfile(best.file_path):
-            block["path"] = best.file_path
-        if "url" in block or "path" in block:
-            async for result in self._yield_delivery(event, title, [block]):
-                yield result
-        else:
-            # 本地路径/图床直链都可能暴露服务器目录或内网地址，只进日志
-            logger.warning(
-                f"哈希命中 #{best.id} 的原图不可用: "
-                f"{best.file_path or best.image_url or '未知路径'}"
-            )
-            yield event.plain_result(
-                f"{title}，但原图文件已不存在或无法访问（详情见机器人日志）。"
-            )
+        # R1：流程主体在 services/trace.py，main 只留同名薄委托。
+        async for result in self.services.trace._hash_hit_result(event, best):
+            yield result
 
     # ------------------------------------------------------------------
     # 向量引擎
     # ------------------------------------------------------------------
 
-    async def _vector_search_one(self, event, seg, resolved: ResolvedImage | None = None):
-        """单图向量检索。返回 (kind, item)：hit / miss / nofile / error。
-
-        hit/miss/nofile 时 item 为可直接 yield 的结果对象；error 时 item 为错误说明字符串。
-
-        resolved 供 auto 引擎复用已解析的本地文件：传了它（ResolvedImage）就不再
-        重复下载/解码，且临时文件由调用方统一清理；其中的 MIME 会直接交给
-        embed_file，省掉为同一张图再取一次格式的解码。
-        """
-        owns_temp = resolved is None
-        if resolved is None:
-            resolved = await self._resolve_local(seg, probe=self._probe_mime)
-        try:
-            if not resolved.path:
-                return "nofile", event.plain_result(resolved.message)
-            outcome = await self._vector_engine().search_outcome(
-                QueryImage(path=resolved.path, mime=resolved.mime)
-            )
-            if outcome.kind == "hit":
-                return "hit", self._vector_hits_delivery(event, outcome.hits)
-            if outcome.kind == "miss":
-                return "miss", event.plain_result(outcome.miss_text)
-            return "error", outcome.error
-        finally:
-            if owns_temp and resolved.is_tmp:
-                self._remove_quiet(resolved.path)
+    async def _vector_search_one(self, event, seg, resolved: ResolvedImage | None=None):
+        # R1：流程主体在 services/trace.py，main 只留同名薄委托。
+        return await self.services.trace._vector_search_one(event, seg, resolved)
 
     async def _trace_vector(self, event: AstrMessageEvent, seg) -> AsyncGenerator:
-        """严格向量引擎：只用向量库，出错直接提示。"""
-        kind, item = await self._vector_search_one(event, seg)
-        if kind == "error":
-            yield event.plain_result(f"⚠️ 向量检索引擎错误：{item}")
-        elif kind == "hit":
-            async for result in item:
-                yield result
-        else:
-            yield item
+        # R1：流程主体在 services/trace.py，main 只留同名薄委托。
+        async for result in self.services.trace._trace_vector(event, seg):
+            yield result
 
     async def _trace_auto(self, event: AstrMessageEvent, seg) -> AsyncGenerator:
-        """auto 引擎：向量优先，未命中或引擎不可用时回退哈希。
+        # R1：流程主体在 services/trace.py，main 只留同名薄委托。
+        async for result in self.services.trace._trace_auto(event, seg):
+            yield result
 
-        图片只解析一次：解析时用 compute_features_with_mime 同时完成格式校验与
-        感知特征，向量腿拿 MIME、哈希腿拿 features，两边都不再为同一张图重复
-        解码。临时文件由这里的 finally 统一清理（下游收到 resolved 时不再删除）。
-        """
-        resolved = await self._resolve_local(
-            seg,
-            probe=lambda path: compute_features_with_mime(path, self.hash_size),
-        )
-        if not resolved.path:
-            yield event.plain_result(resolved.message)
-            return
-        try:
-            feats = resolved.features
-            if feats is None:
-                feats = await asyncio.to_thread(
-                    compute_features, resolved.path, self.hash_size
-                )
-            outcome = await self._auto_engine().search_outcome(
-                QueryImage(path=resolved.path, mime=resolved.mime, phash=feats.phash)
-            )
-            vector = outcome.vector
-            if vector.kind == "hit":
-                async for result in self._vector_hits_delivery(event, vector.hits):
-                    yield result
-                return
-            if vector.kind == "nofile":
-                yield event.plain_result(resolved.message)
-                return
-            if vector.kind == "miss":
-                yield event.plain_result(vector.miss_text)
-                if outcome.hash is None:
-                    yield event.plain_result("（哈希图库为空，无兜底可执行）")
-                    return
-                yield event.plain_result("尝试哈希比对：")
-            else:  # error
-                logger.info(f"auto 引擎回退哈希：{vector.error}")
-                if outcome.hash is None:
-                    yield event.plain_result(
-                        "⚠️ 向量引擎不可用，且哈希图库为空，无兜底可执行。"
-                        "可发送 /登记原图 或执行 /溯源重扫 建库。"
-                    )
-                    return
-                yield event.plain_result("⚠️ 向量引擎不可用，改用哈希比对：")
-            async for item in self._hash_outcome_delivery(
-                event,
-                resolved.path,
-                outcome.hash.hits,
-                outcome.hash.candidate_lines,
-            ):
-                yield item
-        finally:
-            if resolved.is_tmp:
-                self._remove_quiet(resolved.path)
-
-    async def _vector_hits_delivery(
-        self, event: AstrMessageEvent, hits: list
-    ) -> AsyncGenerator:
-        """构造向量命中的去重回传请求。
-
-        先发一条纯文本命中提示，再把全部相似图合并进单独一条消息：第二条走
-        _yield_delivery 的统一入口（一条消息含多图），逐图配文由 mark_compressed
-        按各回传路径的实际压缩情形写入，因此不再重复命中提示标题。
-        """
-        # SearchHit 保留原始 Qdrant dict 于 raw；这里复原成旧结构，投递语义不变。
-        hits = [
-            hit.raw if isinstance(hit, SearchHit) and isinstance(hit.raw, dict) else hit
-            for hit in hits
-        ]
-        total_hits = sum(int(hit.get("duplicate_count") or 1) for hit in hits)
-        duplicate_count = total_hits - len(hits)
-        multi = len(hits) > 1
-        if duplicate_count:
-            logger.info(
-                "向量命中去重：原始 %d 张，合并重复 %d 张，回传 %d 张",
-                total_hits,
-                duplicate_count,
-                len(hits),
-            )
-        for hit in hits:
-            duplicates = hit.get("duplicates") or []
-            if not duplicates:
-                continue
-            payload = hit.get("payload") or {}
-            display_name = payload.get("file_name") or str(hit.get("id"))
-            duplicate_ids = "、".join(str(item.get("id")) for item in duplicates)
-            logger.info(
-                "向量命中去重：保留 %s（%s），合并重复 %d 张（%s）",
-                display_name,
-                hit.get("id"),
-                len(duplicates),
-                duplicate_ids,
-            )
-
-        if multi:
-            header = f"✅ 向量检索命中 {len(hits)} 张（按相似度降序），图片发送可能有延迟"
-        else:
-            header = (
-                f"✅ 向量检索命中（相似度 {hits[0]['score'] * 100:.1f}%），"
-                "图片发送可能有延迟"
-            )
-
-        blocks = []
-        for idx, hit in enumerate(hits, 1):
-            payload = hit.get("payload") or {}
-            file_name = payload.get("file_name") or str(hit.get("id")).rsplit("/", 1)[-1]
-            fields = []
-            if multi:
-                fields.append(f"相似度 {hit['score'] * 100:.1f}%")
-            width, height = payload.get("width"), payload.get("height")
-            if width and height:
-                fields.append(f"{width}x{height}")
-            if payload.get("created_at"):
-                fields.append(str(payload["created_at"]))
-            prefix = f"{idx}." if multi else ""
-            block = {
-                "prefix": prefix,
-                "file_name": str(file_name or ""),
-                "fields": fields,
-            }
-            if width and height:
-                # 供回传计划判断是否需要图床缩放，以及压缩标识是否成立
-                block["width"] = width
-                block["height"] = height
-            size_bytes = self._known_bytes(payload)
-            if size_bytes:
-                # 图床侧钩子（img-indexer）入库时已记录原图体积，直接用：
-                # 回传计划因此不必再探测原图尺寸，省一次往返与一次图床处理
-                block["size_bytes"] = size_bytes
-            image_url = str(payload.get("image_url") or "")
-            if image_url:
-                block["url"] = image_url
-            else:
-                block["fields"].append("该条目没有可用直链，可能已被删除")
-            blocks.append(block)
-        prompt_via_onebot = False
-        prompt_task = None
-        if self._can_send_via_onebot(event):
-            # 提示与图片并行发出：提示只走一次 call_action，串行 await 会让图片
-            # 晚一个完整往返才起步。两条消息都在同一条 OneBot 连接上按顺序下发，
-            # 提示先入队，正常情况下仍先到达。
-            prompt_task = asyncio.create_task(self._send_prompt(event, header))
-        else:
-            yield event.plain_result(header)
-        try:
-            async for result in self._yield_delivery(event, "", blocks, mark_compressed=True):
-                yield result
-            if prompt_task is not None:
-                # 只为 stop_event 决策等待提示结果；图片可能已经交付，不再回滚。
-                prompt_via_onebot = await prompt_task
-                prompt_task = None
-                if not prompt_via_onebot:
-                    # 协议端明确拒绝提示（FAILED）：图片可能已发，但标题不能丢，
-                    # 改走标准消息链补发一次纯文本
-                    yield event.plain_result(header)
-        finally:
-            # 投递层异常或消费者提前退出时回收提示任务，避免留下悬挂任务。
-            if prompt_task is not None:
-                prompt_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await prompt_task
-        # 提示用 OneBot 原生发出（图片那条未必）时，仍按旧语义停事件；若图片
-        # 那条也走了 OneBot，_yield_delivery 已停过，这里重复调用无副作用。
-        # 多图溯源期间由 trace 统一延迟 stop，否则管道会在首图后中断生成器。
-        # 放在 yield 之后：第二条消息已经交付，停事件不会把它吞掉。
-        if prompt_via_onebot and not self._defer_event_stop(event):
-            event.stop_event()
+    async def _vector_hits_delivery(self, event: AstrMessageEvent, hits: list) -> AsyncGenerator:
+        # R1：流程主体在 services/trace.py，main 只留同名薄委托。
+        async for result in self.services.trace._vector_hits_delivery(event, hits):
+            yield result
 
     @staticmethod
     def _is_negative_answer(text: str) -> bool:
@@ -2126,260 +1865,29 @@ class ImageTracePlugin(Star):
             "· 引用一张图发送 /原图 —— 按该图文件名到图床取原图"
         )
 
-    async def _reverse_original(self, fetch, *, action: str, level: str = "warning") -> tuple[str, str]:
-        """执行一次原图反查，返回 (payload 原名, 还原后的原图直链)。
-
-        三个反查入口（缩略图直链 / 缩略图名 / 裸文件名）共用这段“不可用判定 →
-        调用 → 异常只记日志 → 取 url → 按原图口径剥离处理参数”的骨架；各自的
-        展示名回退顺序不同，留在调用点处理，避免把三种文案揉进一个函数。
-        查不到/不可用一律返回 ("", "")，永不抛错。
-        """
-        if not self.vector.qdrant_ready:
-            return "", ""
-        try:
-            info = await fetch()
-        except Exception as exc:  # 反查方法自身已兜错，这里再保一层
-            getattr(logger, level)(f"{action}失败: {exc}")
-            return "", ""
-        if not isinstance(info, dict):
-            return "", ""
-        original = str(info.get("url") or "").strip()
-        if not original:
-            return "", ""
-        return str(info.get("file_name") or "").strip(), build_original_url(original)
+    async def _reverse_original(self, fetch, *, action: str, level: str='warning') -> tuple[str, str]:
+        # R1：流程主体在 services/original.py，main 只留同名薄委托。
+        return await self.services.original._reverse_original(fetch, action=action, level=level)
 
     async def _original_from_thumbnail(self, thumb_ref: str) -> tuple[str, str]:
-        """把「指向缩略图的直链或名字」换成它对应的原图 (名称, 直链)。
-
-        为什么必须在这里拦：`/原图` 的直查分支只会拿一个名字去拼
-        `{base}/file/{name}`。当这个名字来自「用户引用了上一条 /随机图 发出的
-        缩略图」时，它指向 `thumbnails/`，拼出来必然命中缩略图，于是
-        `/原图` 忠实地把 720px 小图又发了一遍——线上报的故障就是这个。
-
-        反查走 Qdrant：缩略图与原图落在**同一个点**上（payload 里
-        `thumb_url` 与 `image_url` 并存），按 thumb_url 即可取回原图。
-        这里特意**不按名字倒推点 id**——缩略图被图床改过名（前置毫秒时间戳、
-        `@` 换 `_`），倒推做不到。
-
-        **host 差异由反查侧吸收，这里不强行归一化**。实测该部署的 payload：
-            thumb_url = http://10.0.0.5:7658/file/thumbnails/178965…_【微博_…】.jpg
-            image_url = http://10.0.0.5:7658/file/12%E3%80%81…%E5%89%A7%E7%85%A7.jpg
-        两者都记**内网 IP**；而插件运行期手上的直链可能来自公网反代
-        `bed.example.com`（OpenResty → `10.0.0.6:8080`，同一图床）。故这里只把
-        编码形态还原成原始形态（`unquote`，缩略图那侧存的是**未编码**串），
-        实际匹配交给 `original_info_for_thumb`：它先试整串、再退回按 `/file/`
-        之后的**对象键**匹配，从而与 host 无关。
-
-        查不到时返回 ("", "")，调用方据此给出可读提示；宁可说「找不到」，也
-        绝不把缩略图当原图发出去。
-        """
-        if not self.vector.qdrant_ready:
-            return "", ""
-        reference = str(thumb_ref or "").strip()
-        if not reference:
-            return "", ""
-        base = self._imgbed_base()
-        # 统一成「与 payload 同形」的完整缩略图直链：
-        # 1) 有站点前缀就直接用；2) 只有路径段则补上前缀；3) 两者都无则作罢
-        if reference.lower().startswith(("http://", "https://")):
-            full = reference
-        elif base:
-            full = f"{base}/file/{reference.lstrip('/')}"
-        else:
-            return "", ""
-        # 关键：还原到**原始未编码**形态（payload.thumb_url 就是这么存的），
-        # 同时去掉可能残留的处理参数（width/height/fit/fallback）
-        thumb_url = unquote(build_original_url(full))
-        display, url = await self._reverse_original(
-            lambda: self.vector.original_info_for_thumb(thumb_url),
-            action="缩略图反查原图",
-        )
-        if not url:
-            return "", ""
-        # 展示名**必须**优先取 payload 里的 file_name：缩略图名的 `@`→`_` 不可逆，
-        # 光清洗缩略图名还原不出真名（实测 payload.file_name 才是原始名）
-        return display or clean_display_name(url) or clean_display_name(reference) or "", url
+        # R1：流程主体在 services/original.py，main 只留同名薄委托。
+        return await self.services.original._original_from_thumbnail(thumb_ref)
 
     async def _original_from_thumb_name(self, name: str) -> tuple[str, str]:
-        """按「缩略图改名后的文件名」反查原图 (名称, 直链)；查不到返回 ("", "")。
+        # R1：流程主体在 services/original.py，main 只留同名薄委托。
+        return await self.services.original._original_from_thumb_name(name)
 
-        与 `_original_from_thumbnail` 的分工：那个认**带 `thumbnails/` 段**的直链，
-        这个只认**文件名**，用于目录段已经在流转中丢掉的场景（QQ 把机器人发的图
-        转存到自己的 CDN 后，插件拿到的只有裸文件名）。两者都是反查，返回的都
-        是同一个 Qdrant 点上的原图直链。
-
-        展示名取 payload.file_name（图床登记真名，`@` 完好）；反查失败返回空，
-        由调用方继续走裸名探测与可读提示——**绝不把缩略图当原图发出去**。
-        """
-        if not self.vector.qdrant_ready:
-            return "", ""
-        query = str(name or "").strip()
-        if not query:
-            return "", ""
-        display, url = await self._reverse_original(
-            lambda: self.vector.original_info_for_thumb_name(query),
-            action="按缩略图名反查原图",
-            level="debug",
-        )
-        if not url:
-            return "", ""
-        return display or clean_display_name(url) or query, url
-
-    async def _lookup_imgbed_file(self, name: str, *, quoted: str = "") -> tuple[str, str, str]:
-        """按文件名到图床直查原图，返回 (名称, 直链, 失败提示)。
-
-        **查询顺序：先向量库按名反查，再退回裸名拼 URL + 探测。** 反查在前是
-        必须的，不是优化：图床的 `/file/{path}` 只认**完整对象键**（含各级目录），
-        裸文件名拼上去**必然 404**。线上报的
-
-            图床里没有找到「【微博@潮流合伙人】20200207-04：赵今麦海报.jpg」
-
-        就是这个：原图实际在 `/file/7、综艺节目/爱奇艺《潮流合伙人》/《潮流合伙人》
-        图集/` 下面，而插件拼的是 `/file/【微博@潮流合伙人】…jpg`。实测 A/B：
-        裸名 404 / 带目录 200（内网与公网域名结果一致）。Qdrant 的 payload
-        `image_url` 正是入库时登记的**带完整目录**的权威直链，拿名字反查它即可。
-
-        反查非「恰好 1 命中」时（同名文件在多目录下有副本、或该图未进索引）不硬猜，
-        退回原有的裸名拼 URL + 探测逻辑：那一步虽然对多级目录无能为力，但对
-        「图床根目录下的文件」以及**用户直接给完整相对路径**的情形仍然有效，
-        且探测结果能给出可读提示。
-
-        探测为「确定不存在」（4xx）时返回空直链并给出提示，同时附上尝试过的
-        完整直链，便于用户核对图床里的目录层级；探测结果未知（网络异常）不拦，
-        仍把直链交给回传——网络抖动不该被当成「图床没有这张图」。
-
-        name 指向缩略图时（`thumbnails/...`，典型来自引用上一条随机图消息）先
-        反查真正的原图直链再返回，绝不把缩略图当原图交付。quoted 是引用图里的
-        **原始直链**（保留 `thumbnails/` 段），有它时优先用它反查——name 可能
-        已被清洗掉时间戳前缀，而 strip 之后的形态与 Qdrant 里存的并不完全一致。
-        """
-        base = self._imgbed_base()
-        if not base:
-            return (
-                "",
-                "",
-                "未配置图床站点地址：请在「图床设置」（cloudflare_imgbed）或「随机图」里"
-                "填写站点地址后重试，或先 /溯源 命中再发 /原图。",
-            )
-        # 判定要用「原始引用直链」与「名字」两者：任一指明 thumbnails/ 都算命中
-        if is_thumbnail_url(quoted) or is_thumbnail_url(name):
-            original_name, original_url = await self._original_from_thumbnail(quoted or name)
-            if original_url:
-                logger.info(
-                    f"/原图 直查命中缩略图，已反查回原图: {quoted or name} -> {original_url}"
-                )
-                return original_name, original_url, ""
-            return (
-                "",
-                "",
-                f"「{name}」是图床里的缩略图，且查不到它对应的原图；"
-                "请改用原图文件名，或先 /溯源 命中该图后再发 /原图。",
-            )
-        # ① 先按文件名反查：拿回入库时登记的、**带完整目录**的权威直链。
-        #    这一步解决「裸名拼 URL 必然 404」——图床 /file/ 只认完整对象键。
-        #    注意判据是 `found[1]` 而**不是** `if found:`：`_original_by_name`
-        #    以 `("", "")` 表示落空，而**非空元组恒为真**——写成 `if found:`
-        #    会在落空时也走进来，直接返回空直链（调用方拿到空 url 会当成
-        #    「查不到」），恰好把兜底路径②整个跳过。这是个静默错误：
-        #    没有异常、没有日志，只是所有直查都失效。
-        found = await self._original_by_name(name)
-        if found[1]:
-            original_name, original_url = found
-            logger.info(f"/原图 按名反查命中原图: {name} -> {original_url}")
-            return original_name, original_url, ""
-        # ①.5 名字本身是「缩略图被改名后的文件名」时，按缩略图名反查原图。
-        #     这一段要放在 ② 之前：这类名字（`1789…_【微博_…】.jpg`）在图床里
-        #     只存在于 `thumbnails/` 下，裸名拼 URL 必然 404，探测只会给出
-        #     「图床里没有找到」这种让人白核对的提示。
-        #
-        #     为什么 ① 拦不住它：① 按 payload.file_name 精确匹配，而缩略图名
-        #     被图床改过（前置毫秒时间戳、`@` 换成 `_`，且 `_` 不可逆）。
-        #     为什么 quoted 也可能拦不住：用户引用机器人消息时，QQ 会把图转存到
-        #     自己的 CDN，插件手上的直链里**没有 `thumbnails/` 段**，
-        #     `is_thumbnail_url` 只能返回 False，于是走到这里。
-        #
-        #     只对「裸文件名」生效：入参自带目录时（`/原图 目录/海报.jpg`）说明
-        #     用户给的是**原图路径**，而缩略图名反查只按 basename 比对，会把别的
-        #     目录下同名缩略图的原图当成本次要取的文件——比查不到更糟。
-        thumb_hit = ("", "")
-        if "/" not in name:
-            thumb_hit = await self._original_from_thumb_name(name)
-        if thumb_hit[1]:
-            original_name, original_url = thumb_hit
-            logger.info(f"/原图 按缩略图名反查回原图: {name} -> {original_url}")
-            return original_name, original_url, ""
-        # ② 反查未命中（未进索引 / 同名多份 / 向量检索关闭）→ 退回裸名拼 URL + 探测，
-        #    对根目录文件与「用户直接给完整相对路径」两种情形仍然管用
-        candidate = build_imgbed_file_url(base, name)
-        if not candidate:
-            return (
-                "",
-                "",
-                f"「{name}」不像图床里的文件名，无法直接取原图；"
-                "可先用 /溯源 命中该图后再发 /原图。",
-            )
-        exists, _length = await self._probe_url(candidate)
-        if exists is False:
-            # 落空原因不同，提示必须不同：库里压根没这个名字（未进索引）时让用户
-            # 去 /溯源；而同名多份且内容不同时图是**确实存在**的，报「图床里没有
-            # 找到」只会让人白核对一遍。命中数只在失败路径上多查一次。
-            matches = await self._file_name_matches(name)
-            if matches and matches > 1:
-                return (
-                    "",
-                    "",
-                    f"「{name}」在图库里有 {matches} 份同名文件且内容不同，"
-                    "无法确定你要哪一张。请带上目录再试（如："
-                    f"/原图 目录名/{name}）。",
-                )
-            # 失败文案只带路径、不带主机：图床地址可能配置成内网 IP/内网域名，
-            # 群聊里不应出现；完整直链留在日志，便于管理员核对。
-            candidate_path = unquote(urlsplit(candidate).path)
-            logger.info(f"/原图 图床直查未命中: {name} -> {candidate}")
-            return "", "", f"图床里没有找到「{name}」，已尝试路径：{candidate_path}"
-        return name, candidate, ""
+    async def _lookup_imgbed_file(self, name: str, *, quoted: str='') -> tuple[str, str, str]:
+        # R1：流程主体在 services/original.py，main 只留同名薄委托。
+        return await self.services.original._lookup_imgbed_file(name, quoted=quoted)
 
     async def _file_name_matches(self, name: str) -> int | None:
-        """问向量库「这个名字有几个点」；用于失败文案的诊断，查不到返回 None。
-
-        对齐库内 `VectorEngine.file_name_matches`——本方法存在的意义只是把
-        「引擎未启用 / 异常」收敛成 None，让调用方不必到处判 self.vector。
-        """
-        if not self.vector.qdrant_ready:
-            return None
-        try:
-            return await self.vector.file_name_matches(name)
-        except Exception as exc:  # 诊断失败不能影响原本的失败提示
-            logger.debug(f"同名命中数诊断失败: {exc}")
-            return None
+        # R1：流程主体在 services/original.py，main 只留同名薄委托。
+        return await self.services.original._file_name_matches(name)
 
     async def _original_by_name(self, name: str) -> tuple[str, str]:
-        """按裸文件名到向量库反查原图 (名称, 直链)；查不到返回 ("", "")。
-
-        与 `_original_from_thumbnail` 的区别：那个按**缩略图直链**反查（用于拦
-        「引用随机图发出来的图」），这个按**文件名**反查（用于 `/原图 文件名`
-        这条「没有历史、只有名字」的路径）。
-
-        名字里可能只有裸文件名，而图床里它在多级目录下——payload.image_url 存的
-        是入库时的完整直链，故必须由库来告诉我们目录，不能靠猜。
-
-        跳过 name 自带目录（含 `/`）的情形：那说明调用方已经拿到了相对路径，
-        直接交给图床按路径取更准，不必多此一举反查（反查只匹配裸 file_name，
-        带目录的名字在这一步本来就命中不了）。
-
-        展示名用 payload.file_name（图床登记真名，`@` 完好），比入参更可信。
-        本方法**永不抛错**：反查只是获取目录层级的捷径，失败由调用方走兜底。
-        """
-        query = str(name or "").strip()
-        if not query or "/" in query or not self.vector.qdrant_ready:
-            return "", ""
-        display, url = await self._reverse_original(
-            lambda: self.vector.original_by_file_name(query),
-            action="按文件名反查原图",
-        )
-        if not url:
-            return "", ""
-        return display or query, url
+        # R1：流程主体在 services/original.py，main 只留同名薄委托。
+        return await self.services.original._original_by_name(name)
 
     @filter.command("原图修复")
     async def original_repair(self, event: AstrMessageEvent):
@@ -2416,152 +1924,18 @@ class ImageTracePlugin(Star):
         async for result in self.controllers.original.original_image(event):
             yield result
 
-    async def _random_media_delivery(
-        self, event: AstrMessageEvent, directory, content_type: str, settings: dict
-    ):
-        """取一条随机媒体并回传。
+    async def _random_media_delivery(self, event: AstrMessageEvent, directory, content_type: str, settings: dict):
+        # R1：流程主体在 services/random.py，main 只留同名薄委托。
+        async for result in self.services.random._random_media_delivery(event, directory, content_type, settings):
+            yield result
 
-        图片走 _yield_delivery（复用全局通道：auto / bytes / url / url-scaled /
-        native），视频走标准消息链 Video.fromURL；无法识别类型时回退纯文本
-        直链。同域 http 直链先升级为 https，减少协议端一次跳转。
-        """
-        # 未指定目录时回退到配置的 default_dir 池：图床若设置了
-        # randomImageAPI.allowedDir，不带 dir 的裸 /random 会被判为「目录不允许」
-        # 而 403，故由客户端补一个目录；池有多项时随机取其一，以尽量覆盖整库。
-        target_dir = str(directory or "").strip() or pick_default_directory(settings)
-        try:
-            media_url = await self._random_client().fetch(target_dir, content_type)
-        except RandomMediaError as exc:
-            logger.warning(f"获取随机媒体失败: {exc}")
-            yield event.plain_result(
-                f"⚠️ 获取随机媒体失败：{sanitize_error_text(exc)}"
-            )
-            return
-        lan_hosts = self._lan_url_hosts(settings)
-        if lan_hosts:
-            # 内网直连：床内直链统一改写为内网源（/random 直链可能已是内网源，
-            # 改写幂等；公网域名形式的直链也一并收进来），后续取字节不出公网
-            media_url = swap_url_origin(media_url, settings["lan_base_url"], lan_hosts)
-        media_url = upgrade_to_https(media_url, settings["base_url"])
-        target = self._delivery_target(event)
-        kind = media_kind(media_url, content_type)
-        if kind == "video":
-            # 官方机器人等平台把视频 URL 交给腾讯服务器拉流，内网地址它访问
-            # 不到，须换回公网直链；换不出来（第三方内网地址等）就保持原样，
-            # 与图片 URL 上传共用同一套换源判定（_public_media_url）
-            send_url = media_url
-            if target.offbox_upload:
-                send_url = self._public_media_url(media_url, settings) or media_url
-            caption = self._random_caption(media_url, "video", settings)
-            yield event.chain_result([Comp.Plain(caption), Comp.Video.fromURL(send_url)])
-            return
-        if kind == "image":
-            send_url, original_url, original_name = await self._random_image_from_media(
-                media_url, settings
-            )
-            # 配文一律用**原图**名并清洗掉图床改名的前缀（时间戳 + `@` 换 `_`），
-            # 显示缩略图名对用户没有意义
-            caption = self._random_caption(
-                original_url, "image", settings, display_name=original_name
-            )
-            # qq_official 等平台的假格式体检已下沉到 _yield_delivery 统一处理
-            blocks = [
-                {
-                    "url": send_url,
-                    "file_name": original_name or clean_display_name(original_url) or "",
-                }
-            ]
-            async for result in self._yield_delivery(
-                event,
-                caption,
-                blocks,
-                remember_blocks=(
-                    blocks if send_url == original_url else [{"url": original_url}]
-                ),
-            ):
-                yield result
-            return
-        yield event.plain_result(f"随机媒体获取成功：{media_url}")
+    async def _random_image_candidate(self, directory, settings: dict, *, thumbnail: bool | None=None) -> tuple[str, str, str]:
+        # R1：流程主体在 services/random.py，main 只留同名薄委托。
+        return await self.services.random._random_image_candidate(directory, settings, thumbnail=thumbnail)
 
-    async def _random_image_candidate(
-        self, directory, settings: dict, *, thumbnail: bool | None = None
-    ) -> tuple[str, str, str]:
-        """取一张随机图并归一为 (发送直链, 原图直链, 原图权威名)。
-
-        /签到 与 /随机图 共用这段「取图 → 内网改写/HTTPS 升级 → 缩略图反查 →
-        选发送态」链路。抽出来是为了让「发缩略图、历史留原图」的口径只存在
-        一份：任何一处改动都不会让两条命令各自漂移。
-
-        thumbnail 只覆盖「这次发哪张」，默认 None 表示沿用
-        random_media.send_thumbnail；/签到 传 checkin.image_mode 换算的布尔值，
-        因此两个功能同链路、异配置，互不影响。
-
-        失败抛 RandomMediaError，由调用方给出可读提示。
-        """
-        # 未指定目录时回退到配置的 default_dir 池：图床若设置了
-        # randomImageAPI.allowedDir，不带 dir 的裸 /random 会被判为「目录不允许」
-        # 而 403，故由客户端补一个目录；池有多项时随机取其一，以尽量覆盖整库。
-        target_dir = str(directory or "").strip() or pick_default_directory(settings)
-        media_url = await self._random_client().fetch(target_dir, "image")
-        lan_hosts = self._lan_url_hosts(settings)
-        if lan_hosts:
-            # 内网直连：床内直链统一改写为内网源（/random 直链可能已是内网源，
-            # 改写幂等；公网域名形式的直链也一并收进来），后续取字节不出公网
-            media_url = swap_url_origin(media_url, settings["lan_base_url"], lan_hosts)
-        media_url = upgrade_to_https(media_url, settings["base_url"])
-        return await self._random_image_from_media(media_url, settings, thumbnail=thumbnail)
-
-    async def _random_image_from_media(
-        self, media_url: str, settings: dict, *, thumbnail: bool | None = None
-    ) -> tuple[str, str, str]:
-        """把随机到的图片直链归一为 (发送直链, 原图直链, 原图权威名)。
-
-        发送用缩略图替身、历史留原图：QQ 侧下载小图更快，sendMsg 回执超时
-        概率显著下降；而 /原图 仍能凭历史里的原图直链取回全尺寸文件。
-
-        thumbnail 覆盖「这次发哪张」：None=沿用 random_media.send_thumbnail；
-        False 时直接把原图当发送态（/签到 的 original 模式），历史仍记原图。
-
-        边界：图床的 /random 若被指到 thumbnails/ 目录（default_dir 配错或
-        用户显式传了该目录），media_url 本身就是缩略图。此时别再查替身
-        （缩略图没有替身），并把「原图」口径定为反查结果，避免历史里记进
-        缩略图直链、导致 /原图 之后只能拿回小图。
-        """
-        lan_hosts = self._lan_url_hosts(settings)
-        original_url = media_url
-        original_name = ""
-        if is_thumbnail_url(media_url):
-            info = None
-            try:
-                normalized = unquote(build_original_url(media_url))
-                info = await self.vector.original_info_for_thumb(normalized)
-            except Exception as exc:  # 反查失败不影响发送，按原样处理
-                logger.debug(f"随机图反查原图失败（按原样处理）: {exc}")
-            if info and info.get("url"):
-                original_url = info["url"]
-                if lan_hosts:
-                    # Qdrant 反查回的是公网直链，内网直连模式下同样改写
-                    original_url = swap_url_origin(
-                        original_url, settings["lan_base_url"], lan_hosts
-                    )
-                # 真名取自 payload.file_name（图床没改过名的原始名）
-                original_name = str(info.get("file_name") or "").strip()
-            else:
-                # 2026-10-20 排查实录：反查失败的原因有多种——引擎未配置、
-                # Qdrant 请求失败、数据未命中——后两者各有 DEBUG 记录（线上
-                # 默认 INFO 看不到），而「引擎未配置」历史上完全静默，导致
-                # warning 里看不出任何线索、跨实例排查只能逐台实测。把引擎
-                # 状态直接写进 warning：未配置 → 给配置指引；缺 embed（此时
-                # 反查仍可用）→ 说明只影响以图搜图；配置齐全 → 指向 DEBUG。
-                if not self.vector.qdrant_ready:
-                    hint = "向量引擎未配置，请在插件配置 vector_search 一节补齐"
-                elif not self.vector.enabled:
-                    hint = "向量引擎缺 embed 配置（反查仍可用，仅以图搜图不可用）"
-                else:
-                    hint = "原因见 DEBUG 日志"
-                logger.warning(f"随机图命中的是缩略图且反查不到原图（{hint}）: {media_url}")
-        send_url = await self._random_send_url(original_url, settings, thumbnail=thumbnail)
-        return send_url, original_url, original_name
+    async def _random_image_from_media(self, media_url: str, settings: dict, *, thumbnail: bool | None=None) -> tuple[str, str, str]:
+        # R1：流程主体在 services/random.py，main 只留同名薄委托。
+        return await self.services.random._random_image_from_media(media_url, settings, thumbnail=thumbnail)
 
     # ------------------------------------------------------------------
     # 指令：每日签到（随机图 + 边框语句卡片，取图/呈现各有一档开关）
@@ -2827,205 +2201,14 @@ class ImageTracePlugin(Star):
             return None
         return post, send_url, original_url, image.file_name, local_thumb
 
-    async def _deliver_checkin(
-        self,
-        event: AstrMessageEvent,
-        header: str,
-        quote: str,
-        footer: str,
-        send_url: str,
-        original_url: str,
-        block_name: str,
-        settings: dict,
-        *,
-        quote_max_lines: int = 3,
-        simple_text: str = "",
-        card_source: str = "",
-    ):
-        """签到统一交付：card 合成失败自动退回 simple；两类签到共用。
-
-        card_source 供微博模式传本地预缓存缩略图路径；它只在
-        ``checkin.image_mode=thumbnail`` 时可当合成源（原图模式要求用原图），
-        否则按 ``_checkin_card_source`` 现查——合成用小图，不能拿 send_url 兜底
-        （它可能是原图）。
-
-        ``checkin.show_quote`` 关掉时（只要美图 + 签到信息）：卡片不画语句区，
-        轻量模式的正文也只留 header / simple_text，不再拼 💬 那一行。
-        """
-        show_quote = bool(settings.get("show_quote", True))
-        remember = (
-            [{"url": original_url, "file_name": block_name}] if original_url else []
-        )
-        if settings["render_mode"] == "card":
-            source = card_source if settings["image_mode"] == "thumbnail" else ""
-            if not source:
-                source = await self._checkin_card_source(
-                    send_url, original_url, settings
-                )
-            path = await self._checkin_card_path(
-                source,
-                quote if show_quote else "",
-                footer,
-                settings,
-                quote_max_lines=quote_max_lines,
-            )
-            if path:
-                try:
-                    async for result in self._yield_delivery(
-                        event,
-                        header,
-                        [{"path": path, "file_name": block_name}],
-                        # 卡片已是成品 JPEG：交给适配器原样发送，避免二次压缩
-                        mode_override="native",
-                        allow_local_fallback=False,
-                        remember_blocks=remember,
-                    ):
-                        yield result
-                finally:
-                    self._remove_quiet(path)
-                return
-            logger.warning("签到卡片合成失败，改用轻量模式")
-        text = simple_text or header
-        if show_quote and quote:
-            text = f"{text}\n💬 {quote}"
-        async for result in self._yield_delivery(
-            event,
-            text,
-            [{"url": send_url, "file_name": block_name}],
-            remember_blocks=remember,
-        ):
+    async def _deliver_checkin(self, event: AstrMessageEvent, header: str, quote: str, footer: str, send_url: str, original_url: str, block_name: str, settings: dict, *, quote_max_lines: int=3, simple_text: str='', card_source: str=''):
+        # R1：流程主体在 services/checkin.py，main 只留同名薄委托。
+        async for result in self.services.checkin._deliver_checkin(event, header, quote, footer, send_url, original_url, block_name, settings, quote_max_lines=quote_max_lines, simple_text=simple_text, card_source=card_source):
             yield result
 
     async def _checkin_flow(self, event: AstrMessageEvent):
-        """签到主流程：判定 → 取图 → 取句 → 卡片/轻量交付。
-
-        签到记录先落库、再取图：取图失败不回收当天资格，避免接口抖动时用户
-        反复重试刷图；提示文案会明确说明「已签到但取图失败」。同一天重复签到
-        不再累加天数，但仍重新取图取句，让每次都有新内容。
-        """
-        settings = self._checkin_settings()
-        if not settings["enabled"]:
-            yield event.plain_result("每日签到功能已在插件配置中关闭。")
-            return
-        if self.checkin_store is None:
-            yield event.plain_result("签到存储不可用（数据库初始化失败），详情请查看机器人日志。")
-            return
-        user_id = str(event.get_sender_id() or "").strip()
-        if not user_id:
-            yield event.plain_result("无法识别发送者，签到失败。")
-            return
-
-        today = self._checkin_today(settings["utc_offset_hours"])
-        try:
-            outcome = await asyncio.to_thread(self.checkin_store.check_in, user_id, today)
-        except Exception as exc:
-            logger.error(f"签到记录写入失败: {exc}")
-            yield event.plain_result("签到记录写入失败，请稍后再试。")
-            return
-        # 昵称（checkin.show_sender）同时进消息文字与卡片页脚；取不到就整行省略。
-        name = self._checkin_sender_name(event) if settings["show_sender"] else ""
-        who = f"{name} " if name else ""
-        if outcome.already:
-            header = (
-                f"📅 {who}今日已签到 · 连续 {outcome.streak} 天"
-                f"（累计 {outcome.total} 天）"
-            )
-        else:
-            header = (
-                f"✅ {who}签到成功 · 连续 {outcome.streak} 天"
-                f"（累计 {outcome.total} 天）"
-            )
-
-        random_settings = self._random_settings()
-
-        # 微博模式：映射表里已有「文案 → 图库图片」，签到只读本地 JSON + 内网缩略图。
-        # 任何一步失败都不把异常抛回事件管线，直接继续走下面的随机语句回退。
-        if settings["mode"] == "weibo":
-            try:
-                candidate = await self._weibo_candidate(
-                    random_settings, image_mode=settings["image_mode"]
-                )
-            except Exception as exc:
-                logger.warning(f"微博签到取图失败，回退随机语句: {exc}")
-                candidate = None
-            if candidate is not None:
-                post, send_url, original_url, image_name, local_thumb = candidate
-                # show_quote=False 时整段文案都不进卡片/消息，只留「美图 + 签到信息」
-                quote = post.text if settings["show_quote"] else ""
-                footer = (
-                    f"{post.account_display} · {post.date_display}\n"
-                    f"{self._checkin_line(name, outcome)}"
-                )
-                block_name = (
-                    clean_display_name(image_name)
-                    or image_name
-                    or clean_display_name(original_url)
-                    or "今日签到"
-                )
-                simple_text = (
-                    f"{header}\n📝 {post.account_display} · {post.date_display}"
-                )
-                async for result in self._deliver_checkin(
-                    event,
-                    header,
-                    quote,
-                    footer,
-                    send_url,
-                    original_url,
-                    block_name,
-                    settings,
-                    quote_max_lines=5,
-                    simple_text=simple_text,
-                    card_source=local_thumb,
-                ):
-                    yield result
-                return
-            logger.debug("微博文案暂无可配图片，回退随机图 + 随机语句")
-
-        try:
-            # 签到的取图口径来自 checkin.image_mode，与 random_media.send_thumbnail
-            # 各管各的：这里显式传布尔值，/随机图 那条仍走配置默认。
-            send_url, original_url, original_name = await self._random_image_candidate(
-                "", random_settings, thumbnail=settings["image_mode"] != "original"
-            )
-        except Exception as exc:
-            # RandomMediaError 之外还可能有网络/解析等未预期异常：签到不能因此
-            # 把异常抛回 AstrBot 事件管线，统一降级为可读提示（URL/内网地址脱敏）
-            logger.warning(f"签到取图失败: {exc}")
-            safe_exc = sanitize_error_text(exc)
-            if outcome.already:
-                yield event.plain_result(
-                    f"📅 今天已经签到过（连续 {outcome.streak} 天），但取图失败：{safe_exc}"
-                )
-            else:
-                yield event.plain_result(
-                    f"✅ 签到成功（连续 {outcome.streak} 天），但取图失败：{safe_exc}"
-                )
-            return
-
-        if settings["show_quote"]:
-            try:
-                quote = await self._quote_library().pick()
-            except Exception as exc:
-                # 语句文件损坏/非 UTF-8/接口构造失败都不该让签到整体失败
-                logger.warning(f"签到语句获取失败，使用内置语句: {exc}")
-                quote = random.choice(DEFAULT_QUOTES)
-        else:
-            # 关掉文字时不取句：省掉一次在线接口请求，卡片也没有文字区可画
-            quote = ""
-        footer = self._checkin_line(name, outcome)
-        block_name = original_name or clean_display_name(original_url) or "今日签到"
-        async for result in self._deliver_checkin(
-            event,
-            header,
-            quote,
-            footer,
-            send_url,
-            original_url,
-            block_name,
-            settings,
-            quote_max_lines=3,
-        ):
+        # R1：流程主体在 services/checkin.py，main 只留同名薄委托。
+        async for result in self.services.checkin._checkin_flow(event):
             yield result
 
     @staticmethod
