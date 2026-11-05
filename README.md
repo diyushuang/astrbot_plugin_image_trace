@@ -464,7 +464,7 @@ QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条
 ## 项目结构与开发
 
 <details>
-<summary><b>模块职责与关键约束（47 个 Python 模块，点击展开）</b></summary>
+<summary><b>模块职责与关键约束（48 个 Python 模块，点击展开）</b></summary>
 
 依赖方向以 `main` → 各子模块为主；少量子模块复用既有能力（`hash_index` → `features` / `library`，`vector_search` / `media_history` → `random_media`，`image_bed` → `s3_store`），通用件（`common` / `http_client` / `url_guard`）被子模块共享。
 
@@ -488,7 +488,7 @@ QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条
 | `common.py` | 配置解析工具与共享常量 | 真值表/常量只在此维护一份，各模块不得自备 |
 | `controllers/` | 指令处理器：trace / register / original / random / checkin / admin | 不得反向 import `main`；插件实例、服务与配置门面由构造函数注入 |
 | `config/` | 配置门面、类型化默认值、旧布局迁移 | 配置键默认值只在 `config/typed.py` 维护；旧键迁移须幂等 |
-| `delivery/` | 发送请求/结果类型、纯计划器、字节级原语与 OneBot/QQ 官方/消息链通道 | 计划器不触网；五条发送不变量由通道执行层保证 |
+| `delivery/` | 投递编排服务（去重/建请求/offbox 前置/计划/选通道/记账）、发送请求/结果类型、纯计划器、字节级原语与 OneBot/QQ 官方/消息链通道 | 计划器不触网；五条发送不变量由 `service.py` 编排与通道执行层共同保证 |
 | `services/` | 业务流程服务：溯源检索 / 签到 / 随机图 / 原图查找 | 通过构造注入的 host 门面访问依赖，不得反向 import `main`；`main` 只留同名薄委托 |
 | `media/` | 图片来源解析（本地文件、URL、下载兜底） | 出网必须经 `url_guard` |
 | `search/` | hash / vector / auto 三种检索引擎 | auto 的「向量优先、失败回退哈希」只在此实现 |
@@ -517,7 +517,7 @@ QQ 官方接口上传图片有三条路，AstrBot 适配器默认只用第一条
 - 配置解析使用 `common.as_int` / `as_float` / `truthy` / `is_blank`，不要写 `value or default`（会把合法的 0 / False 吞掉）；
 - 涉及 SQLite 或大文件复制的调用若出现在 async 上下文，应包 `asyncio.to_thread`；
 - 群聊回复文案保持脱敏：含内网地址 / Key 的错误细节只进日志，不进群聊；
-- 发布包按单点清单打包 **54 个文件**（47 个 `.py` + `README.md` / `CHANGELOG.md` / `metadata.yaml` / `requirements.txt` / `_conf_schema.json` / `LICENSE` / `logo.png`），不含 `.git`、`data/`、会话状态目录与测试；代码清单由 `scripts/build_release.py` 自动扫描根目录 `*.py` 与 `RUNTIME_PACKAGES` 下全部 `*.py` 生成，**新增子包改 `RUNTIME_PACKAGES`、新增数据文件改 `DATA_FILES`**，否则安装后会 `ImportError`；
+- 发布包按单点清单打包 **55 个文件**（48 个 `.py` + `README.md` / `CHANGELOG.md` / `metadata.yaml` / `requirements.txt` / `_conf_schema.json` / `LICENSE` / `logo.png`），不含 `.git`、`data/`、会话状态目录与测试；代码清单由 `scripts/build_release.py` 自动扫描根目录 `*.py` 与 `RUNTIME_PACKAGES` 下全部 `*.py` 生成，**新增子包改 `RUNTIME_PACKAGES`、新增数据文件改 `DATA_FILES`**，否则安装后会 `ImportError`；
 - 测试与开发配置在仓库内（`tests/`、`pytest.ini`、`ruff.toml`、`dev_requirements.txt`），不进入发布包；提交流程由 `.github/workflows/ci.yml` 在 Python 3.10 / 3.12 上跑 `ruff check .` 与 `pytest -q`（本地等价命令需在仓库根执行）；
 - 提交前确认 `metadata.yaml` 的 `version` 使用无 `v` 前缀的 SemVer，并与 `CHANGELOG.md`、README 徽章一致。
 

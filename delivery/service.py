@@ -20,6 +20,7 @@ yield；直发 / 上传接管成功时没有可 yield 的内容。
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
@@ -34,6 +35,25 @@ from .types import (
 )
 
 
+@dataclass(frozen=True)
+class DeliveryHooks:
+    """入口一次性收集的 host 门面调用点。
+
+    原先编织逻辑在分支里零散回取 ``host._xxx``；集中成显式钩子后，服务对 main
+    的依赖只有这一张清单。钩子在 ``deliver`` 入口读取（晚于测试的 monkeypatch），
+    因此 patch 点全部继续生效。
+    """
+
+    target: object
+    remember_blocks: object
+    offbox_pipeline: object
+    url_delivery_plan: object
+    remove_quiet: object
+    already_sent: object
+    mark_sent: object
+    defer_stop: object
+
+
 class EventGuard:
     """事件级记账：去重、标记已发送、按需 stop_event。
 
@@ -42,20 +62,20 @@ class EventGuard:
     此时只记账不 stop，避免管道在首图后中断当前处理器。
     """
 
-    def __init__(self, host, event: AstrMessageEvent) -> None:
-        self._host = host
+    def __init__(self, event: AstrMessageEvent, hooks: DeliveryHooks) -> None:
         self._event = event
+        self._hooks = hooks
 
     def already_sent(self) -> bool:
-        return bool(self._host._event_already_sent(self._event))
+        return bool(self._hooks.already_sent(self._event))
 
     def mark_sent(self) -> None:
-        self._host._mark_event_sent(self._event)
+        self._hooks.mark_sent(self._event)
 
     def finish_direct(self) -> None:
         """直发 / 上传接管已送达：记账并按需 stop_event。"""
         self.mark_sent()
-        if not self._host._defer_event_stop(self._event):
+        if not self._hooks.defer_stop(self._event):
             self._event.stop_event()
 
 
@@ -67,6 +87,20 @@ class DeliveryService:
         # 配置门面注入：main 传入的读取器仍指向 main 薄委托，因此既有
         # monkeypatch(plugin._delivery_config) 的用例继续生效。
         self.delivery_config = delivery_config
+
+    def _hooks(self) -> DeliveryHooks:
+        """在服务入口一次性读取 host 上的全部依赖点。"""
+        host = self.host
+        return DeliveryHooks(
+            target=host._delivery_target,
+            remember_blocks=host._remember_blocks,
+            offbox_pipeline=host._offbox_pipeline,
+            url_delivery_plan=host._url_delivery_plan,
+            remove_quiet=host._remove_quiet,
+            already_sent=host._event_already_sent,
+            mark_sent=host._mark_event_sent,
+            defer_stop=host._defer_event_stop,
+        )
 
     async def deliver(
         self,
@@ -81,13 +115,14 @@ class DeliveryService:
     ) -> AsyncGenerator:
         """按通道选主路径，失败后逐级回退；语义与旧 ``_yield_delivery`` 一致。"""
         host = self.host
-        guard = EventGuard(host, event)
+        hooks = self._hooks()
+        guard = EventGuard(event, hooks)
         if guard.already_sent():
             logger.warning("本次事件已投递过图片，跳过重复投递")
             return
 
-        target = host._delivery_target(event)
-        host._remember_blocks(
+        target = hooks.target(event)
+        hooks.remember_blocks(
             event, blocks if remember_blocks is None else remember_blocks
         )
         request = DeliveryRequest(
@@ -106,7 +141,7 @@ class DeliveryService:
                 # 第三方转存平台的两个前置动作（格式体检 → 上传通道接管）收在一个
                 # 入口里：前者可能把假格式换成 path/缩略图 URL，后者必须拿着改写后
                 # 的 block 才能判断该走 URL 还是分片，顺序不可交换
-                blocks, handled = await host._offbox_pipeline(
+                blocks, handled = await hooks.offbox_pipeline(
                     event, header, blocks, mark_compressed=mark_compressed
                 )
                 request.blocks = blocks
@@ -148,7 +183,7 @@ class DeliveryService:
                 event=event, request=request, plan=plan, image_blocks=image_blocks
             )
             if plan.direct_ok:
-                url_plan = await host._url_delivery_plan(
+                url_plan = await hooks.url_delivery_plan(
                     image_blocks,
                     max_side,
                     mode,
@@ -184,7 +219,7 @@ class DeliveryService:
             if guard.already_sent():
                 return
             if url_plan is None:
-                url_plan = await host._url_delivery_plan(
+                url_plan = await hooks.url_delivery_plan(
                     image_blocks,
                     max_side,
                     mode,
@@ -201,4 +236,4 @@ class DeliveryService:
             # 生成器被消费完/关闭时执行：此时消息已由 OneBot 直发或由 respond
             # stage 发完，删除转码产物是安全的
             for owned in owned_paths:
-                host._remove_quiet(owned)
+                hooks.remove_quiet(owned)

@@ -29,6 +29,10 @@ class DeliveryResult:
     outcome 沿用三态词表：sent / unknown / failed；额外 skipped 表示本批
     无需发送（例如没有图片且链里也没有文字）。
     fallback_reason 仅当 outcome == failed 且调用方允许换通道时填写。
+
+    sent_count 是「批量投递次数」而非图片张数：OneBot 一条消息可以携带多图，
+    通道无法在发送前逐图确认到达，故送达时记为 1、失败为 0。现有调用方都未
+    读取该值；保持批量语义，避免为语义漂亮引入不可验证的逐图计数。
     """
 
     outcome: str = "failed"
