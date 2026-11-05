@@ -378,6 +378,33 @@ async def test_failure_falls_back_before_anything_sent(make_plugin, make_event, 
     assert api.calls == []
 
 
+async def test_failure_after_first_send_never_hands_back(
+    make_plugin, make_event, monkeypatch
+):
+    """不变量 5：只要已经发过一张，后续失败绝不再交回原逻辑，避免重发。"""
+    plugin = make_plugin(qq_upload={"mode": "bytes", "on_failure": "fallback"})
+    event, api = _qq_event(make_event)
+    attempts: list[int] = []
+
+    async def flaky(*_args, **_kwargs):
+        attempts.append(len(attempts) + 1)
+        if len(attempts) == 1:
+            return {"file_uuid": "media-1"}
+        raise RuntimeError("第二张上传失败")
+
+    monkeypatch.setattr(plugin, "_qq_upload_block", flaky)
+
+    handled = await plugin._qq_upload_takeover(
+        event, "标题", [{"url": "https://a/1.jpg"}, {"url": "https://a/2.jpg"}]
+    )
+
+    assert handled is True
+    assert len(attempts) == 2
+    assert api.calls[0][1]["msg_type"] == 7
+    assert api.calls[-1][1]["msg_type"] == 0
+    assert "图片发送失败" in api.calls[-1][1]["content"]
+
+
 async def test_failure_notify_sends_text_instead(make_plugin, make_event, monkeypatch):
     """on_failure=notify：不交回，回一条纯文本说明。"""
     plugin = make_plugin(qq_upload={"mode": "bytes", "on_failure": "notify"})
