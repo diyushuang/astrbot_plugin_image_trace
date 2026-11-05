@@ -110,14 +110,10 @@ from .controllers import (
     TraceController,
 )
 from .delivery import (
-    ChainChannel,
-    DeliveryConfig,
     DeliveryContext,
-    DeliveryProfile,
     DeliveryRequest,
-    OneBotChannel,
+    DeliveryService,
     QQOfficialChannel,
-    plan_delivery,
 )
 from .delivery.primitives import (
     local_compress_delivery,
@@ -361,6 +357,11 @@ class ImageTracePlugin(Star):
             ),
             random=RandomService(host=self),
             original=OriginalService(host=self),
+        )
+        # 第三轮：投递编排（去重/建请求/offbox 前置/计划/选通道/执行/记账）
+        self.delivery = DeliveryService(
+            host=self,
+            delivery_config=lambda: self._delivery_config(),
         )
 
     # ------------------------------------------------------------------
@@ -1079,156 +1080,22 @@ class ImageTracePlugin(Star):
         mark_compressed: bool = False,
         remember_blocks: list[dict] | None = None,
     ):
-        """统一回传入口：按通道选主路径，失败后逐级回退。
+        """统一回传入口（薄委托）。
 
-        mode 取统一词表（auto / native / bytes / url / url-scaled，两平台同名
-        同义，见 image_delivery.normalize_delivery_mode）：
-        - auto（默认）：交给插件自动决定。OneBot 下压缩字节经 base64 段直发
-          （混合载荷，已知小图跳过下载直发 URL），失败改走标准消息链 URL；
-          qq_official 下按体积分流到 native/url/bytes。
-        - bytes：一律本机准备好字节再上传（OneBot 压缩后直发；qq_official 分片）。
-        - url / url-scaled：URL 直传优先（原图 / 图床缩放版），本地压缩只作为
-          失败回退。
-        - native：不加工，直接交给适配器原样发送（排障对照用）。
-
-        OneBot 侧仍默认压缩：QQ 协议端（NapCat 等）会剥离 URL 查询参数，缩放
-        URL 直传拿回的常是原图，本地压缩是唯一能保证压缩 100% 生效的路径。
-
-        mode_override 供 /原图 强制走 url、无视全局通道；
-        allow_local_fallback=False 时彻底不进入下载字节/本地压缩分支。注意
-        qq_official 等第三方转存平台例外：入口处的格式体检（_offbox_rewrite_blocks）
-        可能把假格式图片改写为本地转码 JPEG 交付——官方富媒体上传拒收假格式，
-        正确送达优先于「只发 URL」的提速承诺。
-
-        mark_compressed 供 /溯源 向量命中启用：为真时按各回传路径实际的压缩
-        证据写入 block["text"]（含文件名与「已压缩」用法说明），使合并消息里
-        每张图各带一句配文。为假时一个字节都不碰 block——哈希 /随机图 /原图
-        三处既有调用点行为与改造前一致（offbox 格式体检除外，见上）。
-
-        qq_official 例外：格式体检之后还会按 `qq_upload` 组做上传通道分流，
-        命中 url / url-scaled / bytes 时由 _qq_upload_takeover 自己上传并发消息
-        （绕开适配器「图片恒 base64 直传、5MB 上限」）。该分支返回即视为已投递。
-
-        单次发送保证：同一批图片在一次调用里只发起一次发送。只有 OneBot 直发
-        明确失败（FAILED）才允许换通道重发；结果未知（超时）一律就此打住——
-        请求可能已经送达，再发一次用户就会收到两张一模一样的图。
-
-        投递成功后默认 stop_event 防 respond stage 重发；多图 /溯源 通过
-        `_defer_event_stop` 把 stop 推迟到整轮结束，否则管道会在首图后中断
-        当前处理器，后续图片不再处理。
-
-        remember_blocks 供「发缩略图、记原图」使用：/随机图 发出去的是替身
-        （thumb_url），但会话历史必须留下原图直链，否则 /原图 只能找回那张 720px
-        的缩略图。缺省 None 表示记的就是本次发出的 blocks（其余调用点行为不变）。
+        去重、建请求、offbox 前置、计划、选通道、执行与记账已整体迁到
+        ``delivery.service.DeliveryService``；这里保持原签名与生成器语义，
+        既有调用点及 ``monkeypatch plugin._xxx`` 的测试继续有效。
         """
-        if self._event_already_sent(event):
-            logger.warning("本次事件已投递过图片，跳过重复投递")
-            return
-        target = self._delivery_target(event)
-        self._remember_blocks(event, blocks if remember_blocks is None else remember_blocks)
-        request = DeliveryRequest(
-            header=header,
-            blocks=blocks,
+        async for item in self.delivery.deliver(
+            event,
+            header,
+            blocks,
             mode_override=mode_override,
             allow_local_fallback=allow_local_fallback,
             mark_compressed=mark_compressed,
             remember_blocks=remember_blocks,
-        )
-        # 格式体检可能把假格式转成本地 JPEG（block["_tmp_owned"]）；这些临时文件
-        # 只服务于本次投递，发送完成后必须删除，否则会随每次 /随机图、/原图 累积。
-        owned_paths: list[str] = []
-        try:
-            if target.offbox_upload:
-                # 第三方转存平台的两个前置动作（格式体检 → 上传通道接管）收在一个
-                # 入口里：前者可能把假格式换成 path/缩略图 URL，后者必须拿着改写后
-                # 的 block 才能判断该走 URL 还是分片，顺序不可交换
-                blocks, handled = await self._offbox_pipeline(
-                    event, header, blocks, mark_compressed=mark_compressed
-                )
-                request.blocks = blocks
-                owned_paths = [
-                    str(block.get("path") or "")
-                    for block in blocks
-                    if block.get("_tmp_owned") and block.get("path")
-                ]
-                if handled:
-                    # 通道接管已自行发完消息：必须标记已发送并 stop_event，否则
-                    # respond stage 会照原路（base64 直传）再发一遍
-                    self._mark_event_sent(event)
-                    if not self._defer_event_stop(event):
-                        event.stop_event()
-                    return
-            mode, max_side, quality, scaled_url_style = self._delivery_config()
-            if mode_override is not None:
-                mode = mode_override
-            # 决策收口到纯计划器：输入是请求/平台画像/配置，输出是候选步骤。
-            plan = plan_delivery(
-                request,
-                DeliveryProfile.from_target(target),
-                DeliveryConfig(
-                    mode=mode,
-                    max_side=max_side,
-                    quality=quality,
-                    scaled_url_style=scaled_url_style,
-                ),
-            )
-            mode, max_side = plan.mode, plan.max_side
-            quality, scaled_url_style = plan.quality, plan.scaled_url_style
-            image_blocks = [block for block in blocks if block.get("url") or block.get("path")]
-
-            # 回传计划最多只算一次：回退路径此前会重跑一遍规划，把同样的探测白做
-            # 第二次（图床还会因此多做一次缩放处理）。
-            url_plan: tuple[list[str], list[CompressionEvidence]] | None = None
-            ctx = DeliveryContext(
-                event=event, request=request, plan=plan, image_blocks=image_blocks
-            )
-            if plan.direct_ok:
-                url_plan = await self._url_delivery_plan(image_blocks, max_side, mode, quality=quality, scaled_url_style=scaled_url_style)
-                ctx.url_plan = url_plan
-                result = await OneBotChannel(self).deliver_url(ctx)
-                if result.outcome != "failed":
-                    # SENT 已送达；UNKNOWN 可能已送达——两者都不能再发第二次
-                    self._mark_event_sent(event)
-                    if not self._defer_event_stop(event):
-                        event.stop_event()
-                    return
-
-            if plan.local_compress:
-                # OneBot 下 auto/bytes 直发压缩字节（混合载荷）：压缩结果
-                # 经 base64 段直达 QQ，不经协议端二次下载，压缩 100% 生效
-                result = await OneBotChannel(self).deliver_compressed(ctx)
-                if result.outcome != "failed":
-                    # SENT 已送达；UNKNOWN 可能已送达——两者都不能再发第二次
-                    self._mark_event_sent(event)
-                    if not self._defer_event_stop(event):
-                        event.stop_event()
-                    return
-                # 准备失败 或 直发失败：字节路径已试过，整批改走 URL 链
-                logger.warning("OneBot 压缩直发未成功，改用标准消息链 URL 发送")
-            elif plan.local_bytes_chain:
-                result = await ChainChannel(self).deliver_bytes(ctx)
-                if result.outcome != "failed":
-                    self._mark_event_sent(event)
-                    yield event.chain_result(result.chain)
-                    return
-                logger.warning("本地图片回退失败，改用标准消息链 URL 发送")
-
-            # 走到这里说明没有任何通道明确送达（UNKNOWN 已在上面按已送达拦截）。
-            if self._event_already_sent(event):
-                return
-            if url_plan is None:
-                url_plan = await self._url_delivery_plan(image_blocks, max_side, mode, quality=quality, scaled_url_style=scaled_url_style)
-            ctx.url_plan = url_plan
-            result = await ChainChannel(self).deliver_url(ctx)
-            if result.outcome == "failed":
-                return
-            self._mark_event_sent(event)
-            yield event.chain_result(result.chain)
-        finally:
-            # 生成器被消费完/关闭时执行：此时消息已由 OneBot 直发或由 respond
-            # stage 发完，删除转码产物是安全的
-            for owned in owned_paths:
-                self._remove_quiet(owned)
+        ):
+            yield item
 
     # ------------------------------------------------------------------
     # 指令：溯源

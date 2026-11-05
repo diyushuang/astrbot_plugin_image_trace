@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .channels import ChainChannel, OneBotChannel, QQOfficialChannel
 from .planner import DeliveryPlan, plan_delivery
+from .service import DeliveryService, EventGuard
 from .types import (
     DeliveryChannel,
     DeliveryConfig,
@@ -22,6 +23,8 @@ __all__ = [
     "DeliveryProfile",
     "DeliveryRequest",
     "DeliveryResult",
+    "DeliveryService",
+    "EventGuard",
     "OneBotChannel",
     "QQOfficialChannel",
     "plan_delivery",
