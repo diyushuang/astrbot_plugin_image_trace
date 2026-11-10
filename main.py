@@ -1330,7 +1330,7 @@ class ImageTracePlugin(Star):
             # 签到文字两个开关，互相独立：
             # show_quote=卡片/消息里要不要那句随机语句（微博模式下是文案），
             #   关掉就是「只有美图 + 签到信息」；
-            # show_sender=签到文字里要不要带上签到者昵称。
+            # show_sender=签到文字里要不要带上签到者群昵称（群名片，取不到回退昵称）。
             "show_quote": bool_or(raw.get("show_quote"), True),
             "show_sender": bool_or(raw.get("show_sender"), True),
             "border_px": max(0, min(200, as_int(raw.get("border_px"), 0))),
@@ -1351,17 +1351,39 @@ class ImageTracePlugin(Star):
 
     @staticmethod
     def _checkin_sender_name(event: AstrMessageEvent, limit: int = 16) -> str:
-        """签到者昵称：取不到就返回空串，任何异常都不该打断签到。
+        """签到者群昵称：优先群名片，取不到时退回协议端昵称。
 
-        昵称由协议端（QQ / OneBot）给出，长度与内容都不可控：这里只做空白
-        折叠与限长，emoji 留给 ``compose_poster`` 在绘制前剔除——聊天消息里
-        的昵称可以带 emoji，卡片上不行（中文字体没有彩色 emoji 字形）。
+        群昵称来自 OneBot 原始事件的 ``sender.card``：AstrBot 4.0.x 的
+        aiocqhttp 适配器只把 QQ 昵称写进 MessageMember，群名片留在
+        ``message_obj.raw_message`` 里；较新版本虽已「card 优先」，这里仍
+        统一先查原始事件，兼容不同框架版本与适配器。名字由协议端给出，
+        长度与内容都不可控：这里只做空白折叠与限长，emoji 留给
+        ``compose_poster`` 在绘制前剔除。
         """
+        candidates = []
         try:
-            raw = str(event.get_sender_name() or "")
+            message_obj = getattr(event, "message_obj", None)
+            sender = getattr(message_obj, "sender", None)
+            candidates.append(getattr(sender, "card", None))
+            raw = getattr(message_obj, "raw_message", None)
+            payload = (
+                raw.get("sender")
+                if isinstance(raw, dict)
+                else getattr(raw, "sender", None)
+            )
+            if isinstance(payload, dict):
+                candidates.append(payload.get("card"))
+            else:
+                candidates.append(getattr(payload, "card", None))
         except Exception:
-            return ""
-        name = " ".join(raw.split())
+            pass
+        with contextlib.suppress(Exception):
+            candidates.append(event.get_sender_name())
+        name = ""
+        for candidate in candidates:
+            name = " ".join(str(candidate or "").split())
+            if name:
+                break
         if len(name) > limit:
             name = name[:limit].rstrip() + "…"
         return name
@@ -3032,7 +3054,7 @@ class ImageTracePlugin(Star):
             "· /随机视频 [目录] —— 从图床随机取一个视频并回传\n"
             "· /签到 —— 每日签到领取一张带边框的卡片（每天首次计入天数，同日重复只换图不涨天数，可 /打卡）；"
             "checkin.mode=weibo 时改为“微博文案 + 对应图库图片”，卡片显示博主与发博日期；"
-            "checkin.show_quote=false 时只发美图 + 签到信息，checkin.show_sender 控制是否带签到者昵称\n"
+            "checkin.show_quote=false 时只发美图 + 签到信息，checkin.show_sender 控制是否带签到者群昵称（取不到回退 QQ 昵称）\n"
             "· /签到文案导入 —— 管理员：把微博文案 CSV/MD 作为附件发送，导入插件数据目录\n"
             "· /原图 [文件名] —— 取原图：带文件名时直接到图床按名取（无需先回传），"
             "不带文件名取本会话最近回传的原图\n"
@@ -3961,7 +3983,7 @@ class ImageTracePlugin(Star):
             f"{'合成卡片' if settings['render_mode'] == 'card' else '图文直发'}"
             f"，取图：{'原图' if settings['image_mode'] == 'original' else '缩略图'}"
             f"，文字：{'显示' if settings['show_quote'] else '不显示'}"
-            f"，昵称：{'显示' if settings['show_sender'] else '不显示'}"
+            f"，群昵称：{'显示' if settings['show_sender'] else '不显示'}"
         )
         if settings["mode"] != "weibo":
             return f"· 签到模式：quote（随机图 + 随机语句；{shape}）"
@@ -4132,7 +4154,7 @@ class ImageTracePlugin(Star):
             logger.error(f"签到记录写入失败: {exc}")
             yield event.plain_result("签到记录写入失败，请稍后再试。")
             return
-        # 昵称（checkin.show_sender）同时进消息文字与卡片页脚；取不到就整行省略。
+        # 群昵称（checkin.show_sender）同时进消息文字与卡片页脚；取不到就整行省略。
         name = self._checkin_sender_name(event) if settings["show_sender"] else ""
         who = f"{name} " if name else ""
         if outcome.already:

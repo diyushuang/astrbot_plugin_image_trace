@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 from datetime import date, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from PIL import Image as PILImage
@@ -590,6 +591,53 @@ async def test_checkin_sender_name_normalizes_and_truncates(make_plugin, make_ev
     assert plugin._checkin_sender_name(event) == ""
 
 
+async def test_checkin_sender_name_prefers_onebot_group_card(make_plugin, make_event):
+    """OneBot 原始事件的 sender.card（群名片）优先于框架昵称。"""
+    plugin = make_plugin()
+    event = make_event("/签到", sender_id="u1", group_id="g1")
+    event.message_obj.raw_message = {
+        "sender": {"card": "群昵称A", "nickname": "QQ昵称"}
+    }
+
+    assert plugin._checkin_sender_name(event) == "群昵称A"
+
+
+async def test_checkin_sender_name_member_card_beats_raw_message(make_plugin, make_event):
+    """sender.card 存在时优先级最高，raw_message 与框架昵称都排在后面。"""
+    plugin = make_plugin()
+    event = make_event("/签到", sender_id="u1", group_id="g1")
+    event.message_obj.sender = SimpleNamespace(card="群昵称B", nickname="QQ昵称")
+    event.message_obj.raw_message = SimpleNamespace(sender={"card": "群昵称C"})
+
+    assert plugin._checkin_sender_name(event) == "群昵称B"
+
+
+async def test_checkin_sender_name_falls_back_without_group_card(make_plugin, make_event):
+    """群名片为空 / 全空白 / 缺失时，回退到原有昵称，不影响私聊与非 OneBot 平台。"""
+    plugin = make_plugin()
+    event = make_event("/签到", sender_id="u1")
+    assert plugin._checkin_sender_name(event) == "测试用户"
+
+    event.message_obj.raw_message = {"sender": {"card": "   ", "nickname": "QQ昵称"}}
+    assert plugin._checkin_sender_name(event) == "测试用户"
+
+
+async def test_checkin_sender_name_reads_object_raw_message_and_truncates(
+    make_plugin, make_event
+):
+    """raw_message 为对象时也能取 card；群名片超长仍按 16 字截断。"""
+    plugin = make_plugin()
+    event = make_event("/签到", sender_id="u1", group_id="g1")
+    event.message_obj.raw_message = SimpleNamespace(
+        sender=SimpleNamespace(card="群昵称C")
+    )
+    assert plugin._checkin_sender_name(event) == "群昵称C"
+
+    event.message_obj.raw_message = {"sender": {"card": "长" * 40}}
+    trimmed = plugin._checkin_sender_name(event)
+    assert len(trimmed) == 17 and trimmed.endswith("…")
+
+
 async def test_checkin_settings_defaults_for_text_switches(make_plugin):
     """两个新开关默认都为真（升级即保持原行为 + 带昵称）。"""
     settings = make_plugin()._checkin_settings()
@@ -602,8 +650,6 @@ async def test_checkin_settings_defaults_for_text_switches(make_plugin):
 
 async def test_checkin_line_drops_emoji_only_name(make_plugin):
     """昵称全是 emoji 时，页脚不能剩一个孤零零的「·」。"""
-    from types import SimpleNamespace
-
     plugin = make_plugin()
     outcome = SimpleNamespace(streak=3, total=10)
 
