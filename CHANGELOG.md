@@ -1,5 +1,11 @@
 # 更新日志
 
+## 1.7.23（2026-11-11，签到群昵称增加接口兜底）
+
+- **修复**：1.7.22 只从事件里取 `sender.card`；NapCat 群消息的 `sender.card` 来自 `msg.sendMemberName`，部分消息记录为空，导致仍显示 QQ 昵称。现在事件里取不到群名片时，会通过 OneBot `get_group_member_info` 查一次 `card`（NapCat 返回 `member.cardName`），再取不到才回退 `get_sender_name()`；接口失败/超时（3 秒）静默回退，签到不中断。
+- **兼容**：只对 `aiocqhttp` / `onebot` / `napcat` / `lagrange` 等 OneBot 系平台发起查询；非 OneBot 平台与私聊保持原逻辑；事件里已有群名片时不发多余请求。
+- **测试**：新增 4 例（接口群名片优先、事件已有名片不调用接口、接口失败回退昵称、非 OneBot 不调用接口），全量 **438 passed**，`ruff check` 全绿。
+
 ## 1.7.22（2026-11-10，签到显示群昵称）
 
 - **变更**：`/签到` 的签到者显示名改为**群昵称**：优先取 OneBot 原始事件 `sender.card`（群名片），取不到（私聊 / 未设置群名片 / 非 OneBot 平台）时回退 `get_sender_name()`。消息首行与卡片页脚（含 `weibo` 模式第二行）同步生效，`checkin.show_sender` 仍控制整体显示/隐藏；空白折叠、16 字截断与 emoji 剔除规则不变。

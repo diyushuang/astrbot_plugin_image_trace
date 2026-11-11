@@ -1350,18 +1350,15 @@ class ImageTracePlugin(Star):
         return datetime.now(timezone(timedelta(hours=offset_hours))).date()
 
     @staticmethod
-    def _checkin_sender_name(event: AstrMessageEvent, limit: int = 16) -> str:
-        """签到者群昵称：优先群名片，取不到时退回协议端昵称。
+    def _checkin_event_card(event: AstrMessageEvent) -> str:
+        """从事件自身取群名片：MessageMember.card → 原始事件 sender.card。
 
-        群昵称来自 OneBot 原始事件的 ``sender.card``：AstrBot 4.0.x 的
-        aiocqhttp 适配器只把 QQ 昵称写进 MessageMember，群名片留在
-        ``message_obj.raw_message`` 里；较新版本虽已「card 优先」，这里仍
-        统一先查原始事件，兼容不同框架版本与适配器。名字由协议端给出，
-        长度与内容都不可控：这里只做空白折叠与限长，emoji 留给
-        ``compose_poster`` 在绘制前剔除。
+        群名片可能挂在 ``message_obj.sender.card``（部分适配器/框架版本），
+        也可能只在 OneBot 原始事件 ``message_obj.raw_message["sender"]["card"]``
+        里。取不到返回空串，由调用方决定是否再查群成员接口。
         """
         candidates = []
-        try:
+        with contextlib.suppress(Exception):
             message_obj = getattr(event, "message_obj", None)
             sender = getattr(message_obj, "sender", None)
             candidates.append(getattr(sender, "card", None))
@@ -1375,15 +1372,71 @@ class ImageTracePlugin(Star):
                 candidates.append(payload.get("card"))
             else:
                 candidates.append(getattr(payload, "card", None))
-        except Exception:
-            pass
-        with contextlib.suppress(Exception):
-            candidates.append(event.get_sender_name())
-        name = ""
         for candidate in candidates:
             name = " ".join(str(candidate or "").split())
             if name:
-                break
+                return name
+        return ""
+
+    async def _checkin_group_card(self, event: AstrMessageEvent) -> str:
+        """群名片：事件里没有时，向 OneBot 端查一次群成员信息。
+
+        NapCat 群消息的 ``sender.card`` 取自 ``msg.sendMemberName``，部分消息
+        记录里为空；``get_group_member_info`` 返回的 ``card``（member.cardName）
+        才是权威值。只对 OneBot 系平台调用，失败/超时静默回退事件昵称。
+        """
+        card = self._checkin_event_card(event)
+        if card:
+            return card
+        try:
+            platform = str(event.get_platform_name() or "").strip().lower()
+        except Exception:
+            platform = ""
+        if platform not in {"aiocqhttp", "onebot", "napcat", "lagrange"}:
+            return ""
+        try:
+            group_id = str(event.get_group_id() or "").strip()
+            user_id = str(event.get_sender_id() or "").strip()
+        except Exception:
+            return ""
+        bot = getattr(event, "bot", None)
+        caller = getattr(bot, "call_action", None)
+        if caller is None:
+            caller = getattr(getattr(bot, "api", None), "call_action", None)
+        if not (group_id and user_id and callable(caller)):
+            return ""
+        try:
+            info = await asyncio.wait_for(
+                caller(
+                    action="get_group_member_info",
+                    group_id=group_id,
+                    user_id=user_id,
+                ),
+                timeout=3,
+            )
+        except Exception as exc:
+            logger.debug(f"签到群昵称查询失败，回退事件昵称: {exc}")
+            return ""
+        if isinstance(info, dict):
+            return str(info.get("card") or "")
+        return ""
+
+    async def _checkin_sender_name(self, event: AstrMessageEvent, limit: int = 16) -> str:
+        """签到者群昵称：事件群名片 → 群成员接口 → 协议端昵称。
+
+        事件里的群名片可能缺失（NapCat 的 ``sendMemberName`` 在部分消息记录里
+        为空），所以 OneBot 系平台会再查一次 ``get_group_member_info`` 取权威
+        ``card``；仍取不到（私聊 / 未设置群名片 / 非 OneBot 平台）则退回
+        ``get_sender_name()``。名字由协议端给出，长度与内容都不可控：这里只做
+        空白折叠与限长，emoji 留给 ``compose_poster`` 在绘制前剔除。
+        """
+        raw = ""
+        with contextlib.suppress(Exception):
+            raw = await self._checkin_group_card(event)
+        if not raw:
+            with contextlib.suppress(Exception):
+                raw = str(event.get_sender_name() or "")
+        name = " ".join(raw.split())
         if len(name) > limit:
             name = name[:limit].rstrip() + "…"
         return name
@@ -4155,7 +4208,9 @@ class ImageTracePlugin(Star):
             yield event.plain_result("签到记录写入失败，请稍后再试。")
             return
         # 群昵称（checkin.show_sender）同时进消息文字与卡片页脚；取不到就整行省略。
-        name = self._checkin_sender_name(event) if settings["show_sender"] else ""
+        name = (
+            await self._checkin_sender_name(event) if settings["show_sender"] else ""
+        )
         who = f"{name} " if name else ""
         if outcome.already:
             header = (
