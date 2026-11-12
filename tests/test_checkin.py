@@ -641,15 +641,18 @@ async def test_checkin_sender_name_reads_object_raw_message_and_truncates(
 class _FakeOneBotBot:
     """最小 OneBot 客户端替身：记录 call_action 并返回固定群成员信息。"""
 
-    def __init__(self, card="", *, error=None):
+    def __init__(self, card="", *, error=None, response=None):
         self.card = card
         self.error = error
+        self.response = response
         self.calls = []
 
     async def call_action(self, action, **params):
         self.calls.append((action, params))
         if self.error is not None:
             raise self.error
+        if self.response is not None:
+            return self.response
         return {"card": self.card, "nickname": "接口昵称"}
 
 
@@ -663,12 +666,32 @@ async def test_checkin_sender_name_queries_group_member_card(make_plugin, make_e
 
     assert await plugin._checkin_sender_name(event) == "群昵称API"
     assert bot.calls == [
-        ("get_group_member_info", {"group_id": "g1", "user_id": "u1"})
+        (
+            "get_group_member_info",
+            {"group_id": "g1", "user_id": "u1", "no_cache": True},
+        )
     ]
 
 
-async def test_checkin_sender_name_skips_api_when_event_has_card(make_plugin, make_event):
-    """事件里已有群名片就不再请求群成员接口，省一次 OneBot 调用。"""
+async def test_checkin_sender_name_converts_numeric_ids(make_plugin, make_event):
+    """OneBot 的 group_id / user_id 是整数：纯数字必须转 int 再传。"""
+    plugin = make_plugin()
+    bot = _FakeOneBotBot(card="群昵称D")
+    event = make_event(
+        "/签到", platform="aiocqhttp", sender_id="7890", group_id="123456", bot=bot
+    )
+
+    assert await plugin._checkin_sender_name(event) == "群昵称D"
+    assert bot.calls == [
+        (
+            "get_group_member_info",
+            {"group_id": 123456, "user_id": 7890, "no_cache": True},
+        )
+    ]
+
+
+async def test_checkin_sender_name_api_card_beats_event_card(make_plugin, make_event):
+    """群聊签到主动查权威接口；接口 card 优先于可能过期的事件 card。"""
     plugin = make_plugin()
     bot = _FakeOneBotBot(card="接口群昵称")
     event = make_event(
@@ -676,8 +699,38 @@ async def test_checkin_sender_name_skips_api_when_event_has_card(make_plugin, ma
     )
     event.message_obj.raw_message = {"sender": {"card": "事件群昵称"}}
 
-    assert await plugin._checkin_sender_name(event) == "事件群昵称"
-    assert bot.calls == []
+    assert await plugin._checkin_sender_name(event) == "接口群昵称"
+    assert len(bot.calls) == 1
+
+
+async def test_checkin_sender_name_uses_api_nickname_when_card_empty(
+    make_plugin, make_event
+):
+    """接口成功但 card 为空（成员没设群名片）时，用接口 nickname。"""
+    plugin = make_plugin()
+    bot = _FakeOneBotBot(card="")
+    event = make_event(
+        "/签到", platform="aiocqhttp", sender_id="u1", group_id="g1", bot=bot
+    )
+
+    assert await plugin._checkin_sender_name(event) == "接口昵称"
+
+
+async def test_checkin_sender_name_unwraps_api_envelope(make_plugin, make_event):
+    """兼容完整 OneBot 信封（status/retcode/data）形态。"""
+    plugin = make_plugin()
+    bot = _FakeOneBotBot(
+        response={
+            "status": "ok",
+            "retcode": 0,
+            "data": {"card": "信封群昵称", "nickname": "接口昵称"},
+        }
+    )
+    event = make_event(
+        "/签到", platform="aiocqhttp", sender_id="u1", group_id="g1", bot=bot
+    )
+
+    assert await plugin._checkin_sender_name(event) == "信封群昵称"
 
 
 async def test_checkin_sender_name_api_failure_falls_back(make_plugin, make_event):
@@ -691,6 +744,30 @@ async def test_checkin_sender_name_api_failure_falls_back(make_plugin, make_even
     assert await plugin._checkin_sender_name(event) == "测试用户"
 
 
+async def test_checkin_sender_name_api_failure_uses_event_card(make_plugin, make_event):
+    """接口失败时，事件里的 sender.card 仍可做第一回退。"""
+    plugin = make_plugin()
+    bot = _FakeOneBotBot(error=RuntimeError("api down"))
+    event = make_event(
+        "/签到", platform="aiocqhttp", sender_id="u1", group_id="g1", bot=bot
+    )
+    event.message_obj.raw_message = {"sender": {"card": "事件群昵称"}}
+
+    assert await plugin._checkin_sender_name(event) == "事件群昵称"
+
+
+async def test_checkin_sender_name_private_chat_skips_api(make_plugin, make_event):
+    """私聊没有群昵称，不调用群成员接口。"""
+    plugin = make_plugin()
+    bot = _FakeOneBotBot(card="不该用到")
+    event = make_event(
+        "/签到", platform="aiocqhttp", sender_id="u1", group_id=None, bot=bot
+    )
+
+    assert await plugin._checkin_sender_name(event) == "测试用户"
+    assert bot.calls == []
+
+
 async def test_checkin_sender_name_non_onebot_does_not_call_api(make_plugin, make_event):
     """非 OneBot 平台没有群名片概念，不去调用群成员接口。"""
     plugin = make_plugin()
@@ -701,6 +778,54 @@ async def test_checkin_sender_name_non_onebot_does_not_call_api(make_plugin, mak
 
     assert await plugin._checkin_sender_name(event) == "测试用户"
     assert bot.calls == []
+
+
+async def test_nickname_diag_reports_event_and_api_card(make_plugin, make_event):
+    """/溯源昵称 一次输出事件字段、接口值与最终来源。"""
+    plugin = make_plugin()
+    bot = _FakeOneBotBot(card="群昵称A")
+    event = make_event(
+        "/溯源昵称", platform="aiocqhttp", sender_id="7890", group_id="123456", bot=bot
+    )
+    event.get_platform_id = lambda: "plat-1"
+
+    results = [result async for result in plugin.nickname_diag(event)]
+    text = results[0].text
+
+    assert "平台：aiocqhttp（ID: plat-1）" in text
+    assert "会话：群 123456 / 用户 7890" in text
+    assert "事件群名片：（空）" in text
+    assert "card「群昵称A」" in text
+    assert "最终：群昵称A（来源：群成员接口.card）" in text
+
+
+async def test_nickname_diag_marks_empty_api_card(make_plugin, make_event):
+    """接口 card 为空时，明确提示成员没有设置群昵称。"""
+    plugin = make_plugin()
+    bot = _FakeOneBotBot(card="")
+    event = make_event(
+        "/溯源昵称", platform="aiocqhttp", sender_id="u1", group_id="g1", bot=bot
+    )
+
+    results = [result async for result in plugin.nickname_diag(event)]
+    text = results[0].text
+
+    assert "未设置群昵称" in text
+    assert "最终：接口昵称（来源：群成员接口.nickname）" in text
+
+
+async def test_nickname_diag_non_onebot_explains_unsupported(make_plugin, make_event):
+    """非 OneBot 平台明确说明没有群名片概念。"""
+    plugin = make_plugin()
+    event = make_event(
+        "/溯源昵称", platform="telegram", sender_id="u1", group_id="g1"
+    )
+
+    results = [result async for result in plugin.nickname_diag(event)]
+    text = results[0].text
+
+    assert "没有群名片概念" in text
+    assert "最终：测试用户（来源：事件昵称）" in text
 
 
 async def test_checkin_settings_defaults_for_text_switches(make_plugin):

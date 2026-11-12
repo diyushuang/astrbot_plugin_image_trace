@@ -259,6 +259,8 @@ IMAGE_EXTS = {
 QQ_IMAGE_FILE_TYPE = 1
 # 假格式转码前的像素上限：与 features / 签到卡片同一量级，防解压炸弹
 QQ_TRANSCODE_MAX_PIXELS = 50_000_000
+# OneBot 系平台名：只有这些平台才有群名片（card）概念
+ONEBOT_PLATFORM_NAMES = frozenset({"aiocqhttp", "onebot", "napcat", "lagrange"})
 
 # ----------------------------------------------------------------------
 # 配置布局（1.7.14）：同类项合并进 basic / delivery / limits 三个组。
@@ -1330,7 +1332,8 @@ class ImageTracePlugin(Star):
             # 签到文字两个开关，互相独立：
             # show_quote=卡片/消息里要不要那句随机语句（微博模式下是文案），
             #   关掉就是「只有美图 + 签到信息」；
-            # show_sender=签到文字里要不要带上签到者群昵称（群名片，取不到回退昵称）。
+            # show_sender=签到文字里要不要带上签到者群昵称（OneBot 群名片优先，
+            # 接口失败才回退事件昵称）。
             "show_quote": bool_or(raw.get("show_quote"), True),
             "show_sender": bool_or(raw.get("show_sender"), True),
             "border_px": max(0, min(200, as_int(raw.get("border_px"), 0))),
@@ -1348,6 +1351,40 @@ class ImageTracePlugin(Star):
     def _checkin_today(offset_hours: int) -> date:
         """按配置的 UTC 偏移算出「今天」，与服务器本地时区无关。"""
         return datetime.now(timezone(timedelta(hours=offset_hours))).date()
+
+    @staticmethod
+    def _onebot_id(value) -> int | str:
+        """OneBot 的 group_id / user_id 是整数；纯数字才转 int，其余原样带回。"""
+        text = str(value or "").strip()
+        return int(text) if text.isdigit() else text
+
+    @staticmethod
+    def _onebot_platform(event: AstrMessageEvent) -> str:
+        """事件所属平台名（小写）；取不到返回空串。"""
+        with contextlib.suppress(Exception):
+            return str(event.get_platform_name() or "").strip().lower()
+        return ""
+
+    @staticmethod
+    def _onebot_caller(event: AstrMessageEvent):
+        """取当前事件可用的 OneBot call_action；bot / bot.api 两种挂载都兼容。"""
+        bot = getattr(event, "bot", None)
+        for holder in (bot, getattr(bot, "api", None)):
+            caller = getattr(holder, "call_action", None)
+            if callable(caller):
+                return caller
+        return None
+
+    @staticmethod
+    def _onebot_unwrap(info):
+        """aiocqhttp 的 call_action 已解包 data；这里兼容完整信封形态。"""
+        if (
+            isinstance(info, dict)
+            and isinstance(info.get("data"), dict)
+            and ("status" in info or "retcode" in info)
+        ):
+            return info["data"]
+        return info
 
     @staticmethod
     def _checkin_event_card(event: AstrMessageEvent) -> str:
@@ -1378,65 +1415,97 @@ class ImageTracePlugin(Star):
                 return name
         return ""
 
-    async def _checkin_group_card(self, event: AstrMessageEvent) -> str:
-        """群名片：事件里没有时，向 OneBot 端查一次群成员信息。
+    async def _checkin_member_info(self, event: AstrMessageEvent) -> tuple[dict | None, str]:
+        """查 OneBot 群成员信息（权威 card）。
 
-        NapCat 群消息的 ``sender.card`` 取自 ``msg.sendMemberName``，部分消息
-        记录里为空；``get_group_member_info`` 返回的 ``card``（member.cardName）
-        才是权威值。只对 OneBot 系平台调用，失败/超时静默回退事件昵称。
+        返回 ``(info, error)``：info 为成员对象时 error 为空；不适用（私聊 /
+        非 OneBot）返回 ``(None, "")``；调用失败返回 ``(None, 脱敏原因)``，
+        供诊断指令展示。签到主流程只关心 info，失败时回退事件昵称。
         """
-        card = self._checkin_event_card(event)
-        if card:
-            return card
-        try:
-            platform = str(event.get_platform_name() or "").strip().lower()
-        except Exception:
-            platform = ""
-        if platform not in {"aiocqhttp", "onebot", "napcat", "lagrange"}:
-            return ""
+        platform = self._onebot_platform(event)
+        if platform not in ONEBOT_PLATFORM_NAMES:
+            return None, ""
         try:
             group_id = str(event.get_group_id() or "").strip()
             user_id = str(event.get_sender_id() or "").strip()
         except Exception:
-            return ""
-        bot = getattr(event, "bot", None)
-        caller = getattr(bot, "call_action", None)
-        if caller is None:
-            caller = getattr(getattr(bot, "api", None), "call_action", None)
+            return None, ""
+        caller = self._onebot_caller(event)
         if not (group_id and user_id and callable(caller)):
-            return ""
+            return None, ""
         try:
             info = await asyncio.wait_for(
                 caller(
-                    action="get_group_member_info",
-                    group_id=group_id,
-                    user_id=user_id,
+                    "get_group_member_info",
+                    group_id=self._onebot_id(group_id),
+                    user_id=self._onebot_id(user_id),
+                    no_cache=True,
                 ),
-                timeout=3,
+                timeout=5,
             )
         except Exception as exc:
-            logger.debug(f"签到群昵称查询失败，回退事件昵称: {exc}")
-            return ""
+            detail = sanitize_error_text(exc)
+            logger.warning(
+                f"签到群昵称查询失败（平台={platform}, 群={group_id}, "
+                f"用户={user_id}）: {detail}"
+            )
+            return None, detail
+        info = self._onebot_unwrap(info)
         if isinstance(info, dict):
-            return str(info.get("card") or "")
-        return ""
+            return info, ""
+        logger.warning(
+            f"签到群昵称查询返回非对象结果（平台={platform}, 群={group_id}, "
+            f"用户={user_id}）: {info!r}"
+        )
+        return None, "接口返回了非对象结果"
+
+    @staticmethod
+    def _pick_checkin_name(
+        event_card: str, member_info: dict | None, event_name: str
+    ) -> tuple[str, str]:
+        """按来源优先级挑签到显示名，返回 ``(name, source)``。
+
+        接口成功时以接口为准：``card`` 是权威群名片，空则用接口 ``nickname``；
+        不再拿可能过期的事件 card 硬顶。接口失败/不适用时才用事件
+        ``sender.card``，最后回退事件昵称。
+        """
+        if isinstance(member_info, dict):
+            candidates = [
+                (member_info.get("card"), "群成员接口.card"),
+                (member_info.get("nickname"), "群成员接口.nickname"),
+                (event_name, "事件昵称"),
+            ]
+        else:
+            candidates = [
+                (event_card, "事件.sender.card"),
+                (event_name, "事件昵称"),
+            ]
+        for candidate, source in candidates:
+            name = " ".join(str(candidate or "").split())
+            if name:
+                return name, source
+        return "", "无"
+
+    async def _resolve_checkin_name(self, event: AstrMessageEvent) -> tuple[str, str]:
+        """签到者显示名与来源：事件字段 + OneBot 群成员接口。"""
+        event_card = ""
+        event_name = ""
+        with contextlib.suppress(Exception):
+            event_card = self._checkin_event_card(event)
+        with contextlib.suppress(Exception):
+            event_name = " ".join(str(event.get_sender_name() or "").split())
+        member_info, _error = await self._checkin_member_info(event)
+        return self._pick_checkin_name(event_card, member_info, event_name)
 
     async def _checkin_sender_name(self, event: AstrMessageEvent, limit: int = 16) -> str:
-        """签到者群昵称：事件群名片 → 群成员接口 → 协议端昵称。
+        """签到者群昵称：OneBot 群成员接口 card → 接口昵称 → 事件群名片 → 事件昵称。
 
-        事件里的群名片可能缺失（NapCat 的 ``sendMemberName`` 在部分消息记录里
-        为空），所以 OneBot 系平台会再查一次 ``get_group_member_info`` 取权威
-        ``card``；仍取不到（私聊 / 未设置群名片 / 非 OneBot 平台）则退回
-        ``get_sender_name()``。名字由协议端给出，长度与内容都不可控：这里只做
+        OneBot 群消息自带的 ``sender.card`` 可能缺失或过期，所以群聊里会主动
+        查一次 ``get_group_member_info``（数字 ID + no_cache）。接口失败时不
+        阻断签到，只把原因写进日志并回退事件字段。名字长度不可控：这里只做
         空白折叠与限长，emoji 留给 ``compose_poster`` 在绘制前剔除。
         """
-        raw = ""
-        with contextlib.suppress(Exception):
-            raw = await self._checkin_group_card(event)
-        if not raw:
-            with contextlib.suppress(Exception):
-                raw = str(event.get_sender_name() or "")
-        name = " ".join(raw.split())
+        name, _source = await self._resolve_checkin_name(event)
         if len(name) > limit:
             name = name[:limit].rstrip() + "…"
         return name
@@ -2840,6 +2909,62 @@ class ImageTracePlugin(Star):
         lines.append(f"· AI 复核：{'开' if self._bool_cfg('ai_verify', False) else '关'}")
         yield event.plain_result("\n".join(lines))
 
+    @filter.command("溯源昵称")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def nickname_diag(self, event: AstrMessageEvent):
+        """诊断当前会话能否取到 QQ 群昵称（管理员）"""
+        platform = self._onebot_platform(event) or "未知"
+        platform_id = ""
+        group_id = ""
+        user_id = ""
+        event_name = ""
+        with contextlib.suppress(Exception):
+            platform_id = str(event.get_platform_id() or "")
+        with contextlib.suppress(Exception):
+            group_id = str(event.get_group_id() or "").strip()
+        with contextlib.suppress(Exception):
+            user_id = str(event.get_sender_id() or "").strip()
+        with contextlib.suppress(Exception):
+            event_name = " ".join(str(event.get_sender_name() or "").split())
+        event_card = self._checkin_event_card(event)
+
+        lines = ["🔎 群昵称识别诊断"]
+        lines.append(
+            f"平台：{platform}" + (f"（ID: {platform_id}）" if platform_id else "")
+        )
+        if group_id:
+            lines.append(f"会话：群 {group_id} / 用户 {user_id or '未知'}")
+        else:
+            lines.append(f"会话：私聊 / 用户 {user_id or '未知'}")
+        lines.append(f"事件昵称：{event_name or '（空）'}")
+        lines.append(f"事件群名片：{event_card or '（空）'}")
+
+        member_info, api_error = await self._checkin_member_info(event)
+        if isinstance(member_info, dict):
+            api_card = " ".join(str(member_info.get("card") or "").split())
+            api_nick = " ".join(str(member_info.get("nickname") or "").split())
+            lines.append(
+                f"群成员接口：card「{api_card or '（空）'}」/ "
+                f"nickname「{api_nick or '（空）'}」"
+            )
+            if not api_card:
+                lines.append(
+                    "说明：接口返回的群名片为空，该成员未设置群昵称（QQ 显示的就是昵称）。"
+                )
+        elif platform not in ONEBOT_PLATFORM_NAMES:
+            lines.append("群成员接口：未调用（当前平台不是 OneBot 系，没有群名片概念）。")
+        elif not group_id:
+            lines.append("群成员接口：未调用（私聊没有群昵称）。")
+        elif api_error:
+            lines.append(f"群成员接口：失败（{api_error}）")
+        else:
+            lines.append("群成员接口：不可用（缺少 bot / 群号 / 用户号）。")
+
+        name, source = self._pick_checkin_name(event_card, member_info, event_name)
+        shown = name if len(name) <= 16 else name[:16].rstrip() + "…"
+        lines.append(f"最终：{shown or '（空）'}（来源：{source}）")
+        yield event.plain_result("\n".join(lines))
+
     def _remote_hash_line(self) -> str:
         """/溯源状态 的图床哈希索引一行。
 
@@ -3101,6 +3226,7 @@ class ImageTracePlugin(Star):
             "· /溯源 —— 与图片同条消息发送，或引用一张图片发送，自动在图库中寻找原图\n"
             "· /登记原图 [备注] —— 将图片作为原图登记入库（默认仅管理员）\n"
             "· /溯源状态 —— 查看图库统计\n"
+            "· /溯源昵称 —— 诊断当前群能否取到群昵称（管理员）\n"
             "· /溯源重扫 [force] —— 扫描本地图库目录建立索引（管理员）\n"
             "· /溯源删除 <编号> —— 删除图库条目（管理员）\n"
             "· /随机图 [目录] —— 从图床随机取一张图片并回传\n"

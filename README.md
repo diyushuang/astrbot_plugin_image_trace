@@ -5,7 +5,7 @@
 
 **群聊里随手转发的一张图，一键找回它的原图。**
 
-[![version](https://img.shields.io/badge/version-1.7.23-blue?style=flat-square)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.7.24-blue?style=flat-square)](./CHANGELOG.md)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4?style=flat-square)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat-square)](./LICENSE)
@@ -110,9 +110,10 @@ flowchart LR
 | `/原图修复` | - | 清理会话历史里带配文前缀（`🖼️` / `🎬` / 序号）的旧记录，修复后 `/原图` 才能命中 | 所有人 |
 | `/随机图 [目录]` | `/随机图片` | 从图床随机图接口取一张随机图片并回传 | 所有人 |
 | `/随机视频 [目录]` | - | 从图床随机图接口取一段随机视频并回传 | 所有人 |
-| `/签到` | `/打卡` | 每日签到：首次计入天数；同日重复签到天数不变，但仍回传新的卡片/图片。呈现方式（合成卡片 / 图文直发）、取图方式（缩略图 / 原图）、是否写文字与是否带群昵称（群名片，取不到回退 QQ 昵称）各自独立配置，且不影响 `/随机图`；`checkin.mode=weibo` 时回传「微博文案 + 图库对应图」 | 所有人 |
+| `/签到` | `/打卡` | 每日签到：首次计入天数；同日重复签到天数不变，但仍回传新的卡片/图片。呈现方式（合成卡片 / 图文直发）、取图方式（缩略图 / 原图）、是否写文字与是否带群昵称（优先查群成员接口 card，接口失败才回退事件 QQ 昵称）各自独立配置，且不影响 `/随机图`；`checkin.mode=weibo` 时回传「微博文案 + 图库对应图」 | 所有人 |
 | `/签到文案导入` | `/签到文案上传` | 管理员：把微博文案 CSV/MD 作为附件发送，导入插件数据目录；映射表由 `scripts/build_weibo_map.py` 生成 | 管理员 |
 | `/溯源状态` | - | 查看图库统计与配置摘要 | 所有人 |
+| `/溯源昵称` | - | 诊断当前群能否取到 QQ 群昵称：显示事件昵称/群名片、群成员接口 card 与最终来源 | 管理员 |
 | `/溯源重扫 [force]` | - | 扫描 `scan_dirs` 目录建立/更新索引；`force` 重建全部 | 管理员 |
 | `/溯源删除 <编号>` | - | 按 ID 删除图库条目（同步清理插件侧写入的向量点、远端对象与本地副本） | 管理员 |
 | `/溯源帮助` | - | 使用帮助 | 所有人 |
@@ -195,7 +196,7 @@ flowchart LR
 | `checkin.render_mode` | `card` | **合不合成**：`card`=本地合成「边框 + 语句」卡片（单条图文）/ `simple`=不合成，图片 + 文字语句直接发（图片仍按推送通道交付，`auto` 下 OneBot 可能本地下载压缩） |
 | `checkin.image_mode` | `thumbnail` | **用哪张图**（只作用于 `/签到`，与 `random_media.send_thumbnail` 互不影响）：`thumbnail`=图床 720px 缩略图（快）/ `original`=原图（全尺寸，下载与上传都更慢）；两种取值在 `card` 模式下都会合成卡片（原图先降采样到最长边 1440px） |
 | `checkin.show_quote` | `true` | **写不写文字**：`true`=卡片/消息里带那句文字（`quote` 模式随机语句 / `weibo` 模式微博文案）；`false`=只发**美图 + 签到信息**（连续/累计天数），卡片连文字区一起省掉，也不再请求语句接口 |
-| `checkin.show_sender` | `true` | **带不带群昵称**：`true`=消息首行「✅ 群昵称 签到成功…」+ 卡片页脚「群昵称 · 连续签到 3 天 · 累计 10 天」；群聊优先取群名片（`sender.card`），私聊或未设置群名片时回退 QQ 昵称；`false`=只显示天数。名字按 16 字截断，卡片上不渲染 emoji |
+| `checkin.show_sender` | `true` | **带不带群昵称**：`true`=消息首行「✅ 群昵称 签到成功…」+ 卡片页脚「群昵称 · 连续签到 3 天 · 累计 10 天」；群聊优先查 OneBot `get_group_member_info` 的 `card`（群名片），成员未设置群名片时只能显示 QQ 昵称；`false`=只显示天数。名字按 16 字截断，卡片上不渲染 emoji。可用 `/溯源昵称` 诊断 |
 | `checkin.border_px` | `0` | 卡片边框宽度；`0`=按图片宽度自动（约 4.5%，最小 12px） |
 | `checkin.utc_offset_hours` | `8` | 签到日期按该 UTC 偏移计算（默认北京时间，每天 0 点刷新） |
 | `checkin.quote_source` | `builtin` | `builtin`=只用本地 `quotes.txt` / `api`=优先在线语句接口，失败回退本地 / `mixed`=每次随机本地或在线，在线失败回退本地 |
