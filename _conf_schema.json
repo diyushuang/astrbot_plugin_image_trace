@@ -626,7 +626,7 @@
         "description": "【选填】显示签到者群昵称",
         "type": "bool",
         "default": true,
-        "hint": "true=在签到文字里带上发送者群昵称（群聊内优先查 OneBot get_group_member_info 的群名片 card，成员未设置群名片时只能显示 QQ 昵称；QQ 官方机器人不支持群昵称；消息首行「✅ 群昵称 签到成功…」+ 卡片页脚「群昵称 · 连续签到 3 天 · 累计 10 天」）；false=只显示天数。名字超长会截断到 16 字，卡片上不渲染 emoji。可在群里发 /溯源昵称 诊断实际取到的值。"
+        "hint": "true=在签到文字里带上发送者群昵称（群聊内优先查 OneBot get_group_member_info 的群名片 card，成员未设置群名片时只能显示 QQ 昵称；QQ 官方机器人 qq_official 没有群名片/群昵称，只能显示事件 username 的 QQ 昵称；消息首行「✅ 群昵称 签到成功…」+ 卡片页脚「群昵称 · 连续签到 3 天 · 累计 10 天」）；false=只显示天数。名字超长会截断到 16 字，卡片上不渲染 emoji。可在群里发 /溯源昵称 诊断实际取到的值。"
       },
       "border_px": {
         "description": "【选填】卡片边框宽度（像素）",

@@ -261,6 +261,8 @@ QQ_IMAGE_FILE_TYPE = 1
 QQ_TRANSCODE_MAX_PIXELS = 50_000_000
 # OneBot 系平台名：只有这些平台才有群名片（card）概念
 ONEBOT_PLATFORM_NAMES = frozenset({"aiocqhttp", "onebot", "napcat", "lagrange"})
+# QQ 官方机器人平台名：事件与群成员接口只提供 username（QQ 昵称），没有群名片
+QQ_OFFICIAL_PLATFORM = "qq_official"
 
 # ----------------------------------------------------------------------
 # 配置布局（1.7.14）：同类项合并进 basic / delivery / limits 三个组。
@@ -1459,6 +1461,53 @@ class ImageTracePlugin(Star):
         )
         return None, "接口返回了非对象结果"
 
+    async def _qq_official_member_info(
+        self, event: AstrMessageEvent
+    ) -> tuple[dict | None, str]:
+        """查 QQ 官方群成员信息（只有 username，没有群名片）。
+
+        官方 ``GET /v2/groups/{group_openid}/members/{member_openid}`` 目前是
+        内邀白名单能力（无权限返回 11253）。官方群消息事件本身已带
+        ``author.username``，所以只有事件昵称为空时才需要这里兜底；返回
+        ``(info, error)`` 供诊断指令展示，失败不阻断签到。
+        """
+        if self._onebot_platform(event) != QQ_OFFICIAL_PLATFORM:
+            return None, ""
+        try:
+            group_id = str(event.get_group_id() or "").strip()
+            user_id = str(event.get_sender_id() or "").strip()
+        except Exception:
+            return None, ""
+        bot = getattr(event, "bot", None)
+        http = getattr(getattr(bot, "api", None), "_http", None)
+        request = getattr(http, "request", None)
+        if not (group_id and user_id and callable(request)):
+            return None, ""
+        try:
+            from botpy.http import Route
+        except Exception as exc:
+            return None, sanitize_error_text(exc)
+        route = Route(
+            "GET",
+            "/v2/groups/{group_openid}/members/{member_openid}",
+            group_openid=group_id,
+            member_openid=user_id,
+        )
+        try:
+            info = await asyncio.wait_for(request(route), timeout=5)
+        except Exception as exc:
+            detail = sanitize_error_text(exc)
+            logger.warning(
+                f"QQ 官方群成员查询失败（群={group_id}, 用户={user_id}）: {detail}"
+            )
+            return None, detail
+        if isinstance(info, dict):
+            return info, ""
+        logger.warning(
+            f"QQ 官方群成员查询返回非对象结果（群={group_id}, 用户={user_id}）: {info!r}"
+        )
+        return None, "接口返回了非对象结果"
+
     @staticmethod
     def _pick_checkin_name(
         event_card: str, member_info: dict | None, event_name: str
@@ -1487,13 +1536,24 @@ class ImageTracePlugin(Star):
         return "", "无"
 
     async def _resolve_checkin_name(self, event: AstrMessageEvent) -> tuple[str, str]:
-        """签到者显示名与来源：事件字段 + OneBot 群成员接口。"""
+        """签到者显示名与来源：QQ 官方 / OneBot / 事件字段。"""
         event_card = ""
         event_name = ""
         with contextlib.suppress(Exception):
             event_card = self._checkin_event_card(event)
         with contextlib.suppress(Exception):
             event_name = " ".join(str(event.get_sender_name() or "").split())
+        if self._onebot_platform(event) == QQ_OFFICIAL_PLATFORM:
+            # QQ 官方没有群名片：事件 username 就是唯一可用昵称；只有它为空
+            # 时才去试内邀制的群成员接口（失败/无权限都回退空串）。
+            if event_name:
+                return event_name, "事件昵称"
+            info, _error = await self._qq_official_member_info(event)
+            if isinstance(info, dict):
+                name = " ".join(str(info.get("username") or "").split())
+                if name:
+                    return name, "官方群成员接口.username"
+            return "", "无"
         member_info, _error = await self._checkin_member_info(event)
         return self._pick_checkin_name(event_card, member_info, event_name)
 
@@ -2939,28 +2999,53 @@ class ImageTracePlugin(Star):
         lines.append(f"事件昵称：{event_name or '（空）'}")
         lines.append(f"事件群名片：{event_card or '（空）'}")
 
-        member_info, api_error = await self._checkin_member_info(event)
-        if isinstance(member_info, dict):
-            api_card = " ".join(str(member_info.get("card") or "").split())
-            api_nick = " ".join(str(member_info.get("nickname") or "").split())
-            lines.append(
-                f"群成员接口：card「{api_card or '（空）'}」/ "
-                f"nickname「{api_nick or '（空）'}」"
-            )
-            if not api_card:
+        if platform == QQ_OFFICIAL_PLATFORM:
+            member_info, api_error = await self._qq_official_member_info(event)
+            api_name = ""
+            if isinstance(member_info, dict):
+                api_name = " ".join(str(member_info.get("username") or "").split())
+                api_role = str(member_info.get("member_role") or "").strip()
                 lines.append(
-                    "说明：接口返回的群名片为空，该成员未设置群昵称（QQ 显示的就是昵称）。"
+                    f"官方群成员接口：username「{api_name or '（空）'}」"
+                    + (f" / member_role「{api_role}」" if api_role else "")
                 )
-        elif platform not in ONEBOT_PLATFORM_NAMES:
-            lines.append("群成员接口：未调用（当前平台不是 OneBot 系，没有群名片概念）。")
-        elif not group_id:
-            lines.append("群成员接口：未调用（私聊没有群昵称）。")
-        elif api_error:
-            lines.append(f"群成员接口：失败（{api_error}）")
+            elif api_error:
+                lines.append(f"官方群成员接口：失败（{api_error}）")
+            else:
+                lines.append("官方群成员接口：不可用（缺少 bot / 群号 / 用户号）。")
+            lines.append(
+                "说明：QQ 官方机器人没有群名片/群昵称，事件与接口都只提供 "
+                "username（QQ 昵称）；无法显示与 QQ 昵称不同的群昵称。"
+            )
+            if event_name:
+                name, source = event_name, "事件昵称"
+            elif api_name:
+                name, source = api_name, "官方群成员接口.username"
+            else:
+                name, source = "", "无"
         else:
-            lines.append("群成员接口：不可用（缺少 bot / 群号 / 用户号）。")
+            member_info, api_error = await self._checkin_member_info(event)
+            if isinstance(member_info, dict):
+                api_card = " ".join(str(member_info.get("card") or "").split())
+                api_nick = " ".join(str(member_info.get("nickname") or "").split())
+                lines.append(
+                    f"群成员接口：card「{api_card or '（空）'}」/ "
+                    f"nickname「{api_nick or '（空）'}」"
+                )
+                if not api_card:
+                    lines.append(
+                        "说明：接口返回的群名片为空，该成员未设置群昵称（QQ 显示的就是昵称）。"
+                    )
+            elif platform not in ONEBOT_PLATFORM_NAMES:
+                lines.append("群成员接口：未调用（当前平台不是 OneBot 系，没有群名片概念）。")
+            elif not group_id:
+                lines.append("群成员接口：未调用（私聊没有群昵称）。")
+            elif api_error:
+                lines.append(f"群成员接口：失败（{api_error}）")
+            else:
+                lines.append("群成员接口：不可用（缺少 bot / 群号 / 用户号）。")
 
-        name, source = self._pick_checkin_name(event_card, member_info, event_name)
+            name, source = self._pick_checkin_name(event_card, member_info, event_name)
         shown = name if len(name) <= 16 else name[:16].rstrip() + "…"
         lines.append(f"最终：{shown or '（空）'}（来源：{source}）")
         yield event.plain_result("\n".join(lines))

@@ -828,6 +828,110 @@ async def test_nickname_diag_non_onebot_explains_unsupported(make_plugin, make_e
     assert "最终：测试用户（来源：事件昵称）" in text
 
 
+class _FakeQQHTTP:
+    """QQ 官方 HTTP 客户端替身：记录 Route 并返回固定群成员信息。"""
+
+    def __init__(self, payload=None, *, error=None):
+        self.payload = payload
+        self.error = error
+        self.calls = []
+
+    async def request(self, route, **kwargs):
+        self.calls.append((route.method, route.path, route.params))
+        if self.error is not None:
+            raise self.error
+        return self.payload
+
+
+class _FakeQQBot:
+    def __init__(self, http):
+        self.api = SimpleNamespace(_http=http)
+
+
+async def test_checkin_sender_name_qq_official_uses_event_username(
+    make_plugin, make_event
+):
+    """QQ 官方事件自带 username；有值时不再请求内邀制群成员接口。"""
+    plugin = make_plugin()
+    http = _FakeQQHTTP({"username": "官方接口昵称"})
+    event = make_event(
+        "/签到",
+        platform="qq_official",
+        sender_id="member-openid",
+        group_id="group-openid",
+        bot=_FakeQQBot(http),
+    )
+
+    assert await plugin._checkin_sender_name(event) == "测试用户"
+    assert http.calls == []
+
+
+async def test_checkin_sender_name_qq_official_falls_back_to_member_api(
+    make_plugin, make_event
+):
+    """事件 username 为空时才查官方群成员接口（只返回 username，无群名片）。"""
+    plugin = make_plugin()
+    http = _FakeQQHTTP({"username": "官方接口昵称", "member_role": "member"})
+    event = make_event(
+        "/签到",
+        platform="qq_official",
+        sender_id="member-openid",
+        group_id="group-openid",
+        bot=_FakeQQBot(http),
+    )
+    event.get_sender_name = lambda: ""
+
+    assert await plugin._checkin_sender_name(event) == "官方接口昵称"
+    assert http.calls == [
+        (
+            "GET",
+            "/v2/groups/{group_openid}/members/{member_openid}",
+            {"group_openid": "group-openid", "member_openid": "member-openid"},
+        )
+    ]
+
+
+async def test_checkin_sender_name_qq_official_api_forbidden_falls_back_empty(
+    make_plugin, make_event
+):
+    """官方群成员接口无白名单权限（11253）时，签到不能中断。"""
+    plugin = make_plugin()
+    http = _FakeQQHTTP(error=RuntimeError("11253 应用无接口访问权限"))
+    event = make_event(
+        "/签到",
+        platform="qq_official",
+        sender_id="member-openid",
+        group_id="group-openid",
+        bot=_FakeQQBot(http),
+    )
+    event.get_sender_name = lambda: ""
+
+    assert await plugin._checkin_sender_name(event) == ""
+
+
+async def test_nickname_diag_qq_official_explains_no_group_card(
+    make_plugin, make_event
+):
+    """QQ 官方诊断明确说明没有群名片，并展示接口 username。"""
+    plugin = make_plugin()
+    http = _FakeQQHTTP({"username": "官方接口昵称", "member_role": "member"})
+    event = make_event(
+        "/溯源昵称",
+        platform="qq_official",
+        sender_id="member-openid",
+        group_id="group-openid",
+        bot=_FakeQQBot(http),
+    )
+
+    results = [result async for result in plugin.nickname_diag(event)]
+    text = results[0].text
+
+    assert "平台：qq_official" in text
+    assert "官方群成员接口：username「官方接口昵称」" in text
+    assert "没有群名片/群昵称" in text
+    assert "最终：测试用户（来源：事件昵称）" in text
+
+
 async def test_checkin_settings_defaults_for_text_switches(make_plugin):
     """两个新开关默认都为真（升级即保持原行为 + 带昵称）。"""
     settings = make_plugin()._checkin_settings()

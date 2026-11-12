@@ -1,5 +1,13 @@
 # 更新日志
 
+## 1.7.25（2026-11-12，qq_official 昵称按官方文档兜底）
+
+- **兼容**：`qq_official` 平台按官方文档处理昵称：群消息事件自带 `author.username`（QQ 昵称），优先直接使用；只有事件昵称为空时才调用官方 `GET /v2/groups/{group_openid}/members/{member_openid}` 取 `username` 兜底。
+- **说明**：QQ 官方机器人没有群名片/群昵称字段，群成员接口也只返回 `username`，且目前是内邀白名单能力（无权限返回 11253）；因此 `qq_official` 下无法显示与 QQ 昵称不同的群昵称，插件不再尝试 OneBot 的 `get_group_member_info`。
+- **诊断**：`/溯源昵称` 增加 `qq_official` 分支，显示事件 `username`、官方接口 `username` / `member_role` 或失败原因，并明确提示「没有群名片/群昵称」。
+- **文档**：`checkin.show_sender` 配置说明与 README 同步补充 `qq_official` 限制。
+- **测试**：新增 4 例（`qq_official` 事件 username 优先、事件为空查官方接口、11253 无权限回退、诊断说明），全量 **450 passed**，`ruff check` 全绿。
+
 ## 1.7.24（2026-11-12，签到群昵称接口修复与诊断）
 
 - **修复**：1.7.23 的 `get_group_member_info` 兜底把 `group_id` / `user_id` 按字符串传给 OneBot，而 OneBot v11 / SnowLuma 文档要求 `uint` 数字；参数校验失败后异常只进 debug，签到继续回退 QQ 昵称，表现为「已升级 1.7.23 但仍不显示群昵称」。现在纯数字 ID 一律转 `int`、显式带 `no_cache=True`，超时从 3 秒放宽到 5 秒。
