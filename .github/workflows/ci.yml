@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, refactor/architecture]
   pull_request:
 
 jobs:
@@ -28,15 +28,11 @@ jobs:
       - name: Pytest
         # 完整输出写文件，只打印尾部：失败时既能看到摘要与首个 traceback，
         # 又不会让 GitHub 因步骤日志过大而截断（截断后反而看不到根因）。
-        # 同时只对纯规则模块采集覆盖率（main 等入口层不设硬门槛）。
+        # 覆盖率采集整个包，门禁脚本再按模块分别卡阈值。
         run: |
           set +e
           pytest -q \
-            --cov=astrbot_plugin_image_trace.image_delivery \
-            --cov=astrbot_plugin_image_trace.features \
-            --cov=astrbot_plugin_image_trace.weibo_posts \
-            --cov=astrbot_plugin_image_trace.delivery.planner \
-            --cov=astrbot_plugin_image_trace.config \
+            --cov=astrbot_plugin_image_trace \
             --cov-report=json:coverage.json \
             > pytest.log 2>&1
           status=$?

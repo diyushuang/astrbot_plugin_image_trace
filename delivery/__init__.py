@@ -6,7 +6,6 @@ from .channels import ChainChannel, OneBotChannel, QQOfficialChannel
 from .planner import DeliveryPlan, plan_delivery
 from .service import DeliveryService, EventGuard
 from .types import (
-    DeliveryChannel,
     DeliveryConfig,
     DeliveryContext,
     DeliveryProfile,
@@ -16,7 +15,6 @@ from .types import (
 
 __all__ = [
     "ChainChannel",
-    "DeliveryChannel",
     "DeliveryConfig",
     "DeliveryContext",
     "DeliveryPlan",

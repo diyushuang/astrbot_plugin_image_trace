@@ -58,10 +58,7 @@ class StorageRegistry:
         config,
         http_getter: Callable[[], Awaitable[GuardedHttpClient]],
     ) -> None:
-        try:  # 包模式
-            from ..image_bed import ImageBedClient
-        except ImportError:  # 兼容插件以独立模块方式加载
-            from image_bed import ImageBedClient  # type: ignore[no-redef]
+        from ..image_bed import ImageBedClient
 
         self._client = ImageBedClient(data_dir, config, http_getter)
         self.active: ImageStore = ImageBedStoreAdapter(self._client)

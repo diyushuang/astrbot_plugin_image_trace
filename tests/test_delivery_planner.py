@@ -40,7 +40,6 @@ def _plan(
 
 def test_onebot_auto_compresses_bytes_then_falls_back_to_url_chain() -> None:
     plan = _plan("auto")
-    assert plan.run_offbox is False
     assert plan.direct_ok is False
     assert plan.local_compress is True
     assert plan.local_bytes_chain is False
@@ -89,7 +88,6 @@ def test_onebot_url_mixed_url_and_path_does_not_try_direct() -> None:
 
 def test_qq_official_auto_runs_offbox_then_chain_bytes() -> None:
     plan = _plan("auto", profile=QQ_OFFICIAL)
-    assert plan.run_offbox is True
     assert plan.direct_ok is False
     assert plan.local_compress is False  # 没有 OneBot 直发能力
     assert plan.local_bytes_chain is True
@@ -98,7 +96,6 @@ def test_qq_official_auto_runs_offbox_then_chain_bytes() -> None:
 
 def test_qq_official_url_stays_url_chain_after_offbox() -> None:
     plan = _plan("url", profile=QQ_OFFICIAL)
-    assert plan.run_offbox is True
     assert plan.direct_ok is False
     assert plan.local_bytes_chain is False
     assert plan.stages == ("offbox", "url_chain")

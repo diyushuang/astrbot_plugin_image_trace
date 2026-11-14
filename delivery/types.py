@@ -7,7 +7,7 @@ main 负责把 AstrBot 事件适配成 `DeliveryRequest`，通道实现负责真
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from typing import Any
 
 
 @dataclass
@@ -19,7 +19,6 @@ class DeliveryRequest:
     mode_override: str | None = None
     allow_local_fallback: bool = True
     mark_compressed: bool = False
-    remember_blocks: list[dict] | None = None
 
 
 @dataclass
@@ -37,7 +36,6 @@ class DeliveryResult:
 
     outcome: str = "failed"
     sent_count: int = 0
-    evidence: list[Any] = field(default_factory=list)
     fallback_reason: str = ""
     chain: list[Any] | None = None
 
@@ -49,7 +47,6 @@ class DeliveryProfile:
     name: str = ""
     direct_send: bool = False
     offbox_upload: bool = False
-    native_mention: bool = False
 
     @classmethod
     def from_target(cls, target) -> DeliveryProfile:
@@ -57,7 +54,6 @@ class DeliveryProfile:
             name=str(getattr(target, "name", "") or ""),
             direct_send=bool(getattr(target, "direct_send", False)),
             offbox_upload=bool(getattr(target, "offbox_upload", False)),
-            native_mention=bool(getattr(target, "native_mention", False)),
         )
 
 
@@ -80,14 +76,5 @@ class DeliveryContext:
     plan: Any
     image_blocks: list[dict] = field(default_factory=list)
     url_plan: Any = None
-
-
-@runtime_checkable
-class DeliveryChannel(Protocol):
-    """发送通道：先判定能否处理某份计划，再执行。"""
-
-    name: str
-
-    def can_handle(self, plan) -> bool: ...
 
     async def deliver(self, context: DeliveryContext) -> DeliveryResult: ...

@@ -1,31 +1,31 @@
 """media / storage 层可脱离 AstrBot 独立加载的冒烟用例。
 
-做法：按文件路径把目标模块当成顶层模块加载（`__package__` 为空，包内相对
-import 失败后会走各模块自带的保底分支），并在加载期间拦截所有 `astrbot.*`
-导入。这样能证明这两层没有硬依赖 AstrBot，后续抽库时可以直接搬走。
+做法：清空本次要验证的包模块后，在屏蔽所有 ``astrbot.*`` 导入的前提下按包
+路径重新导入目标模块。这样既能证明这两层没有硬依赖 AstrBot，也不再需要各
+模块维护「包加载 / 平铺加载」两套 import 回退。
 """
 
 from __future__ import annotations
 
 import builtins
-import importlib.util
+import importlib
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "astrbot_plugin_image_trace"
 
 
-def _load_standalone(relative_path: str, module_name: str):
-    """以顶层模块方式加载 rel_path，期间 astrbot 不可导入。"""
-    spec = importlib.util.spec_from_file_location(module_name, ROOT / relative_path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    before = set(sys.modules)
-    saved = sys.modules.get(module_name)
-    sys.modules[module_name] = module
-    inserted = str(ROOT) not in sys.path
-    if inserted:
-        sys.path.insert(0, str(ROOT))
+def _import_without_astrbot(module_name: str):
+    """在 astrbot 不可导入的条件下重新导入目标包模块。"""
+    saved = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == PACKAGE or name.startswith(PACKAGE + ".")
+    }
+    for name in saved:
+        sys.modules.pop(name, None)
+
     real_import = builtins.__import__
 
     def guarded(name, globals=None, locals=None, fromlist=(), level=0):
@@ -35,33 +35,24 @@ def _load_standalone(relative_path: str, module_name: str):
 
     builtins.__import__ = guarded
     try:
-        spec.loader.exec_module(module)
+        return importlib.import_module(module_name)
     finally:
         builtins.__import__ = real_import
-        if inserted:
-            sys.path.remove(str(ROOT))
-        # 清掉本次加载引入的仓库内顶层模块，避免污染其它用例
-        for name in set(sys.modules) - before:
-            loaded = sys.modules.get(name)
-            file_path = getattr(loaded, "__file__", None)
-            if file_path and Path(file_path).resolve().parent == ROOT:
+        for name in list(sys.modules):
+            if (name == PACKAGE or name.startswith(PACKAGE + ".")) and name not in saved:
                 sys.modules.pop(name, None)
-        if saved is None:
-            sys.modules.pop(module_name, None)
-        else:
-            sys.modules[module_name] = saved
-    return module
+        sys.modules.update(saved)
 
 
 def test_media_image_source_imports_without_astrbot() -> None:
-    module = _load_standalone("media/image_source.py", "_standalone_image_source")
-    assert module.ImageSource.__module__ == "_standalone_image_source"
-    assert module.ResolvedImage.__module__ == "_standalone_image_source"
+    module = _import_without_astrbot(f"{PACKAGE}.media.image_source")
+    assert module.ImageSource.__module__ == f"{PACKAGE}.media.image_source"
+    assert module.ResolvedImage.__module__ == f"{PACKAGE}.media.image_source"
 
 
 def test_storage_protocol_imports_without_astrbot() -> None:
-    module = _load_standalone("storage/protocol.py", "_standalone_storage_protocol")
+    module = _import_without_astrbot(f"{PACKAGE}.storage.protocol")
     result = module.StoreResult(ok=True, url="https://example.com/a.jpg")
     assert result.ok is True
     assert result.url == "https://example.com/a.jpg"
-    assert module.ImageStore.__module__ == "_standalone_storage_protocol"
+    assert module.ImageStore.__module__ == f"{PACKAGE}.storage.protocol"

@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-try:  # 包加载
-    from ..image_delivery import build_original_url
-    from ..random_media import clean_display_name, is_thumbnail_url, strip_leading_decoration
-except ImportError:  # 兼容插件以独立模块方式加载
-    from image_delivery import build_original_url
-    from random_media import clean_display_name, is_thumbnail_url, strip_leading_decoration
-
 from astrbot.api import logger
+
+from ..image_delivery import build_original_url
+from ..random_media import clean_display_name, is_thumbnail_url, strip_leading_decoration
 
 
 class OriginalController:

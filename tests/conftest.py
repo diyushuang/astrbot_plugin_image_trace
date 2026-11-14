@@ -202,6 +202,19 @@ _install("astrbot.core.utils")
 _install("astrbot.core.utils.astrbot_path", get_astrbot_data_path=_get_astrbot_data_path)
 
 
+class _Route:
+    """botpy.http.Route 替身：只记录 method/path/params，供 QQ 官方接口用例断言。"""
+
+    def __init__(self, method, path, **params):
+        self.method = method
+        self.path = path
+        self.params = params
+
+
+_install("botpy")
+_install("botpy.http", Route=_Route)
+
+
 # ----------------------------------------------------------------------
 # 2) 事件 / 结果 / 配置替身
 # ----------------------------------------------------------------------

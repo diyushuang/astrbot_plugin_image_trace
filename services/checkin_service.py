@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+from datetime import datetime, timedelta, timezone
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
@@ -112,7 +113,9 @@ class CheckinService:
             yield event.plain_result("无法识别发送者，签到失败。")
             return
 
-        today = self.host._checkin_today(settings["utc_offset_hours"])
+        today = datetime.now(
+            timezone(timedelta(hours=settings["utc_offset_hours"]))
+        ).date()
         try:
             outcome = await asyncio.to_thread(self.host.checkin_store.check_in, user_id, today)
         except Exception as exc:
@@ -120,7 +123,11 @@ class CheckinService:
             yield event.plain_result("签到记录写入失败，请稍后再试。")
             return
         # 昵称（checkin.show_sender）同时进消息文字与卡片页脚；取不到就整行省略。
-        name = self.host._checkin_sender_name(event) if settings["show_sender"] else ""
+        name = (
+            await self.host._checkin_sender_name(event)
+            if settings["show_sender"]
+            else ""
+        )
         who = f"{name} " if name else ""
         if outcome.already:
             header = (
@@ -162,7 +169,7 @@ class CheckinService:
                 simple_text = (
                     f"{header}\n📝 {post.account_display} · {post.date_display}"
                 )
-                async for result in self.host._deliver_checkin(
+                async for result in self._deliver_checkin(
                     event,
                     header,
                     quote,
@@ -212,7 +219,7 @@ class CheckinService:
             quote = ""
         footer = self.host._checkin_line(name, outcome)
         block_name = original_name or clean_display_name(original_url) or "今日签到"
-        async for result in self.host._deliver_checkin(
+        async for result in self._deliver_checkin(
             event,
             header,
             quote,

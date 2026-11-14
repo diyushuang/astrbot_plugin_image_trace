@@ -16,11 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-try:
-    from ..image_delivery import is_napcat_parseable_url
-except ImportError:  # 兼容独立模块加载
-    from image_delivery import is_napcat_parseable_url  # type: ignore[no-redef]
-
+from ..image_delivery import is_napcat_parseable_url
 from .types import DeliveryConfig, DeliveryProfile, DeliveryRequest
 
 DIRECT_MODES = frozenset({"url", "url-scaled"})
@@ -34,18 +30,11 @@ class DeliveryPlan:
     max_side: int
     quality: int
     scaled_url_style: str
-    run_offbox: bool = False
     direct_ok: bool = False
-    allow_local_fallback: bool = True
     local_compress: bool = False
     local_bytes_chain: bool = False
     prepare_compress: bool = True
-    needs_url_plan: bool = True
     stages: tuple[str, ...] = ()
-
-    @property
-    def direct_mode(self) -> bool:
-        return self.mode in DIRECT_MODES
 
 
 def plan_delivery(
@@ -94,12 +83,9 @@ def plan_delivery(
         max_side=config.max_side,
         quality=config.quality,
         scaled_url_style=config.scaled_url_style,
-        run_offbox=profile.offbox_upload,
         direct_ok=direct_ok,
-        allow_local_fallback=request.allow_local_fallback,
         local_compress=local_compress,
         local_bytes_chain=local_bytes_chain,
         prepare_compress=mode != "url",
-        needs_url_plan=True,
         stages=tuple(stages),
     )

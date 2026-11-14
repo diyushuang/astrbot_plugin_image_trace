@@ -17,10 +17,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-try:  # 包模式：astrbot_plugin_image_trace.config.migrations
-    from ..common import is_blank
-except ImportError:  # 兼容插件以独立模块方式加载（仓库目录在 sys.path 上）
-    from common import is_blank  # type: ignore[no-redef]
+from ..common import is_blank
 
 logger = logging.getLogger("astrbot")
 

@@ -17,38 +17,21 @@ from urllib.parse import urlparse
 
 import aiohttp
 
-try:  # 包模式：astrbot_plugin_image_trace.media.image_source
-    from ..common import (
-        DOWNLOAD_CHUNK_SIZE,
-        DOWNLOAD_TIMEOUT,
-        MEMORY_DOWNLOAD_MAX_BYTES,
-        PROBE_TIMEOUT,
-        is_qq_image_bed_host,
-        read_bytes,
-    )
-    from ..features import ImageFeatures, heif_available
-    from ..image_delivery import (
-        classify_probe_status,
-        content_length_from_headers,
-        is_scaling_capability_rejection,
-        sniff_image_format,
-    )
-except ImportError:  # 兼容插件以独立模块方式加载
-    from common import (  # type: ignore[no-redef]
-        DOWNLOAD_CHUNK_SIZE,
-        DOWNLOAD_TIMEOUT,
-        MEMORY_DOWNLOAD_MAX_BYTES,
-        PROBE_TIMEOUT,
-        is_qq_image_bed_host,
-        read_bytes,
-    )
-    from features import ImageFeatures, heif_available  # type: ignore[no-redef]
-    from image_delivery import (  # type: ignore[no-redef]
-        classify_probe_status,
-        content_length_from_headers,
-        is_scaling_capability_rejection,
-        sniff_image_format,
-    )
+from ..common import (
+    DOWNLOAD_CHUNK_SIZE,
+    DOWNLOAD_TIMEOUT,
+    MEMORY_DOWNLOAD_MAX_BYTES,
+    PROBE_TIMEOUT,
+    is_qq_image_bed_host,
+    read_bytes,
+)
+from ..features import ImageFeatures, heif_available
+from ..image_delivery import (
+    classify_probe_status,
+    content_length_from_headers,
+    is_scaling_capability_rejection,
+    sniff_image_format,
+)
 
 try:
     from astrbot.api import logger

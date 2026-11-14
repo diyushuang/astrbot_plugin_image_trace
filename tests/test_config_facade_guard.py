@@ -21,26 +21,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 # main 上已收口为薄委托的配置方法：新模块只允许调 config.loader / config.migrations
 PRIVATE_CONFIG_METHODS = {
-    "_cfg",
-    "_int_cfg",
-    "_float_cfg",
-    "_bool_cfg",
-    "_dict_cfg",
-    "_napcat_delivery_cfg",
-    "_qq_delivery_cfg",
     "_delivery_config",
-    "_bucket_config",
-    "_effective_bed_cfg",
     "_random_settings",
     "_checkin_settings",
-    "_verify_scaled",
-    "_onebot_image_timeout",
-    "_encode_options",
-    "_qq_upload_config",
-    "_scan_dirs",
-    "_first_value",
-    "_engine_choice",
-    "_vector_index_on_register",
+    "_bool_cfg",
 }
 
 # 目录名 -> 不参与检查（测试自身要构造插件、也可能引用兼容常量）

@@ -5,18 +5,12 @@ from __future__ import annotations
 import asyncio
 import os
 
-try:  # 包加载
-    from ..config.loader import bool_cfg, vector_index_on_register
-    from ..config.typed import DEFAULT_BASIC
-    from ..features import compute_features, compute_features_with_mime
-    from ..image_bed import MODE_CFB
-except ImportError:  # 兼容插件以独立模块方式加载
-    from config.loader import bool_cfg, vector_index_on_register
-    from config.typed import DEFAULT_BASIC
-    from features import compute_features, compute_features_with_mime
-    from image_bed import MODE_CFB
-
 from astrbot.api import logger
+
+from ..config.loader import bool_cfg, vector_index_on_register
+from ..config.typed import DEFAULT_BASIC
+from ..features import compute_features, compute_features_with_mime
+from ..image_bed import MODE_CFB
 
 
 class RegisterController:

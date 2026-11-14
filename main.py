@@ -25,12 +25,10 @@ import random
 import secrets
 import time
 from collections.abc import AsyncGenerator
-from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import unquote, urlparse, urlsplit
 
-import aiohttp
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -72,25 +70,18 @@ from .common import (
 )
 from .config.loader import (
     bool_cfg,
-    bucket_config,
     checkin_settings,
     delivery_config,
     dict_group,
     effective_bed_cfg,
     encode_options,
     engine_choice,
-    ensure_group_cfg,
-    first_value,
     float_cfg,
     int_cfg,
-    napcat_delivery_cfg,
     onebot_image_timeout,
-    qq_delivery_cfg,
     qq_upload_config,
     random_settings,
     scalar_cfg,
-    scan_dirs,
-    vector_index_on_register,
     verify_scaled,
 )
 from .config.migrations import (
@@ -147,14 +138,7 @@ from .image_delivery import (
     upgrade_to_https,
 )
 from .library import ImageLibrary
-from .media.image_source import (
-    ImageSource,
-    ResolvedImage,
-    decode_fail_message,
-    download_fail_message,
-    image_download_headers,
-    range_probe_headers,
-)
+from .media.image_source import ImageSource, ResolvedImage
 from .media_history import MediaHistory
 from .random_media import (
     RandomMediaClient,
@@ -175,6 +159,7 @@ from .services import (
     RandomService,
     TraceService,
 )
+from .services.checkin_identity import checkin_sender_name
 from .storage import StorageRegistry
 from .url_guard import read_limited_bytes
 from .vector_search import VectorEngine
@@ -235,11 +220,11 @@ class ImageTracePlugin(Star):
         os.makedirs(self.tmp_dir, exist_ok=True)
 
         # 旧布局先搬进 basic / delivery / limits，后续读取一律走新路径
-        self._migrate_config_layout()
+        migrate_config_layout(self.config)
         # pHash 十六进制长度 = phash_hex_len(hash_size)（packbits 补齐到字节
         # 边界）；hash_size 必须为 4 的倍数，否则长度公式与旧数据对不上，
         # 全库记录都会被判为不匹配、索引静默清空
-        hash_size = as_int(self._cfg("hash_size"), DEFAULT_BASIC.hash_size)
+        hash_size = as_int(scalar_cfg(self.config, "hash_size"), DEFAULT_BASIC.hash_size)
         if not 4 <= hash_size <= 32 or hash_size % 4 != 0:
             logger.warning(
                 f"hash_size 配置值 {hash_size} 无效（须为 4~32 之间 4 的倍数，"
@@ -253,17 +238,17 @@ class ImageTracePlugin(Star):
         )
         self.hash_threshold = max(
             0.0,
-            min(1.0, self._float_cfg("similarity_threshold", DEFAULT_BASIC.hash_similarity_threshold)),
+            min(1.0, float_cfg(self.config, "similarity_threshold", DEFAULT_BASIC.hash_similarity_threshold)),
         )
         # 配置上限：这两个值直接放大网络请求量与消息长度，手改离谱值时必须收敛
-        self.top_n = max(0, min(50, self._int_cfg("top_n", DEFAULT_BASIC.top_n)))
+        self.top_n = max(0, min(50, int_cfg(self.config, "top_n", DEFAULT_BASIC.top_n)))
         self.max_images_per_query = max(
             1,
-            min(10, self._int_cfg("max_images_per_query", DEFAULT_BASIC.max_images_per_query)),
+            min(10, int_cfg(self.config, "max_images_per_query", DEFAULT_BASIC.max_images_per_query)),
         )
         # v1.2.x 的储存桶配置先迁移，再合并（储存桶完整时优先于图床）
-        self._migrate_bucket_config()
-        self._bed_cfg = self._effective_bed_cfg()
+        migrate_bucket_config(self.config)
+        self._bed_cfg = effective_bed_cfg(self.config)
         self._http: GuardedHttpClient | None = None
         # 内网直连白名单按实例持有：交给本实例的 GuardedHttpClient，避免多个
         # 插件实例通过模块级全局集合互相覆盖（旧实现 terminate 会清掉别人的白名单）
@@ -333,7 +318,7 @@ class ImageTracePlugin(Star):
         cache_note = ""
         if self.remote_hash_on() and self.remote_hash.load_cache():
             cache_note = f"（图床哈希缓存 {self.remote_hash.count} 条）"
-        engine = self._engine_choice()
+        engine = engine_choice(self.config)
         vector_note = "（向量引擎已启用）" if self.vector.enabled and engine != "hash" else ""
         bucket_note = (
             f"（储存桶 {self._bed_mode()} 优先）" if self._bed_mode() in BUCKET_MODES else ""
@@ -381,12 +366,12 @@ class ImageTracePlugin(Star):
 
     def _remote_hash_ttl(self) -> int:
         """缓存最长有效期（秒）。缓存新鲜时启动/溯源都不重新拉取。"""
-        return max(300, self._int_cfg("remote_hash_ttl", DEFAULT_LIMITS.remote_hash_ttl))
+        return max(300, int_cfg(self.config, "remote_hash_ttl", DEFAULT_LIMITS.remote_hash_ttl))
 
     def _remote_hash_max_points(self) -> int:
         """拉取上限（0 = 不限）。用于先小样本验证链路，再放开全量。"""
         return max(
-            0, self._int_cfg("remote_hash_max_points", DEFAULT_LIMITS.remote_hash_max_points)
+            0, int_cfg(self.config, "remote_hash_max_points", DEFAULT_LIMITS.remote_hash_max_points)
         )
 
     def _remote_hash_cache_fresh(self) -> bool:
@@ -456,56 +441,9 @@ class ImageTracePlugin(Star):
     # 配置读取
     # ------------------------------------------------------------------
 
-    def _dict_cfg(self, key: str) -> dict:
-        """取对象型配置；实现见 config.loader.dict_group。"""
-        return dict_group(self.config, key)
-
-    def _ensure_group(self, name: str) -> dict:
-        """取（必要时创建）对象型配置组，实现见 config.migrations。"""
-        return ensure_group_cfg(self.config, name)
-
-    def _cfg(self, key: str):
-        """读标量配置：新布局（basic / limits）优先，回落旧顶层键。"""
-        return scalar_cfg(self.config, key)
-
-    def _int_cfg(self, key: str, default: int) -> int:
-        return int_cfg(self.config, key, default)
-
-    def _float_cfg(self, key: str, default: float) -> float:
-        return float_cfg(self.config, key, default)
-
     def _bool_cfg(self, key: str, default: bool) -> bool:
         """布尔配置：未配置（缺键/空串/null）时取默认值，与数值配置口径一致。"""
         return bool_cfg(self.config, key, default)
-
-    def _migrate_config_layout(self) -> None:
-        """把旧布局搬进 basic / delivery / limits；实现见 config.migrations。"""
-        migrate_config_layout(self.config)
-
-    def _napcat_delivery_cfg(self) -> dict:
-        """推送通道（NapCat）配置，实现见 config.loader.napcat_delivery_cfg。"""
-        return napcat_delivery_cfg(self.config)
-
-    def _qq_delivery_cfg(self) -> dict:
-        """推送通道（QQ 官方）配置，实现见 config.loader.qq_delivery_cfg。"""
-        return qq_delivery_cfg(self.config)
-
-    @staticmethod
-    def _first_value(*values):
-        """取第一个非空值（0 / False 是合法配置，不能按假值跳过）。"""
-        return first_value(*values)
-
-    def _migrate_bucket_config(self) -> None:
-        """v1.2.x 储存桶配置迁移；实现见 config.migrations。"""
-        migrate_bucket_config(self.config)
-
-    def _bucket_config(self) -> dict | None:
-        """储存桶配置完整时返回可并入图床配置的 dict（含 mode），否则 None。"""
-        return bucket_config(self.config)
-
-    def _effective_bed_cfg(self) -> dict:
-        """合并储存桶与图床两组配置：储存桶配置完整时优先（覆盖 mode 与字段）。"""
-        return effective_bed_cfg(self.config)
 
     def _bed_mode(self) -> str:
         """生效的存储模式（storage_bucket 优先合并后的图床配置）。"""
@@ -513,24 +451,14 @@ class ImageTracePlugin(Star):
 
     def _storage_line(self) -> str:
         """/溯源状态 的存储方式一行：标明生效来源（储存桶优先于图床）。"""
-        bucket_mode = str(self._dict_cfg("storage_bucket").get("mode") or "").strip()
-        bed_mode = str(self._dict_cfg("image_bed").get("mode") or "local")
+        bucket_mode = str(dict_group(self.config, "storage_bucket").get("mode") or "").strip()
+        bed_mode = str(dict_group(self.config, "image_bed").get("mode") or "local")
         active = self._bed_mode()
         if bucket_mode in BUCKET_MODES:
             if active == bucket_mode:
                 return f"· 存储方式：储存桶 {bucket_mode}（优先于图床 {bed_mode}）"
             return f"· 存储方式：图床 {active}（储存桶 {bucket_mode} 配置不完整，未生效）"
         return f"· 存储方式：图床 {active}"
-
-    def _engine_choice(self) -> str:
-        """当前检索引擎：hash | vector | auto（vector 优先，失败/未命中回退 hash）。"""
-        return engine_choice(self.config)
-
-    def _vector_index_on_register(self) -> bool:
-        return vector_index_on_register(self.config)
-
-    def _scan_dirs(self) -> list:
-        return scan_dirs(self.config)
 
     # ------------------------------------------------------------------
     # 图片提取与解析
@@ -583,27 +511,9 @@ class ImageTracePlugin(Star):
         """把图片段解析为本地文件（解析/兜底下载/失败分诊见 media.image_source）。"""
         return await self.image_source.resolve(seg, probe=probe)
 
-    @staticmethod
-    def _download_fail_message() -> str:
-        return download_fail_message()
-
-    @staticmethod
-    def _decode_fail_message(sniffed: str) -> str:
-        """认得出容器却解不开时的提示；HEIC 缺解码器是最常见的一种。"""
-        return decode_fail_message(sniffed, heif_ready=heif_available())
-
     def _download_limit_bytes(self) -> int:
         """回传兜底下载的大小上限（字节）：limits.max_download_mb。"""
-        return max(1, self._int_cfg("max_download_mb", DEFAULT_LIMITS.max_download_mb)) * 1024 * 1024
-
-    @staticmethod
-    def _download_timeout() -> aiohttp.ClientTimeout:
-        """兜底下载/格式体检统一的出网超时（实现见 media.image_source）。"""
-        return ImageSource._timeout()
-
-    async def _stream_response_to_temp(self, resp, limit: int) -> str:
-        """把已打开的响应流式写入临时文件（实现见 media.image_source）。"""
-        return await self.image_source.stream_response_to_temp(resp, limit)
+        return max(1, int_cfg(self.config, "max_download_mb", DEFAULT_LIMITS.max_download_mb)) * 1024 * 1024
 
     async def _download(self, url: str, *, size_limit: int | None = None) -> str:
         """下载到临时文件，返回路径（实现见 media.image_source）。"""
@@ -613,27 +523,11 @@ class ImageTracePlugin(Star):
         """下载到内存（实现见 media.image_source）。"""
         return await self.image_source.download_bytes(url)
 
-    @staticmethod
-    def _image_download_headers(u: str, _m: str, _c: bool) -> dict:
-        """图片兜底下载的请求头（实现见 media.image_source）。"""
-        return image_download_headers(u, _m, _c)
-
-    @classmethod
-    def _range_probe_headers(cls, u: str, m: str, c: bool) -> dict:
-        """在下载请求头基础上加 Range: bytes=0-0（实现见 media.image_source）。"""
-        return range_probe_headers(u, m, c)
-
     async def _probe_url(
         self, url: str, cache: dict | None = None, *, allow_range: bool = True
     ) -> tuple[bool | None, int | None]:
         """轻量探测 URL 存在性与响应体长度（实现见 media.image_source）。"""
         return await self.image_source.probe(url, cache, allow_range=allow_range)
-
-    async def _probe_url_uncached(
-        self, url: str, *, allow_range: bool = True
-    ) -> tuple[bool | None, int | None]:
-        """探测实现（实现见 media.image_source）。"""
-        return await self.image_source.probe_uncached(url, allow_range=allow_range)
 
     def _note_scaled_unsupported(self, status: int) -> None:
         """记录「图床处理不了缩放请求」，随后一段时间跳过缩放探测。"""
@@ -666,18 +560,6 @@ class ImageTracePlugin(Star):
     def _qq_url_cooling(self) -> bool:
         """是否处在「URL 上传通道不可用」的冷却期内。"""
         return time.monotonic() < self._qq_url_unsupported_until
-
-    def _verify_scaled(self) -> bool:
-        """delivery.napcat_verify_scaled：图床缩放是否实测校验，未配置时默认开启。"""
-        return verify_scaled(self.config)
-
-    def _onebot_image_timeout(self) -> int:
-        """delivery.napcat_timeout：OneBot image 段的 timeout 字段（秒）。
-
-        实现与默认值见 config.loader.onebot_image_timeout；填 0 会落到 10，
-        不会原样写 0（否则等于告诉协议端「立刻放弃下载」）。
-        """
-        return onebot_image_timeout(self.config)
 
     async def _get_http(self) -> GuardedHttpClient:
         if self._http is None:
@@ -755,27 +637,9 @@ class ImageTracePlugin(Star):
         """归一化每日签到配置（checkin 组）；实现见 config.loader。"""
         return checkin_settings(self.config)
 
-    @staticmethod
-    def _checkin_today(offset_hours: int) -> date:
-        """按配置的 UTC 偏移算出「今天」，与服务器本地时区无关。"""
-        return datetime.now(timezone(timedelta(hours=offset_hours))).date()
-
-    @staticmethod
-    def _checkin_sender_name(event: AstrMessageEvent, limit: int = 16) -> str:
-        """签到者昵称：取不到就返回空串，任何异常都不该打断签到。
-
-        昵称由协议端（QQ / OneBot）给出，长度与内容都不可控：这里只做空白
-        折叠与限长，emoji 留给 ``compose_poster`` 在绘制前剔除——聊天消息里
-        的昵称可以带 emoji，卡片上不行（中文字体没有彩色 emoji 字形）。
-        """
-        try:
-            raw = str(event.get_sender_name() or "")
-        except Exception:
-            return ""
-        name = " ".join(raw.split())
-        if len(name) > limit:
-            name = name[:limit].rstrip() + "…"
-        return name
+    async def _checkin_sender_name(self, event: AstrMessageEvent, limit: int = 16) -> str:
+        """签到者群昵称（薄委托）：实现见 services/checkin_identity.py。"""
+        return await checkin_sender_name(event, limit)
 
     def _checkin_line(self, name: str, outcome) -> str:
         """签到信息行：带昵称时「小双 · 连续签到 3 天 · 累计 10 天」。
@@ -917,7 +781,7 @@ class ImageTracePlugin(Star):
         # R2：实现已下沉到 delivery/primitives.py，签名不变。
         return await send_via_onebot(
             self, event, header, blocks, payloads,
-            image_timeout=self._onebot_image_timeout(),
+            image_timeout=onebot_image_timeout(self.config),
         )
 
     async def _send_prompt(self, event: AstrMessageEvent, text: str) -> bool:
@@ -971,7 +835,7 @@ class ImageTracePlugin(Star):
         return await prepare_delivery_blocks(
             self, blocks, compress=compress,
             delivery_config=(mode, max_side, quality),
-            encode_options=self._encode_options(),
+            encode_options=encode_options(self.config),
         )
 
     async def _local_compress_delivery(
@@ -988,10 +852,6 @@ class ImageTracePlugin(Star):
             self, event, header, blocks, image_blocks,
             mark_compressed=mark_compressed,
         )
-
-    def _encode_options(self) -> tuple[int, bool]:
-        """本地压缩进阶选项：目标体积上限（字节，0 表示不限制）与 WebP 输出。"""
-        return encode_options(self.config)
 
     @staticmethod
     def _known_bytes(block: dict) -> int:
@@ -1010,7 +870,7 @@ class ImageTracePlugin(Star):
         return await url_delivery_plan(
             self, image_blocks, max_side, mode,
             quality=quality, scaled_url_style=scaled_url_style,
-            verify_scaled=self._verify_scaled(),
+            verify_scaled=verify_scaled(self.config),
         )
 
     async def _verify_scaled_batch(
@@ -1286,6 +1146,13 @@ class ImageTracePlugin(Star):
         async for result in self.controllers.trace.status(event):
             yield result
 
+    @filter.command("溯源昵称")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def nickname_diag(self, event: AstrMessageEvent):
+        """诊断当前会话能否取到 QQ 群昵称（管理员）"""
+        async for result in self.controllers.admin.nickname_diag(event):
+            yield result
+
     def _remote_hash_line(self) -> str:
         """/溯源状态 的图床哈希索引一行。
 
@@ -1396,13 +1263,14 @@ class ImageTracePlugin(Star):
             "· /溯源 —— 与图片同条消息发送，或引用一张图片发送，自动在图库中寻找原图\n"
             "· /登记原图 [备注] —— 将图片作为原图登记入库（默认仅管理员）\n"
             "· /溯源状态 —— 查看图库统计\n"
+            "· /溯源昵称 —— 诊断当前群能否取到群昵称（管理员）\n"
             "· /溯源重扫 [force] —— 扫描本地图库目录建立索引（管理员）\n"
             "· /溯源删除 <编号> —— 删除图库条目（管理员）\n"
             "· /随机图 [目录] —— 从图床随机取一张图片并回传\n"
             "· /随机视频 [目录] —— 从图床随机取一个视频并回传\n"
             "· /签到 —— 每日签到领取一张带边框的卡片（每天首次计入天数，同日重复只换图不涨天数，可 /打卡）；"
             "checkin.mode=weibo 时改为“微博文案 + 对应图库图片”，卡片显示博主与发博日期；"
-            "checkin.show_quote=false 时只发美图 + 签到信息，checkin.show_sender 控制是否带签到者昵称\n"
+            "checkin.show_quote=false 时只发美图 + 签到信息，checkin.show_sender 控制是否带签到者群昵称（取不到回退 QQ 昵称）\n"
             "· /签到文案导入 —— 管理员：把微博文案 CSV/MD 作为附件发送，导入插件数据目录\n"
             "· /原图 [文件名] —— 取原图：带文件名时直接到图床按名取（无需先回传），"
             "不带文件名取本会话最近回传的原图\n"
@@ -1463,12 +1331,12 @@ class ImageTracePlugin(Star):
         随机图接口用的站点地址（同一台图床的另一处配置）。都没有时返回空串，
         由调用方给出「未配置图床站点」的提示，而不是拼一条必然 404 的链接。
         """
-        bed = self._dict_cfg("image_bed")
+        bed = dict_group(self.config, "image_bed")
         if str(bed.get("mode") or "").strip() == MODE_CFB:
             base = str(bed.get("cfi_base_url") or "").strip().rstrip("/")
             if base.lower().startswith(("http://", "https://")):
                 return base
-        base = str(self._dict_cfg("random_media").get("base_url") or "").strip().rstrip("/")
+        base = str(dict_group(self.config, "random_media").get("base_url") or "").strip().rstrip("/")
         return base if base.lower().startswith(("http://", "https://")) else ""
 
     @classmethod
@@ -1835,11 +1703,6 @@ class ImageTracePlugin(Star):
             return None
         return post, send_url, original_url, image.file_name, local_thumb
 
-    async def _deliver_checkin(self, event: AstrMessageEvent, header: str, quote: str, footer: str, send_url: str, original_url: str, block_name: str, settings: dict, *, quote_max_lines: int=3, simple_text: str='', card_source: str=''):
-        # R1：流程主体在 services/checkin.py，main 只留同名薄委托。
-        async for result in self.services.checkin._deliver_checkin(event, header, quote, footer, send_url, original_url, block_name, settings, quote_max_lines=quote_max_lines, simple_text=simple_text, card_source=card_source):
-            yield result
-
     async def _checkin_flow(self, event: AstrMessageEvent):
         # R1：流程主体在 services/checkin.py，main 只留同名薄委托。
         async for result in self.services.checkin._checkin_flow(event):
@@ -1943,7 +1806,7 @@ class ImageTracePlugin(Star):
             client = await self._get_http()
             limit = self._download_limit_bytes()
             async with await client.request(
-                "GET", url, timeout=self._download_timeout()
+                "GET", url, timeout=ImageSource._timeout()
             ) as resp:
                 if not 200 <= resp.status < 300:
                     return None
@@ -2016,10 +1879,6 @@ class ImageTracePlugin(Star):
     # ------------------------------------------------------------------
     # QQ 官方机器人上传通道（url / chunked，与缩略图发送无关）
     # ------------------------------------------------------------------
-
-    def _qq_upload_config(self) -> tuple[str, int, int, str, int, str]:
-        """推送通道（QQ 官方）配置归一化，实现见 config.loader.qq_upload_config。"""
-        return qq_upload_config(self.config)
 
     @staticmethod
     def _qq_send_target(event: AstrMessageEvent) -> tuple[str, str] | None:
@@ -2149,7 +2008,7 @@ class ImageTracePlugin(Star):
         - notify：不交回，改回一条文字说明失败原因。
         """
         mode, direct_max, url_max, auto_prefer, max_upload, on_failure = (
-            self._qq_upload_config()
+            qq_upload_config(self.config)
         )
         if mode == "native":
             # 通道关闭：交给 image_delivery 的原生回传逻辑（含压缩）
@@ -2272,7 +2131,7 @@ class ImageTracePlugin(Star):
         temp = ""
         try:
             if not path:
-                temp = await self._download(
+                temp = await self.image_source.download(
                     str(block.get("url") or ""), size_limit=max_upload
                 )
                 path = temp

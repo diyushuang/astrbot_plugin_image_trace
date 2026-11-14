@@ -39,12 +39,8 @@ except Exception:  # 兼容独立模块加载/本地自测环境
 
     logger = logging.getLogger("hash_index")
 
-try:
-    from .features import phash_hex_len
-    from .library import _POPCOUNT
-except ImportError:  # 兼容插件以独立模块方式加载
-    from features import phash_hex_len  # type: ignore[no-redef]
-    from library import _POPCOUNT  # type: ignore[no-redef]
+from .features import phash_hex_len
+from .library import _POPCOUNT
 
 # 服务端为「中位数落在浮点噪声里」的退化图（纯色/纯渐变/大面积平坦图）写的哨兵
 # 值。必须与 img-indexer 的 tools/gen_phash.mjs::DEGENERATE_SENTINEL 一致。

@@ -2,12 +2,8 @@
 
 from __future__ import annotations
 
-try:  # 包加载
-    from ..config.loader import random_settings
-    from ..random_media import extract_directory
-except ImportError:  # 兼容插件以独立模块方式加载
-    from config.loader import random_settings
-    from random_media import extract_directory
+from ..config.loader import random_settings
+from ..random_media import extract_directory
 
 
 class RandomController:
@@ -24,7 +20,7 @@ class RandomController:
         """从图床随机取一张图片并回传（可带目录，如 /随机图 风景）"""
         settings = self._settings()
         directory, parsed_type = extract_directory(event.message_str or "")
-        async for result in self.plugin._random_media_delivery(
+        async for result in self.plugin.services.random._random_media_delivery(
             event, directory, parsed_type or "image", settings
         ):
             yield result
@@ -33,7 +29,7 @@ class RandomController:
         """从图床随机取一个视频并回传（可带目录，如 /随机视频 风景）"""
         settings = self._settings()
         directory, parsed_type = extract_directory(event.message_str or "")
-        async for result in self.plugin._random_media_delivery(
+        async for result in self.plugin.services.random._random_media_delivery(
             event, directory, parsed_type or "video", settings
         ):
             yield result
@@ -60,7 +56,7 @@ class RandomController:
         if directory is None and parsed_directory:
             directory = parsed_directory
         content_type = (parsed_type or content_type or "image").strip().lower()
-        async for result in self.plugin._random_media_delivery(
+        async for result in self.plugin.services.random._random_media_delivery(
             event, directory, content_type, settings
         ):
             yield result

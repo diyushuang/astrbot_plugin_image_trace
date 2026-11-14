@@ -10,19 +10,9 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import urlsplit
 
-try:  # 包模式
-    from ..common import as_float, as_int, bool_or, is_blank, truthy
-    from ..image_delivery import bounded_int, delivery_settings, qq_upload_settings
-    from ..random_media import RANDOM_ENDPOINT_DEFAULT
-except ImportError:  # 兼容插件以独立模块方式加载
-    from common import as_float, as_int, bool_or, is_blank, truthy  # type: ignore[no-redef]
-    from image_delivery import (  # type: ignore[no-redef]
-        bounded_int,
-        delivery_settings,
-        qq_upload_settings,
-    )
-    from random_media import RANDOM_ENDPOINT_DEFAULT  # type: ignore[no-redef]
-
+from ..common import as_float, as_int, bool_or, is_blank, truthy
+from ..image_delivery import bounded_int, delivery_settings, qq_upload_settings
+from ..random_media import RANDOM_ENDPOINT_DEFAULT
 from .migrations import (
     BUCKET_MODES,
     BUCKET_REQUIRED,
@@ -55,10 +45,14 @@ _MB = 1024 * 1024
 
 
 def logger_warning(message: str) -> None:
-    """延迟导入 logger，避免本模块在 main 导入前就依赖 astrbot 桩。"""
-    import logging
+    """延迟导入 AstrBot logger，避免本模块在插件加载前就硬依赖 astrbot。"""
+    try:
+        from astrbot.api import logger
+    except Exception:  # 独立加载/单元测试环境
+        import logging
 
-    logging.getLogger("astrbot").warning(message)
+        logger = logging.getLogger("astrbot")
+    logger.warning(message)
 
 
 def dict_group(config: Any, key: str) -> dict:
@@ -265,7 +259,11 @@ def checkin_settings(config: Any) -> dict:
         "render_mode": "simple" if render_mode == "simple" else "card",
         # 签到自己的取图口径，与 random_media.send_thumbnail 独立。
         "image_mode": "original" if image_mode == "original" else "thumbnail",
-        # 签到文字两个开关，互相独立。
+        # 签到文字两个开关，互相独立：
+        # show_quote=卡片/消息里要不要那句随机语句（微博模式下是文案），
+        #   关掉就是「只有美图 + 签到信息」；
+        # show_sender=签到文字里要不要带上签到者群昵称（OneBot 群名片优先，
+        #   接口失败才回退事件昵称）。
         "show_quote": bool_or(raw.get("show_quote"), d.show_quote),
         "show_sender": bool_or(raw.get("show_sender"), d.show_sender),
         "border_px": max(0, min(200, as_int(raw.get("border_px"), d.border_px))),

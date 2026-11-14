@@ -1,28 +1,28 @@
-"""管理员指令控制器：重扫 / 删除。"""
+"""管理员指令控制器：重扫 / 删除 / 昵称诊断。"""
 
 from __future__ import annotations
 
 import asyncio
 import os
 
-try:  # 包加载
-    from ..common import RESCAN_BATCH_SIZE, RESCAN_PROGRESS_EVERY, SCAN_CONCURRENCY
-    from ..config.loader import scan_dirs
-    from ..features import compute_features
-except ImportError:  # 兼容插件以独立模块方式加载
-    from common import RESCAN_BATCH_SIZE, RESCAN_PROGRESS_EVERY, SCAN_CONCURRENCY
-    from config.loader import scan_dirs
-    from features import compute_features
-
 from astrbot.api import logger
+
+from ..common import RESCAN_BATCH_SIZE, RESCAN_PROGRESS_EVERY, SCAN_CONCURRENCY
+from ..config.loader import scan_dirs
+from ..features import compute_features
+from ..services.checkin_identity import nickname_diag_text
 
 
 class AdminController:
-    """承载 `溯源重扫`、`溯源删除` 两条管理员指令。"""
+    """承载 `溯源重扫`、`溯源删除`、`溯源昵称` 三条管理员指令。"""
 
     def __init__(self, plugin, config) -> None:
         self.plugin = plugin
         self.config = config
+
+    async def nickname_diag(self, event):
+        """诊断当前会话能否取到 QQ 群昵称（管理员）"""
+        yield event.plain_result(await nickname_diag_text(event))
 
     async def rescan(self, event):
         """扫描配置的本地图库目录，建立/更新索引（管理员）"""

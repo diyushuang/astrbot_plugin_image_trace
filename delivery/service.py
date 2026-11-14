@@ -131,7 +131,6 @@ class DeliveryService:
             mode_override=mode_override,
             allow_local_fallback=allow_local_fallback,
             mark_compressed=mark_compressed,
-            remember_blocks=remember_blocks,
         )
         # 格式体检可能把假格式转成本地 JPEG（block["_tmp_owned"]）；这些临时文件
         # 只服务于本次投递，发送完成后必须删除，否则会随每次 /随机图、/原图 累积。
@@ -196,6 +195,7 @@ class DeliveryService:
                     # SENT 已送达；UNKNOWN 可能已送达——两者都不能再发第二次
                     guard.finish_direct()
                     return
+                logger.debug("OneBot URL 直发未成功（%s），继续回退", result.fallback_reason)
 
             if plan.local_compress:
                 # OneBot 下 auto/bytes 直发压缩字节（混合载荷）：压缩结果
@@ -206,14 +206,20 @@ class DeliveryService:
                     guard.finish_direct()
                     return
                 # 准备失败 或 直发失败：字节路径已试过，整批改走 URL 链
-                logger.warning("OneBot 压缩直发未成功，改用标准消息链 URL 发送")
+                logger.warning(
+                    "OneBot 压缩直发未成功（%s），改用标准消息链 URL 发送",
+                    result.fallback_reason,
+                )
             elif plan.local_bytes_chain:
                 result = await ChainChannel(host).deliver_bytes(ctx)
                 if result.outcome != "failed":
                     guard.mark_sent()
                     yield event.chain_result(result.chain)
                     return
-                logger.warning("本地图片回退失败，改用标准消息链 URL 发送")
+                logger.warning(
+                    "本地图片回退失败（%s），改用标准消息链 URL 发送",
+                    result.fallback_reason,
+                )
 
             # 走到这里说明没有任何通道明确送达（UNKNOWN 已在上面按已送达拦截）。
             if guard.already_sent():

@@ -16,6 +16,32 @@ THRESHOLDS = {
     "features.py": 88.0,  # 实测 89.71
     "weibo_posts.py": 83.0,  # 实测 85.31
     "delivery/planner.py": 92.0,  # 实测 93.75
+    "delivery/service.py": 95.0,  # 实测 99.0
+    "delivery/channels.py": 95.0,  # 实测 100.0
+    "controllers/register.py": 93.0,  # 实测 96.1
+    "controllers/trace.py": 83.0,  # 实测 86.5
+    "controllers/admin.py": 71.0,  # 实测 73.8
+    "controllers/checkin.py": 65.0,  # 实测 68.0
+    "controllers/random.py": 77.0,  # 实测 80.0
+    "services/checkin_service.py": 95.0,  # 实测 100.0
+    "services/trace_service.py": 83.0,  # 实测 86.1
+    "services/random_service.py": 70.0,  # 实测 73.6
+    "services/original_service.py": 85.0,  # 实测 89.9
+    "search/vector_engine.py": 89.0,  # 实测 92.9
+    "search/hash_engine.py": 90.0,  # 实测 94.5
+    "search/auto_engine.py": 95.0,  # 实测 100.0
+    "search/embedding_client.py": 83.0,  # 实测 86.3
+    "search/qdrant_client.py": 84.0,  # 实测 87.7
+    "search/errors.py": 95.0,  # 实测 100.0
+    "storage/backend_utils.py": 92.0,  # 实测 95.5
+    "storage/cloudflare_backend.py": 73.0,  # 实测 77.1
+    "storage/http_backend.py": 72.0,  # 实测 75.5
+    "storage/local_backend.py": 95.0,  # 实测 100.0
+    "storage/modes.py": 95.0,  # 实测 100.0
+    "storage/object_backend.py": 68.0,  # 实测 71.6
+    "storage/urls.py": 80.0,  # 实测 83.3
+    "image_bed.py": 74.0,  # 实测 77.7
+    "vector_search.py": 78.0,  # 实测 81.5
 }
 CONFIG_PACKAGE = "config/"  # 整包聚合，实测 83.47
 CONFIG_THRESHOLD = 82.0

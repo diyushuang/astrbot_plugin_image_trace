@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from astrbot_plugin_image_trace.config import typed
+from astrbot_plugin_image_trace.config.loader import bucket_config, effective_bed_cfg
 
 SCHEMA_PATH = Path(__file__).resolve().parents[1] / "_conf_schema.json"
 
@@ -65,8 +66,8 @@ async def test_bucket_priority_and_completeness(make_plugin):
         image_bed={"mode": "local", "token": "imglab"},
         storage_bucket=r2,
     )
-    assert plugin._bucket_config()["mode"] == "cloudflare_r2"
-    merged = plugin._effective_bed_cfg()
+    assert bucket_config(plugin.config)["mode"] == "cloudflare_r2"
+    merged = effective_bed_cfg(plugin.config)
     assert merged["mode"] == "cloudflare_r2"
     assert merged["r2_bucket"] == "bucket"
     assert merged["token"] == "imglab"
@@ -75,8 +76,8 @@ async def test_bucket_priority_and_completeness(make_plugin):
     incomplete = dict(r2)
     incomplete.pop("r2_public_base_url")
     plugin = make_plugin(image_bed={"mode": "local"}, storage_bucket=incomplete)
-    assert plugin._bucket_config() is None
-    assert plugin._effective_bed_cfg()["mode"] == "local"
+    assert bucket_config(plugin.config) is None
+    assert effective_bed_cfg(plugin.config)["mode"] == "local"
 
     # OCI：公共桶与公开地址二选一，缺两个都不满足时判定不完整
     oci = {
@@ -88,13 +89,13 @@ async def test_bucket_priority_and_completeness(make_plugin):
         "oci_bucket": "b",
     }
     plugin = make_plugin(storage_bucket=oci)
-    assert plugin._bucket_config() is None
+    assert bucket_config(plugin.config) is None
     plugin = make_plugin(storage_bucket={**oci, "oci_public_base_url": "https://cdn.example.com"})
-    assert plugin._bucket_config()["mode"] == "oracle_oci"
+    assert bucket_config(plugin.config)["mode"] == "oracle_oci"
 
     # 伪模式（如 v1.2.x 遗留在 image_bed 里的旧值）不参与优先
     plugin = make_plugin(storage_bucket={"mode": "cloudflare_r2"})
-    assert plugin._bucket_config() is None
+    assert bucket_config(plugin.config) is None
 
 
 @pytest.mark.asyncio

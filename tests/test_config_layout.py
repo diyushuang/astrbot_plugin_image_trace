@@ -17,7 +17,8 @@ from pathlib import Path
 
 import pytest
 
-from astrbot_plugin_image_trace.config.migrations import SCALAR_PATHS
+from astrbot_plugin_image_trace.config.loader import first_value, int_cfg, qq_upload_config
+from astrbot_plugin_image_trace.config.migrations import SCALAR_PATHS, migrate_config_layout
 from astrbot_plugin_image_trace.main import _LAYOUT_VERSION
 
 SCHEMA_PATH = Path(__file__).resolve().parents[1] / "_conf_schema.json"
@@ -74,7 +75,7 @@ def test_migrated_values_reach_the_readers(make_plugin):
     mode, max_side, quality, _style = plugin._delivery_config()
     assert (mode, max_side, quality) == ("url", 1280, 70)
 
-    qq_mode, _native, url_max, _prefer, _upload, _failure = plugin._qq_upload_config()
+    qq_mode, _native, url_max, _prefer, _upload, _failure = qq_upload_config(plugin.config)
     assert qq_mode == "url"
     assert url_max == 30 * 1024 * 1024
 
@@ -97,7 +98,7 @@ def test_migration_runs_only_once(make_plugin):
 
     # 模拟用户在面板里改成 native，再重启（= 再跑一次迁移）
     plugin.config["delivery"]["napcat_mode"] = "native"
-    plugin._migrate_config_layout()
+    migrate_config_layout(plugin.config)
 
     assert plugin.config["delivery"]["napcat_mode"] == "native"
     assert plugin._delivery_config()[0] == "native"
@@ -109,16 +110,14 @@ def test_cfg_falls_back_to_legacy_when_group_missing(make_plugin):
     plugin.config.pop("basic", None)
     plugin.config["top_n"] = 7
 
-    assert plugin._int_cfg("top_n", 3) == 7
+    assert int_cfg(plugin.config, "top_n", 3) == 7
 
 
-def test_first_value_keeps_zero_and_false(make_plugin):
+def test_first_value_keeps_zero_and_false():
     """0 / False 是合法配置，不能被当成"未配置"跳过。"""
-    plugin = make_plugin()
-
-    assert plugin._first_value(0, 5) == 0
-    assert plugin._first_value(False, True) is False
-    assert plugin._first_value(None, "", 5) == 5
+    assert first_value(0, 5) == 0
+    assert first_value(False, True) is False
+    assert first_value(None, "", 5) == 5
 
 
 @pytest.mark.parametrize(

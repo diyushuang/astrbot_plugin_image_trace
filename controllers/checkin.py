@@ -6,14 +6,10 @@ import asyncio
 import os
 import secrets
 
-try:  # 包加载
-    from ..common import read_bytes, sanitize_error_text
-    from ..weibo_posts import load_post_map, map_is_stale, parse_weibo_text
-except ImportError:  # 兼容插件以独立模块方式加载
-    from common import read_bytes, sanitize_error_text
-    from weibo_posts import load_post_map, map_is_stale, parse_weibo_text
-
 from astrbot.api import logger
+
+from ..common import read_bytes, sanitize_error_text
+from ..weibo_posts import load_post_map, map_is_stale, parse_weibo_text
 
 
 class CheckinController:
@@ -25,7 +21,7 @@ class CheckinController:
 
     async def checkin(self, event):
         """每日签到，领取一张带边框与随机语句的随机缩略图"""
-        async for result in self.plugin._checkin_flow(event):
+        async for result in self.plugin.services.checkin._checkin_flow(event):
             yield result
 
     async def checkin_import(self, event):

@@ -1,5 +1,38 @@
 # 更新日志
 
+## 1.7.25（2026-11-12，qq_official 昵称按官方文档兜底）
+
+- **兼容**：`qq_official` 平台按官方文档处理昵称：群消息事件自带 `author.username`（QQ 昵称），优先直接使用；只有事件昵称为空时才调用官方 `GET /v2/groups/{group_openid}/members/{member_openid}` 取 `username` 兜底。
+- **说明**：QQ 官方机器人没有群名片/群昵称字段，群成员接口也只返回 `username`，且目前是内邀白名单能力（无权限返回 11253）；因此 `qq_official` 下无法显示与 QQ 昵称不同的群昵称，插件不再尝试 OneBot 的 `get_group_member_info`。
+- **诊断**：`/溯源昵称` 增加 `qq_official` 分支，显示事件 `username`、官方接口 `username` / `member_role` 或失败原因，并明确提示「没有群名片/群昵称」。
+- **文档**：`checkin.show_sender` 配置说明与 README 同步补充 `qq_official` 限制。
+- **测试**：新增 4 例（`qq_official` 事件 username 优先、事件为空查官方接口、11253 无权限回退、诊断说明），全量 **450 passed**，`ruff check` 全绿。
+- **重构分支同步**：1.7.22–1.7.25 已按 `services/checkin_identity.py` 分层移植；全量 **526 passed**（含 pillow-heif），覆盖率门禁通过。
+- **重构分支加固**：清理 delivery 死接口与未用字段；统一包内相对导入并移除各模块双份 import 回退；发布脚本增加 SemVer / 16MB 上限 / SHA256 / `--check`；CI 扩到整包覆盖率并按模块设置门槛；新增 26 个控制器/服务/检索用例，全量 **552 passed**，总覆盖率 **80.25%**。
+- **P2 结构治理**：`image_bed.py` 拆为 `storage/` 下 local / generic_http / cloudflare_imgbed / R2-OCI 后端与 URL 工具；`vector_search.py` 拆为 `search/embedding_client.py` + `search/qdrant_client.py`，原类保留薄门面；`main.py` 方法数 165 → **137**（私有 123 → 119），服务/控制器 host 调用 63/48 → **55/41**；原项目外层历史 zip / 脚本 / 报告归档到 `archive/2026-11-14/`。全量 **575 passed**，总覆盖率 **82.92%**，发布包 **66 文件 / 59 个 .py**。
+
+## 1.7.24（2026-11-12，签到群昵称接口修复与诊断）
+
+- **修复**：1.7.23 的 `get_group_member_info` 兜底把 `group_id` / `user_id` 按字符串传给 OneBot，而 OneBot v11 / SnowLuma 文档要求 `uint` 数字；参数校验失败后异常只进 debug，签到继续回退 QQ 昵称，表现为「已升级 1.7.23 但仍不显示群昵称」。现在纯数字 ID 一律转 `int`、显式带 `no_cache=True`，超时从 3 秒放宽到 5 秒。
+- **变更**：群聊签到主动查一次群成员接口（签到是低频命令），以接口 `card` 为权威群名片；接口成功但 `card` 为空时用接口 `nickname`，不再拿可能过期的事件 `sender.card` 硬顶；接口失败 / 私聊 / 非 OneBot 平台才回退事件 `sender.card` → 事件昵称。接口失败改记 `warning` 并输出脱敏原因，不再静默。
+- **新增**：管理员诊断指令 `/溯源昵称`，一次输出平台、会话、事件昵称、事件群名片、接口 `card` / `nickname` 与最终来源；接口 `card` 为空时明确提示「该成员未设置群昵称」。
+- **文档**：`checkin.show_sender` 配置说明、README 指令表与配置表同步补充「成员未设置群名片时只能显示 QQ 昵称；QQ 官方机器人不支持群昵称」。
+- **测试**：新增 8 例（数字 ID 转 int、接口 card 优先、接口 card 空回退接口 nickname、信封解包、接口失败用事件 card、私聊不调用接口、诊断指令三种结果），全量 **446 passed**，`ruff check` 全绿。
+
+## 1.7.23（2026-11-11，签到群昵称增加接口兜底）
+
+- **修复**：1.7.22 只从事件里取 `sender.card`；NapCat 群消息的 `sender.card` 来自 `msg.sendMemberName`，部分消息记录为空，导致仍显示 QQ 昵称。现在事件里取不到群名片时，会通过 OneBot `get_group_member_info` 查一次 `card`（NapCat 返回 `member.cardName`），再取不到才回退 `get_sender_name()`；接口失败/超时（3 秒）静默回退，签到不中断。
+- **兼容**：只对 `aiocqhttp` / `onebot` / `napcat` / `lagrange` 等 OneBot 系平台发起查询；非 OneBot 平台与私聊保持原逻辑；事件里已有群名片时不发多余请求。
+- **测试**：新增 4 例（接口群名片优先、事件已有名片不调用接口、接口失败回退昵称、非 OneBot 不调用接口），全量 **438 passed**，`ruff check` 全绿。
+
+## 1.7.22（2026-11-10，签到显示群昵称）
+
+- **变更**：`/签到` 的签到者显示名改为**群昵称**：优先取 OneBot 原始事件 `sender.card`（群名片），取不到（私聊 / 未设置群名片 / 非 OneBot 平台）时回退 `get_sender_name()`。消息首行与卡片页脚（含 `weibo` 模式第二行）同步生效，`checkin.show_sender` 仍控制整体显示/隐藏；空白折叠、16 字截断与 emoji 剔除规则不变。
+- **兼容**：AstrBot 4.0.x 的 aiocqhttp 适配器只把 QQ 昵称写进 `MessageMember`，群名片留在 `message_obj.raw_message` 的 `sender.card` 里；插件声明支持 `>=4.0.0`，因此由插件自己按「`sender.card` → 原始事件 `sender.card` → 框架昵称」取值，较新版本（已 card 优先）行为不变。
+- **文档**：`checkin.show_sender` 配置说明、`/溯源帮助`、`/溯源状态` 与 README 同步改为「群昵称（取不到回退 QQ 昵称）」。
+- **测试**：新增 4 例（原始事件群名片优先、`sender.card` 优先级最高、空/全空白群名片回退昵称、对象形式 raw_message 与群名片截断），全量 **434 passed**，`ruff check` 全绿。
+
+
 ## 1.7.21（2026-11-03，签到可「只发美图」+ 文字带签到者昵称）
 
 - **新增**：`checkin.show_quote`（默认 `true`）。设为 `false` 后签到只发**美图 + 签到信息**（连续/累计天数）：`card` 模式连文字区一起省掉（画布按实际内容算高，不留一条本该写字的空白带），`simple` 模式也不再拼 `💬` 那一行；同时**不再取句**——`quote_source=api` 时省掉一次在线接口请求。`weibo` 模式下该开关同样生效：图片与「博主 · 发博日期」保留，微博正文不再上卡片/消息。

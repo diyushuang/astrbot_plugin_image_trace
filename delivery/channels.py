@@ -16,11 +16,7 @@ import random
 
 import astrbot.api.message_components as Comp
 
-try:
-    from ..image_delivery import CompressionEvidence, SendOutcome
-except ImportError:  # 兼容插件以独立模块方式加载
-    from image_delivery import CompressionEvidence, SendOutcome  # type: ignore[no-redef]
-
+from ..image_delivery import CompressionEvidence, SendOutcome
 from .types import DeliveryContext, DeliveryResult
 
 
@@ -40,9 +36,6 @@ class OneBotChannel:
     def __init__(self, host) -> None:
         self._host = host
 
-    def can_handle(self, plan) -> bool:
-        return bool(plan.direct_ok or plan.local_compress)
-
     async def deliver_url(self, ctx: DeliveryContext) -> DeliveryResult:
         host = self._host
         urls, evidences = ctx.url_plan
@@ -55,7 +48,6 @@ class OneBotChannel:
         return DeliveryResult(
             outcome=name,
             sent_count=1 if name != "failed" else 0,
-            evidence=list(evidences),
             fallback_reason="" if name != "failed" else "onebot_url_send_failed",
         )
 
@@ -87,9 +79,6 @@ class QQOfficialChannel:
 
     def __init__(self, host) -> None:
         self._host = host
-
-    def can_handle(self, plan) -> bool:
-        return bool(plan.run_offbox)
 
     async def run_offbox(self, ctx: DeliveryContext) -> tuple[list[dict], bool]:
         """先改写信封（可能换成本地转码 path），再由上传通道决定 URL/分片。"""
@@ -131,9 +120,6 @@ class ChainChannel:
     def __init__(self, host) -> None:
         self._host = host
 
-    def can_handle(self, plan) -> bool:
-        return bool(plan.local_bytes_chain or plan.stages)
-
     async def deliver_bytes(self, ctx: DeliveryContext) -> DeliveryResult:
         host = self._host
         prepared = await host._prepare_delivery_blocks(
@@ -164,7 +150,7 @@ class ChainChannel:
                 chain.append(Comp.Image.fromBytes(data))
                 image_index += 1
         return DeliveryResult(
-            outcome="sent", sent_count=1, evidence=evidences, chain=chain
+            outcome="sent", sent_count=1, chain=chain
         )
 
     async def deliver_url(self, ctx: DeliveryContext) -> DeliveryResult:
@@ -191,5 +177,5 @@ class ChainChannel:
             if block.get("url") or path:
                 image_index += 1
         return DeliveryResult(
-            outcome="sent", sent_count=1, evidence=evidences, chain=chain
+            outcome="sent", sent_count=1, chain=chain
         )

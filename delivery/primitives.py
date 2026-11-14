@@ -19,40 +19,22 @@ import astrbot.api.message_components as Comp
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
-try:
-    from ..common import COMPRESS_CONCURRENCY
-    from ..features import image_bytes_ok
-    from ..image_delivery import (
-        CompressionEvidence,
-        SendOutcome,
-        build_original_url,
-        build_scaled_url,
-        classify_send_error,
-        compression_evidence,
-        is_scaling_needed,
-        prefer_inline_bytes,
-        prefer_url_direct,
-        prepare_image_bytes,
-        send_diagnosis,
-        sniff_image_format,
-    )
-except ImportError:  # 兼容插件以独立模块方式加载
-    from common import COMPRESS_CONCURRENCY  # type: ignore[no-redef]
-    from features import image_bytes_ok  # type: ignore[no-redef]
-    from image_delivery import (  # type: ignore[no-redef]
-        CompressionEvidence,
-        SendOutcome,
-        build_original_url,
-        build_scaled_url,
-        classify_send_error,
-        compression_evidence,
-        is_scaling_needed,
-        prefer_inline_bytes,
-        prefer_url_direct,
-        prepare_image_bytes,
-        send_diagnosis,
-        sniff_image_format,
-    )
+from ..common import COMPRESS_CONCURRENCY
+from ..features import image_bytes_ok
+from ..image_delivery import (
+    CompressionEvidence,
+    SendOutcome,
+    build_original_url,
+    build_scaled_url,
+    classify_send_error,
+    compression_evidence,
+    is_scaling_needed,
+    prefer_inline_bytes,
+    prefer_url_direct,
+    prepare_image_bytes,
+    send_diagnosis,
+    sniff_image_format,
+)
 
 
 def mention_prefix(host, event: AstrMessageEvent) -> list:

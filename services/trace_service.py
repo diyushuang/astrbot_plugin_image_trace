@@ -56,7 +56,7 @@ class TraceService:
             hits, candidate_lines = await asyncio.to_thread(
                 self.host._merged_hash_candidates, feats.phash, max(5, top_n)
             )
-            async for result in self.host._hash_outcome_delivery(
+            async for result in self._hash_outcome_delivery(
                 event, local_path, hits, candidate_lines
             ):
                 yield result
@@ -75,7 +75,7 @@ class TraceService:
             hits = await self.host._ai_verify(query_path, hits)
 
         if hits:
-            async for result in self.host._hash_hit_result(event, hits[0]):
+            async for result in self._hash_hit_result(event, hits[0]):
                 yield result
             return
 
@@ -146,7 +146,7 @@ class TraceService:
                 QueryImage(path=resolved.path, mime=resolved.mime)
             )
             if outcome.kind == "hit":
-                return "hit", self.host._vector_hits_delivery(event, outcome.hits)
+                return "hit", self._vector_hits_delivery(event, outcome.hits)
             if outcome.kind == "miss":
                 return "miss", event.plain_result(outcome.miss_text)
             return "error", outcome.error
@@ -190,7 +190,7 @@ class TraceService:
             )
             vector = outcome.vector
             if vector.kind == "hit":
-                async for result in self.host._vector_hits_delivery(event, vector.hits):
+                async for result in self._vector_hits_delivery(event, vector.hits):
                     yield result
                 return
             if vector.kind == "nofile":
@@ -211,7 +211,7 @@ class TraceService:
                     )
                     return
                 yield event.plain_result("⚠️ 向量引擎不可用，改用哈希比对：")
-            async for item in self.host._hash_outcome_delivery(
+            async for item in self._hash_outcome_delivery(
                 event,
                 resolved.path,
                 outcome.hash.hits,

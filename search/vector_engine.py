@@ -15,13 +15,8 @@ except Exception:  # 兼容独立模块加载/本地自测环境
 
     logger = logging.getLogger("search.vector_engine")
 
-try:
-    from ..image_delivery import deduplicate_vector_hits
-    from ..vector_search import VectorEngineError
-except ImportError:  # 兼容插件以独立模块方式加载
-    from image_delivery import deduplicate_vector_hits  # type: ignore[no-redef]
-    from vector_search import VectorEngineError  # type: ignore[no-redef]
-
+from ..image_delivery import deduplicate_vector_hits
+from ..vector_search import VectorEngineError
 from .base import QueryImage, SearchHit, SearchOutcome, miss_message
 
 

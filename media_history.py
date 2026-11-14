@@ -10,10 +10,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 
-try:
-    from .random_media import media_filename
-except ImportError:  # 兼容插件以独立模块方式加载
-    from random_media import media_filename  # type: ignore[no-redef]
+from .random_media import media_filename
 
 # 每个会话最多保留的历史键数 / 最多保留的会话数：纯内存缓存，防止长期运行下
 # 无限增长；超出后按 LRU 淘汰最早的条目（会话级收敛）

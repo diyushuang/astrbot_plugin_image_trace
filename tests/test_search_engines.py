@@ -179,3 +179,139 @@ def test_auto_engine_falls_back_to_hash_on_miss_or_empty_pool() -> None:
     assert result.hash is None
     assert result.hash_empty is True
     assert hash_engine.calls == 0
+
+
+# ----------------------------------------------------------------------
+# 协议入口与错误分支补强
+# ----------------------------------------------------------------------
+
+
+def test_vector_engine_no_path_and_miss_candidates() -> None:
+    class _FakeVector:
+        threshold = 0.80
+        duplicate_threshold = 1.1
+        top_k = 5
+
+        async def embed_file(self, path, mime=None):
+            return [1.0]
+
+        async def search(self, vector, limit, with_vector):
+            return [
+                {"id": "a", "score": 0.7, "payload": {"file_name": "a.jpg"}},
+                {"id": "b", "score": 0.6, "payload": {"file_name": "b.jpg"}},
+            ]
+
+    engine = VectorSearchEngine(_FakeVector(), top_n=2)
+    nofile = asyncio.run(engine.search_outcome(QueryImage(path="")))
+    assert nofile.kind == "nofile"
+
+    miss = asyncio.run(engine.search_outcome(QueryImage(path="q.jpg")))
+    assert miss.kind == "miss"
+    assert len(miss.candidate_lines) == 2
+    assert "阈值 80%" in miss.miss_text
+    assert asyncio.run(engine.search(QueryImage(path="q.jpg"))) == []
+
+
+def test_vector_engine_error_paths_are_normalized() -> None:
+    from astrbot_plugin_image_trace.vector_search import VectorEngineError
+
+    class _Boom:
+        threshold = 0.8
+        duplicate_threshold = 1.0
+        top_k = 5
+
+        async def embed_file(self, path, mime=None):
+            raise VectorEngineError("boom")
+
+        async def search(self, vector, limit, with_vector):
+            return []
+
+    outcome = asyncio.run(
+        VectorSearchEngine(_Boom(), top_n=3).search_outcome(QueryImage(path="q.jpg"))
+    )
+    assert outcome.kind == "error"
+    assert outcome.error == "boom"
+
+    class _BoomGeneric(_Boom):
+        async def embed_file(self, path, mime=None):
+            raise RuntimeError("secret detail")
+
+    outcome = asyncio.run(
+        VectorSearchEngine(_BoomGeneric(), top_n=3).search_outcome(QueryImage(path="q.jpg"))
+    )
+    assert outcome.kind == "error"
+    assert "内部错误" in outcome.error
+
+
+def test_auto_engine_protocol_search_returns_hits() -> None:
+    class _VectorHit:
+        async def search_outcome(self, image):
+            return SearchOutcome(
+                kind="hit", hits=[SearchHit(id="a", score=0.9)]
+            )
+
+    hit = asyncio.run(
+        AutoSearchEngine(
+            _VectorHit(), object(), hash_pool_size=lambda: 0, want=5
+        ).search(QueryImage(path="q.jpg"))
+    )
+    assert [item.id for item in hit] == ["a"]
+
+    class _VectorMiss:
+        async def search_outcome(self, image):
+            return SearchOutcome(kind="miss")
+
+    class _Hash:
+        def merged_candidates(self, phash, want):
+            return SimpleNamespace(
+                hits=[SearchHit(id="h", score=0.9)], candidate_lines=[]
+            )
+
+    fallback = asyncio.run(
+        AutoSearchEngine(
+            _VectorMiss(), _Hash(), hash_pool_size=lambda: 1, want=5
+        ).search(QueryImage(path="q.jpg", phash="0" * 64))
+    )
+    assert [item.id for item in fallback] == ["h"]
+
+
+def test_hash_engine_survives_one_leg_failure_and_protocol_methods() -> None:
+    class _BoomLibrary:
+        def search(self, phash, want):
+            raise RuntimeError("local down")
+
+    class _Remote:
+        is_empty = False
+
+        def search(self, phash, want):
+            return [_remote(0.95, 9)]
+
+    engine = HashSearchEngine(
+        _BoomLibrary(),
+        _Remote(),
+        threshold=0.85,
+        top_n=5,
+        remote_enabled=lambda: True,
+    )
+    result = engine.merged_candidates("0" * 64, 5)
+    assert [hit.id for hit in result.hits] == [9]
+    assert [
+        hit.id
+        for hit in asyncio.run(engine.search(QueryImage(phash="0" * 64)))
+    ] == [9]
+    assert engine.search_outcome(QueryImage(phash="0" * 64)).kind == "hit"
+
+    class _BoomRemote:
+        is_empty = False
+
+        def search(self, phash, want):
+            raise RuntimeError("remote down")
+
+    engine = HashSearchEngine(
+        _FakeLibrary([_local(0.90, 1)]),
+        _BoomRemote(),
+        threshold=0.85,
+        top_n=5,
+        remote_enabled=lambda: True,
+    )
+    assert [hit.id for hit in engine.merged_candidates("0" * 64, 5).hits] == [1]
