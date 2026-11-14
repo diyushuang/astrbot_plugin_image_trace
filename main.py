@@ -1627,7 +1627,7 @@ class ImageTracePlugin(Star):
             f"{'合成卡片' if settings['render_mode'] == 'card' else '图文直发'}"
             f"，取图：{'原图' if settings['image_mode'] == 'original' else '缩略图'}"
             f"，文字：{'显示' if settings['show_quote'] else '不显示'}"
-            f"，昵称：{'显示' if settings['show_sender'] else '不显示'}"
+            f"，群昵称：{'显示' if settings['show_sender'] else '不显示'}"
         )
         if settings["mode"] != "weibo":
             return f"· 签到模式：quote（随机图 + 随机语句；{shape}）"
