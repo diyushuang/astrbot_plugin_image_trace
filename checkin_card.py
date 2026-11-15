@@ -31,15 +31,7 @@ except Exception:  # 兼容独立模块加载/本地自测环境
 
     logger = logging.getLogger("checkin_card")
 
-try:
-    from .url_guard import read_limited_text
-except ImportError:  # 兼容插件以独立模块方式加载
-    try:
-        from url_guard import read_limited_text  # type: ignore[no-redef]
-    except ImportError:  # 本地自测环境没有 url_guard 时退化为普通读取
-        async def read_limited_text(resp, limit: int) -> str:  # type: ignore[no-redef]
-            data = await resp.content.read(limit + 1)
-            return bytes(data[:limit]).decode("utf-8", errors="replace")
+from .url_guard import read_limited_text
 
 # 内置语句库：首次运行会写入 data 目录的 quotes.txt，用户可直接增删。
 # 全部为原创短句，不引用受版权保护的歌词/诗句。

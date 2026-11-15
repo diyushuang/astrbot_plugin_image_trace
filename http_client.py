@@ -6,13 +6,8 @@ from collections.abc import Awaitable, Callable
 
 import aiohttp
 
-try:
-    from .common import USER_AGENT
-    from .url_guard import guarded_request, make_pinned_connector
-except ImportError:  # Compatible with direct module imports used by tests.
-    from common import USER_AGENT  # type: ignore[no-redef]
-    from url_guard import guarded_request, make_pinned_connector  # type: ignore[no-redef]
-
+from .common import USER_AGENT
+from .url_guard import guarded_request, make_pinned_connector
 
 PrepareCallback = Callable[[str, str, bool], dict]
 

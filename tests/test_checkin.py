@@ -931,7 +931,6 @@ async def test_nickname_diag_qq_official_explains_no_group_card(
     assert "没有群名片/群昵称" in text
     assert "最终：测试用户（来源：事件昵称）" in text
 
-
 async def test_checkin_settings_defaults_for_text_switches(make_plugin):
     """两个新开关默认都为真（升级即保持原行为 + 带昵称）。"""
     settings = make_plugin()._checkin_settings()
@@ -944,6 +943,8 @@ async def test_checkin_settings_defaults_for_text_switches(make_plugin):
 
 async def test_checkin_line_drops_emoji_only_name(make_plugin):
     """昵称全是 emoji 时，页脚不能剩一个孤零零的「·」。"""
+    from types import SimpleNamespace
+
     plugin = make_plugin()
     outcome = SimpleNamespace(streak=3, total=10)
 

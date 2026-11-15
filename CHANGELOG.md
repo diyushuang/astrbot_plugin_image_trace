@@ -1,5 +1,14 @@
 # 更新日志
 
+## 1.8.0（2026-11-15，架构重构，用户可见行为不变）
+
+- **架构重构，用户可见行为不变**：插件按 `config/`、`controllers/`、`services/`、`delivery/`、`media/`、`search/`、`storage/` 分层重组，`main.py` 只保留入口与薄委托。指令名、参数、配置键、默认值、数据目录与文件格式、回传链路语义全部与 1.7.25 一致，升级无需迁移。
+- **行为契约不变**：同一事件只投递一次；`UNKNOWN` 按已送达处理、绝不重发；只有通道明确失败才回退；「已压缩」配文只按通道实测证据写入；`/原图` 不返回缩略图；多图逐张投递；签到取图独立于 `/随机图`。
+- **兼容**：`_conf_schema.json` 与 `requirements.txt` 与 1.7.25 字节一致（含 15 个隐藏旧键）；`config/migrations.py` 继续支持旧布局自动迁移（`LAYOUT_VERSION="3"`）。
+- **质量**：全量 **575 passed**、总覆盖率 **82.92%**、`ruff check` 全绿；CI 覆盖 Python 3.10 / 3.12，覆盖率门禁扩到 31 个模块。
+- **发布**：发布包 **66 文件 / 59 个 .py**（含 7 个子包 `__init__.py`），`scripts/build_release.py --check` 校验清单、SemVer、16MB 上限与 SHA256。
+- **同步**：1.7.22–1.7.25 的签到群昵称修复（含 `/溯源昵称` 诊断、qq_official 官方文档兜底）已按分层结构完整移植。
+
 ## 1.7.25（2026-11-12，qq_official 昵称按官方文档兜底）
 
 - **兼容**：`qq_official` 平台按官方文档处理昵称：群消息事件自带 `author.username`（QQ 昵称），优先直接使用；只有事件昵称为空时才调用官方 `GET /v2/groups/{group_openid}/members/{member_openid}` 取 `username` 兜底。
@@ -7,6 +16,9 @@
 - **诊断**：`/溯源昵称` 增加 `qq_official` 分支，显示事件 `username`、官方接口 `username` / `member_role` 或失败原因，并明确提示「没有群名片/群昵称」。
 - **文档**：`checkin.show_sender` 配置说明与 README 同步补充 `qq_official` 限制。
 - **测试**：新增 4 例（`qq_official` 事件 username 优先、事件为空查官方接口、11253 无权限回退、诊断说明），全量 **450 passed**，`ruff check` 全绿。
+- **重构分支同步**：1.7.22–1.7.25 已按 `services/checkin_identity.py` 分层移植；全量 **526 passed**（含 pillow-heif），覆盖率门禁通过。
+- **重构分支加固**：清理 delivery 死接口与未用字段；统一包内相对导入并移除各模块双份 import 回退；发布脚本增加 SemVer / 16MB 上限 / SHA256 / `--check`；CI 扩到整包覆盖率并按模块设置门槛；新增 26 个控制器/服务/检索用例，全量 **552 passed**，总覆盖率 **80.25%**。
+- **P2 结构治理**：`image_bed.py` 拆为 `storage/` 下 local / generic_http / cloudflare_imgbed / R2-OCI 后端与 URL 工具；`vector_search.py` 拆为 `search/embedding_client.py` + `search/qdrant_client.py`，原类保留薄门面；`main.py` 方法数 165 → **137**（私有 123 → 119），服务/控制器 host 调用 63/48 → **55/41**；原项目外层历史 zip / 脚本 / 报告归档到 `archive/2026-11-14/`。全量 **575 passed**，总覆盖率 **82.92%**，发布包 **66 文件 / 59 个 .py**。
 
 ## 1.7.24（2026-11-12，签到群昵称接口修复与诊断）
 
@@ -28,6 +40,7 @@
 - **兼容**：AstrBot 4.0.x 的 aiocqhttp 适配器只把 QQ 昵称写进 `MessageMember`，群名片留在 `message_obj.raw_message` 的 `sender.card` 里；插件声明支持 `>=4.0.0`，因此由插件自己按「`sender.card` → 原始事件 `sender.card` → 框架昵称」取值，较新版本（已 card 优先）行为不变。
 - **文档**：`checkin.show_sender` 配置说明、`/溯源帮助`、`/溯源状态` 与 README 同步改为「群昵称（取不到回退 QQ 昵称）」。
 - **测试**：新增 4 例（原始事件群名片优先、`sender.card` 优先级最高、空/全空白群名片回退昵称、对象形式 raw_message 与群名片截断），全量 **434 passed**，`ruff check` 全绿。
+
 
 ## 1.7.21（2026-11-03，签到可「只发美图」+ 文字带签到者昵称）
 

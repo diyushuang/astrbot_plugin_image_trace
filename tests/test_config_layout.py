@@ -12,9 +12,26 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
+from astrbot_plugin_image_trace.config.loader import first_value, int_cfg, qq_upload_config
+from astrbot_plugin_image_trace.config.migrations import SCALAR_PATHS, migrate_config_layout
 from astrbot_plugin_image_trace.main import _LAYOUT_VERSION
+
+SCHEMA_PATH = Path(__file__).resolve().parents[1] / "_conf_schema.json"
+
+# 15 个隐藏旧键：12 个顶层散项 + 2 个旧配置组 + 布局版本标记。
+# 它们不能从 schema 删除——AstrBot 在插件初始化前就按 schema 丢弃未声明键，
+# 删掉后老用户的旧值会在 migrate_config_layout 读到之前消失。
+HIDDEN_LEGACY_KEYS = (
+    *SCALAR_PATHS,
+    "image_delivery",
+    "qq_upload",
+    "config_layout",
+)
 
 
 def test_migration_moves_legacy_scalars_into_groups(make_plugin):
@@ -58,7 +75,7 @@ def test_migrated_values_reach_the_readers(make_plugin):
     mode, max_side, quality, _style = plugin._delivery_config()
     assert (mode, max_side, quality) == ("url", 1280, 70)
 
-    qq_mode, _native, url_max, _prefer, _upload, _failure = plugin._qq_upload_config()
+    qq_mode, _native, url_max, _prefer, _upload, _failure = qq_upload_config(plugin.config)
     assert qq_mode == "url"
     assert url_max == 30 * 1024 * 1024
 
@@ -81,7 +98,7 @@ def test_migration_runs_only_once(make_plugin):
 
     # 模拟用户在面板里改成 native，再重启（= 再跑一次迁移）
     plugin.config["delivery"]["napcat_mode"] = "native"
-    plugin._migrate_config_layout()
+    migrate_config_layout(plugin.config)
 
     assert plugin.config["delivery"]["napcat_mode"] == "native"
     assert plugin._delivery_config()[0] == "native"
@@ -93,16 +110,14 @@ def test_cfg_falls_back_to_legacy_when_group_missing(make_plugin):
     plugin.config.pop("basic", None)
     plugin.config["top_n"] = 7
 
-    assert plugin._int_cfg("top_n", 3) == 7
+    assert int_cfg(plugin.config, "top_n", 3) == 7
 
 
-def test_first_value_keeps_zero_and_false(make_plugin):
+def test_first_value_keeps_zero_and_false():
     """0 / False 是合法配置，不能被当成"未配置"跳过。"""
-    plugin = make_plugin()
-
-    assert plugin._first_value(0, 5) == 0
-    assert plugin._first_value(False, True) is False
-    assert plugin._first_value(None, "", 5) == 5
+    assert first_value(0, 5) == 0
+    assert first_value(False, True) is False
+    assert first_value(None, "", 5) == 5
 
 
 @pytest.mark.parametrize(
@@ -121,3 +136,40 @@ def test_scalar_paths_cover_every_moved_key(legacy, group, field):
     from astrbot_plugin_image_trace.main import _SCALAR_PATHS
 
     assert _SCALAR_PATHS[legacy] == (group, field)
+
+
+def test_hidden_legacy_keys_are_still_declared():
+    """15 个隐藏旧键必须继续声明：删掉会让升级用户的旧值在迁移前被 schema 清空。"""
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    assert len(HIDDEN_LEGACY_KEYS) == 15
+    for key in HIDDEN_LEGACY_KEYS:
+        assert key in schema, f"旧键 {key} 不能从 _conf_schema.json 删除"
+        assert schema[key].get("invisible") is True, f"旧键 {key} 必须保持隐藏"
+
+
+_LEGACY_SCALAR_VALUES = {
+    "search_engine": "hash",
+    "scan_dirs": ["C:\\imgs"],
+    "similarity_threshold": 0.9,
+    "hash_size": 8,
+    "top_n": 5,
+    "max_images_per_query": 2,
+    "ai_verify": True,
+    "register_admin_only": False,
+    "max_download_mb": 30,
+    "remote_hash_enabled": False,
+    "remote_hash_ttl": 600,
+    "remote_hash_max_points": 100,
+}
+
+
+@pytest.mark.parametrize(("legacy", "target"), sorted(SCALAR_PATHS.items()))
+def test_every_legacy_scalar_migrates_to_the_correct_new_key(
+    make_plugin, legacy, target
+):
+    """12 个顶层旧键逐个钉住：迁移后新组里的新键取值等于旧值。"""
+    value = _LEGACY_SCALAR_VALUES[legacy]
+    group, field = target
+    plugin = make_plugin(**{legacy: value})
+    assert plugin.config[group][field] == value
+    assert plugin.config["config_layout"] == _LAYOUT_VERSION

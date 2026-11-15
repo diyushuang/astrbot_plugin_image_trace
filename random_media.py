@@ -21,12 +21,8 @@ from urllib.parse import unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 import aiohttp
 
-try:
-    from .http_client import GuardedHttpClient
-    from .url_guard import read_limited_text
-except ImportError:  # 兼容插件以独立模块方式加载
-    from http_client import GuardedHttpClient  # type: ignore[no-redef]
-    from url_guard import read_limited_text  # type: ignore[no-redef]
+from .http_client import GuardedHttpClient
+from .url_guard import read_limited_text
 
 try:
     from astrbot.api import logger

@@ -20,6 +20,7 @@ from PIL import Image as PILImage
 from astrbot_plugin_image_trace import main as main_module
 from astrbot_plugin_image_trace.features import compute_features
 from astrbot_plugin_image_trace.main import ImageTracePlugin  # noqa: F401  见 conftest 桩
+from astrbot_plugin_image_trace.services import trace_service
 
 
 class _FakeBot:
@@ -1112,8 +1113,9 @@ async def test_auto_engine_reuses_features_and_mime_from_single_decode(
     def forbid_features(*_args, **_kwargs):
         raise AssertionError("解析结果已带 features，不应再调用 compute_features")
 
-    monkeypatch.setattr(main_module, "compute_features_with_mime", fake_features_with_mime)
-    monkeypatch.setattr(main_module, "compute_features", forbid_features)
+    # R1 起特征计算在 services/trace_service，patch 点随实现迁到服务模块。
+    monkeypatch.setattr(trace_service, "compute_features_with_mime", fake_features_with_mime)
+    monkeypatch.setattr(trace_service, "compute_features", forbid_features)
     monkeypatch.setattr(plugin, "_hash_pool_size", lambda: 1)
     monkeypatch.setattr(plugin, "_merged_hash_candidates", lambda *_a, **_k: ([], []))
 

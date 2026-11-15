@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, refactor/architecture]
   pull_request:
 
 jobs:
@@ -28,9 +28,13 @@ jobs:
       - name: Pytest
         # 完整输出写文件，只打印尾部：失败时既能看到摘要与首个 traceback，
         # 又不会让 GitHub 因步骤日志过大而截断（截断后反而看不到根因）。
+        # 覆盖率采集整个包，门禁脚本再按模块分别卡阈值。
         run: |
           set +e
-          pytest -q > pytest.log 2>&1
+          pytest -q \
+            --cov=astrbot_plugin_image_trace \
+            --cov-report=json:coverage.json \
+            > pytest.log 2>&1
           status=$?
           if [ "$status" -ne 0 ]; then
             echo "::group::pytest (tail -n 250)"
@@ -40,3 +44,5 @@ jobs:
             tail -n 20 pytest.log
           fi
           exit "$status"
+      - name: Coverage gate
+        run: python scripts/check_coverage.py coverage.json

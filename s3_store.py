@@ -33,17 +33,9 @@ from urllib.parse import quote, urlparse
 
 import aiohttp
 
-try:
-    from .common import USER_AGENT
-    from .http_client import GuardedHttpClient
-    from .url_guard import UrlBlockedError, read_limited_bytes
-except ImportError:  # 兼容插件以独立模块方式加载
-    from common import USER_AGENT  # type: ignore[no-redef]
-    from http_client import GuardedHttpClient  # type: ignore[no-redef]
-    from url_guard import (  # type: ignore[no-redef]
-        UrlBlockedError,
-        read_limited_bytes,
-    )
+from .common import USER_AGENT
+from .http_client import GuardedHttpClient
+from .url_guard import UrlBlockedError, read_limited_bytes
 
 EMPTY_PAYLOAD_SHA256 = hashlib.sha256(b"").hexdigest()
 
