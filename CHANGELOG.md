@@ -1,5 +1,14 @@
 # 更新日志
 
+## 1.8.0（2026-11-15，架构重构，用户可见行为不变）
+
+- **架构重构，用户可见行为不变**：插件按 `config/`、`controllers/`、`services/`、`delivery/`、`media/`、`search/`、`storage/` 分层重组，`main.py` 只保留入口与薄委托。指令名、参数、配置键、默认值、数据目录与文件格式、回传链路语义全部与 1.7.25 一致，升级无需迁移。
+- **行为契约不变**：同一事件只投递一次；`UNKNOWN` 按已送达处理、绝不重发；只有通道明确失败才回退；「已压缩」配文只按通道实测证据写入；`/原图` 不返回缩略图；多图逐张投递；签到取图独立于 `/随机图`。
+- **兼容**：`_conf_schema.json` 与 `requirements.txt` 与 1.7.25 字节一致（含 15 个隐藏旧键）；`config/migrations.py` 继续支持旧布局自动迁移（`LAYOUT_VERSION="3"`）。
+- **质量**：全量 **575 passed**、总覆盖率 **82.92%**、`ruff check` 全绿；CI 覆盖 Python 3.10 / 3.12，覆盖率门禁扩到 31 个模块。
+- **发布**：发布包 **66 文件 / 59 个 .py**（含 7 个子包 `__init__.py`），`scripts/build_release.py --check` 校验清单、SemVer、16MB 上限与 SHA256。
+- **同步**：1.7.22–1.7.25 的签到群昵称修复（含 `/溯源昵称` 诊断、qq_official 官方文档兜底）已按分层结构完整移植。
+
 ## 1.7.25（2026-11-12，qq_official 昵称按官方文档兜底）
 
 - **兼容**：`qq_official` 平台按官方文档处理昵称：群消息事件自带 `author.username`（QQ 昵称），优先直接使用；只有事件昵称为空时才调用官方 `GET /v2/groups/{group_openid}/members/{member_openid}` 取 `username` 兜底。
