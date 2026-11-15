@@ -1,7 +1,7 @@
-"""R1 服务层：随机图流程：目录选择、图床直链归一与发送。
+"""服务层：随机图——目录选择、直链归一、缩略图替身与发送。
 
-服务通过构造注入的 host 门面访问 library / vector / storage / 图床等
-依赖，禁止反向 import main；main 中的同名方法只做薄委托。
+服务通过构造注入的 host 门面访问随机接口、Qdrant 缩略图反查与发送通道，
+禁止反向 import main；main 中的同名方法只做薄委托。
 """
 
 from __future__ import annotations

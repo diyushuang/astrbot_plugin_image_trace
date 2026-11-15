@@ -1,6 +1,7 @@
 """检索层：统一的命中模型与 hash / vector / auto 三个引擎。
 
-main 只保留同名薄委托，不再直接拼两条哈希腿或写 auto 的回退分支。
+main 只保留同名薄委托；控制器与服务按需选用引擎，不再直接拼两条哈希腿
+或写 auto 的回退分支。
 
 这里的导出是**惰性**的：`vector_engine` 会从 `..vector_search` 取
 `VectorEngineError`，而 `vector_search` 又要 import 本包下的

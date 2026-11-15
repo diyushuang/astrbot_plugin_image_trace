@@ -1,7 +1,7 @@
-"""R1 服务层：原图查找流程：按名反查、缩略图反查、图床直链探测。
+"""服务层：原图查找——按名反查、缩略图反查、图床直链探测。
 
-服务通过构造注入的 host 门面访问 library / vector / storage / 图床等
-依赖，禁止反向 import main；main 中的同名方法只做薄委托。
+服务通过构造注入的 host 门面访问会话历史、Qdrant 精确反查与图床直链，
+禁止反向 import main；main 中的同名方法只做薄委托。
 """
 
 from __future__ import annotations

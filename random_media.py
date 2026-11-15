@@ -1,9 +1,10 @@
 """CloudFlare-ImgBed 随机图 API 客户端与纯函数工具。
 
-数据流：取随机图配置（由 main 归一化后传入）→ 拼接随机接口地址
+数据流：取随机图配置（由 config.loader 归一化后传入）→ 拼接随机接口地址
 （GET {base_url}{api_endpoint}?type=url&form=json[&dir=][&content=]）
-→ 经 GuardedHttpClient 请求 → 把响应归一为绝对媒体 URL 交回 main，
-由 main 决定发送方式（图片走 _yield_delivery、视频走标准消息链）。
+→ 经 GuardedHttpClient 请求 → 把响应归一为绝对媒体 URL 交回
+services/random_service.py，由服务决定发送方式（图片走统一投递入口、视频走
+标准消息链）。
 
 本模块只负责“取到一条通过校验的媒体直链”：不关心发送策略、不落地字节；
 所有出网请求都走 http_client.GuardedHttpClient（SSRF 校验 + IP 钉扎 + 逐跳

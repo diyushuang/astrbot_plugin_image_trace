@@ -24,6 +24,7 @@ SEMVER_RE = re.compile(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?")
 RUNTIME_PACKAGES = ("config", "controllers", "delivery", "media", "search", "services", "storage")
 # 非代码运行所需文件：新增/删除时只改这里
 DATA_FILES = (
+    "ARCHITECTURE.md",
     "CHANGELOG.md",
     "LICENSE",
     "_conf_schema.json",

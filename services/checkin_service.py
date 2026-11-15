@@ -1,7 +1,7 @@
-"""R1 服务层：每日签到流程：签到记录、取图、文案与卡片合成失败回退。
+"""服务层：每日签到——签到记账、取图、文案与卡片合成失败回退。
 
-服务通过构造注入的 host 门面访问 library / vector / storage / 图床等
-依赖，禁止反向 import main；main 中的同名方法只做薄委托。
+服务通过构造注入的数据目录、签到库、随机图服务与发送通道完成流程，
+禁止反向 import main；main 中的同名方法只做薄委托。
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
-"""R1 服务层：溯源检索流程：哈希/向量/auto 三条检索路径与命中回传。
+"""服务层：溯源检索流程——哈希 / 向量 / auto 三条路径与命中回传。
 
-服务通过构造注入的 host 门面访问 library / vector / storage / 图床等
-依赖，禁止反向 import main；main 中的同名方法只做薄委托。
+服务通过构造注入的 host 门面访问图库、向量引擎、存储与发送能力，
+禁止反向 import main；main 中的同名方法只做薄委托。
 """
 
 from __future__ import annotations

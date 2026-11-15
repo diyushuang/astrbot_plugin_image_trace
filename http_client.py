@@ -1,4 +1,8 @@
-"""Shared guarded HTTP client for plugin outbound requests."""
+"""插件出网统一使用的受管 HTTP 客户端。
+
+在 `url_guard` 的逐跳校验 / IP 钉扎之上提供一个 aiohttp 会话，供下载兜底、
+图床、对象存储、Qdrant 与随机图接口复用。
+"""
 
 from __future__ import annotations
 

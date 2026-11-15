@@ -10,6 +10,8 @@
 - QQ 消息的接收与发送完全通过 AstrBot 事件与消息组件 API 完成；
 - 所有出网请求（下载兜底/图床/向量服务）统一经 url_guard 做 SSRF 校验；
 - 可选使用当前会话的视觉大模型对哈希命中结果做二次复核（ai_verify 开关）。
+
+分层结构、调用链与扩展点见仓库根目录 `ARCHITECTURE.md`。
 """
 
 # E402：下面的合成包引导必须先于包内相对导入执行（仅此一处例外）。
@@ -210,7 +212,7 @@ QQ_TRANSCODE_MAX_PIXELS = 50_000_000
 
 
 class ImageTracePlugin(Star):
-    """图片溯源插件主类。"""
+    """插件主类：组装依赖、注册指令，并把业务流程薄委托给 controllers / services。"""
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -273,8 +275,9 @@ class ImageTracePlugin(Star):
         except Exception as exc:
             logger.error(f"签到数据库初始化失败，/签到 将不可用: {exc}")
         self._quote_library_cache: QuoteLibrary | None = None
-        # 微博签到：文案源目录 + 预生成映射表。映射表由 scripts/build_weibo_map.py
-        # 离线生成，签到只读本地 JSON，不请求微博、不算 pHash。
+        # 微博签到：文案源目录 + 预生成映射表。仓库不附带生成脚本；映射表由
+        # 离线流程调用 weibo_posts.save_post_map 写出，签到只读本地 JSON，
+        # 不请求微博、不算 pHash。
         self.weibo_dir = os.path.join(self.data_dir, "weibo")
         self.weibo_thumb_dir = os.path.join(self.weibo_dir, "thumbs")
         try:
@@ -562,6 +565,7 @@ class ImageTracePlugin(Star):
         return time.monotonic() < self._qq_url_unsupported_until
 
     async def _get_http(self) -> GuardedHttpClient:
+        """惰性构造本实例唯一的受管 HTTP 客户端（带实例级内网直连白名单）。"""
         if self._http is None:
             # 连接器启用 IP 钉扎：出网连接只允许落在 url_guard 校验过的地址上。
             # 内网直连白名单按实例传入，避免多实例共享模块级全局集合。
@@ -588,6 +592,7 @@ class ImageTracePlugin(Star):
             pass
 
     def _delivery_config(self) -> tuple[str, int, int, str]:
+        """当前通道配置 (mode, max_side, quality, scaled_url_style)；解析见 config.loader.delivery_config。"""
         return delivery_config(self.config)
 
     def _random_settings(self) -> dict:
@@ -638,7 +643,7 @@ class ImageTracePlugin(Star):
         return checkin_settings(self.config)
 
     async def _checkin_sender_name(self, event: AstrMessageEvent, limit: int = 16) -> str:
-        """签到者群昵称（薄委托）：实现见 services/checkin_identity.py。"""
+        """签到者群昵称（薄委托）：委托 services.checkin_identity.checkin_sender_name。"""
         return await checkin_sender_name(event, limit)
 
     def _checkin_line(self, name: str, outcome) -> str:
@@ -706,7 +711,7 @@ class ImageTracePlugin(Star):
         return self._delivery_target(event).direct_send
 
     def _mention_prefix(self, event: AstrMessageEvent) -> list:
-        # R2：实现已下沉到 delivery/primitives.py，签名不变。
+        """群聊 @ 前缀消息段；委托 delivery.primitives.mention_prefix（平台能力探测仍在 main）。"""
         return mention_prefix(self, event)
 
     @staticmethod
@@ -778,7 +783,7 @@ class ImageTracePlugin(Star):
     async def _send_via_onebot(
         self, event: AstrMessageEvent, header: str, blocks: list[dict], payloads: list[str | bytes]
     ) -> SendOutcome:
-        # R2：实现已下沉到 delivery/primitives.py，签名不变。
+        """经 OneBot 原生接口直发；委托 delivery.primitives.send_via_onebot（超时窗口由 config.loader 注入）。"""
         return await send_via_onebot(
             self, event, header, blocks, payloads,
             image_timeout=onebot_image_timeout(self.config),
@@ -799,7 +804,7 @@ class ImageTracePlugin(Star):
     def _mark_compressed_captions(
         self, blocks: list[dict], evidences: list[CompressionEvidence]
     ) -> None:
-        # R2：实现已下沉到 delivery/primitives.py，签名不变。
+        """给实测压缩过的块改写配文；委托 delivery.primitives.mark_compressed_captions。"""
         mark_compressed_captions(self, blocks, evidences)
 
     async def _load_delivery_bytes(self, block: dict, *, validate: bool = True) -> bytes | None:
@@ -830,7 +835,7 @@ class ImageTracePlugin(Star):
     async def _prepare_delivery_blocks(
         self, blocks: list[dict], *, compress: bool
     ) -> list[tuple[bytes, bool]] | None:
-        # R2：实现已下沉到 delivery/primitives.py；配置仍在 main 读取后注入。
+        """读取并（可选）压缩待发图片；委托 delivery.primitives.prepare_delivery_blocks。"""
         mode, max_side, quality, _ = self._delivery_config()
         return await prepare_delivery_blocks(
             self, blocks, compress=compress,
@@ -847,7 +852,7 @@ class ImageTracePlugin(Star):
         *,
         mark_compressed: bool,
     ) -> SendOutcome | None:
-        # R2：实现已下沉到 delivery/primitives.py，签名不变。
+        """本机压缩后经 OneBot 直发；委托 delivery.primitives.local_compress_delivery。"""
         return await local_compress_delivery(
             self, event, header, blocks, image_blocks,
             mark_compressed=mark_compressed,
@@ -866,7 +871,7 @@ class ImageTracePlugin(Star):
         self, image_blocks: list[dict], max_side: int, mode: str,
         quality: int = 85, scaled_url_style: str = "query",
     ) -> tuple[list[str], list[CompressionEvidence]]:
-        # R2：实现已下沉到 delivery/primitives.py；缩放实测开关由 main 注入。
+        """生成直链投递计划与压缩证据；委托 delivery.primitives.url_delivery_plan。"""
         return await url_delivery_plan(
             self, image_blocks, max_side, mode,
             quality=quality, scaled_url_style=scaled_url_style,
@@ -995,9 +1000,11 @@ class ImageTracePlugin(Star):
         )
 
     def _vector_engine(self) -> VectorSearchEngine:
+        """按当前实例状态构造向量检索适配器（属性动态读取，兼容测试替换）。"""
         return VectorSearchEngine(self.vector, top_n=self.top_n)
 
     def _auto_engine(self) -> AutoSearchEngine:
+        """构造 auto 引擎：向量优先，未命中/不可用时回退哈希。"""
         return AutoSearchEngine(
             self._vector_engine(),
             self._hash_engine(),
@@ -1015,17 +1022,17 @@ class ImageTracePlugin(Star):
         return HashSearchEngine.candidate_note(match)
 
     async def _trace_hash(self, event: AstrMessageEvent, seg, resolved: ResolvedImage | None=None) -> AsyncGenerator:
-        # R1：流程主体在 services/trace.py，main 只留同名薄委托。
+        """哈希检索主流程；委托 services.trace_service.TraceService._trace_hash。"""
         async for result in self.services.trace._trace_hash(event, seg, resolved):
             yield result
 
     async def _hash_outcome_delivery(self, event: AstrMessageEvent, query_path: str, hits: list, candidate_lines: list) -> AsyncGenerator:
-        # R1：流程主体在 services/trace.py，main 只留同名薄委托。
+        """哈希命中/未命中的回传；委托 services.trace_service.TraceService._hash_outcome_delivery。"""
         async for result in self.services.trace._hash_outcome_delivery(event, query_path, hits, candidate_lines):
             yield result
 
     async def _hash_hit_result(self, event: AstrMessageEvent, best) -> AsyncGenerator:
-        # R1：流程主体在 services/trace.py，main 只留同名薄委托。
+        """哈希命中的单条结果（可含 AI 复核）；委托 services.trace_service.TraceService._hash_hit_result。"""
         async for result in self.services.trace._hash_hit_result(event, best):
             yield result
 
@@ -1034,21 +1041,21 @@ class ImageTracePlugin(Star):
     # ------------------------------------------------------------------
 
     async def _vector_search_one(self, event, seg, resolved: ResolvedImage | None=None):
-        # R1：流程主体在 services/trace.py，main 只留同名薄委托。
+        """单图向量检索；委托 services.trace_service.TraceService._vector_search_one。"""
         return await self.services.trace._vector_search_one(event, seg, resolved)
 
     async def _trace_vector(self, event: AstrMessageEvent, seg) -> AsyncGenerator:
-        # R1：流程主体在 services/trace.py，main 只留同名薄委托。
+        """纯向量检索流程；委托 services.trace_service.TraceService._trace_vector。"""
         async for result in self.services.trace._trace_vector(event, seg):
             yield result
 
     async def _trace_auto(self, event: AstrMessageEvent, seg) -> AsyncGenerator:
-        # R1：流程主体在 services/trace.py，main 只留同名薄委托。
+        """向量优先、失败回退哈希的流程；委托 services.trace_service.TraceService._trace_auto。"""
         async for result in self.services.trace._trace_auto(event, seg):
             yield result
 
     async def _vector_hits_delivery(self, event: AstrMessageEvent, hits: list) -> AsyncGenerator:
-        # R1：流程主体在 services/trace.py，main 只留同名薄委托。
+        """向量命中的批量回传；委托 services.trace_service.TraceService._vector_hits_delivery。"""
         async for result in self.services.trace._vector_hits_delivery(event, hits):
             yield result
 
@@ -1123,6 +1130,7 @@ class ImageTracePlugin(Star):
 
     @staticmethod
     def _dup_message(dup) -> str:
+        """重复登记的提示文案（带原条目编号与备注）；查重由 RegisterController 完成。"""
         note = f"，备注：{dup['note']}" if dup["note"] else ""
         return f"该图片已登记过（#{dup['id']}{note}）。"
 
@@ -1258,6 +1266,7 @@ class ImageTracePlugin(Star):
             yield result
 
     def _usage(self) -> str:
+        """`/溯源帮助` 的纯文本说明；内容随已注册指令同步维护。"""
         return (
             "🔍 图片溯源使用说明\n"
             "· /溯源 —— 与图片同条消息发送，或引用一张图片发送，自动在图库中寻找原图\n"
@@ -1360,6 +1369,7 @@ class ImageTracePlugin(Star):
 
     @staticmethod
     def _original_usage() -> str:
+        """`/原图` 在历史为空时的提示，顺带说明「按文件名直取」的用法。"""
         return (
             "本会话还没有回传过图片。/原图 也可直接按文件名到图床取原图：\n"
             "· /原图 文件名 —— 直接把图床里的原图取回来（无需先回传）\n"
@@ -1368,27 +1378,27 @@ class ImageTracePlugin(Star):
         )
 
     async def _reverse_original(self, fetch, *, action: str, level: str='warning') -> tuple[str, str]:
-        # R1：流程主体在 services/original.py，main 只留同名薄委托。
+        """执行一次反查并把失败转成 (文案, 日志级别)；委托 services.original_service.OriginalService._reverse_original。"""
         return await self.services.original._reverse_original(fetch, action=action, level=level)
 
     async def _original_from_thumbnail(self, thumb_ref: str) -> tuple[str, str]:
-        # R1：流程主体在 services/original.py，main 只留同名薄委托。
+        """缩略图直链 → 原图直链；委托 services.original_service.OriginalService._original_from_thumbnail。"""
         return await self.services.original._original_from_thumbnail(thumb_ref)
 
     async def _original_from_thumb_name(self, name: str) -> tuple[str, str]:
-        # R1：流程主体在 services/original.py，main 只留同名薄委托。
+        """按缩略图文件名反查原图；委托 services.original_service.OriginalService._original_from_thumb_name。"""
         return await self.services.original._original_from_thumb_name(name)
 
     async def _lookup_imgbed_file(self, name: str, *, quoted: str='') -> tuple[str, str, str]:
-        # R1：流程主体在 services/original.py，main 只留同名薄委托。
+        """按文件名到图床/索引取权威直链；委托 services.original_service.OriginalService._lookup_imgbed_file。"""
         return await self.services.original._lookup_imgbed_file(name, quoted=quoted)
 
     async def _file_name_matches(self, name: str) -> int | None:
-        # R1：流程主体在 services/original.py，main 只留同名薄委托。
+        """Qdrant 中同名文件的匹配数；委托 services.original_service.OriginalService._file_name_matches。"""
         return await self.services.original._file_name_matches(name)
 
     async def _original_by_name(self, name: str) -> tuple[str, str]:
-        # R1：流程主体在 services/original.py，main 只留同名薄委托。
+        """按裸文件名拼接图床直链并探测；委托 services.original_service.OriginalService._original_by_name。"""
         return await self.services.original._original_by_name(name)
 
     @filter.command("原图修复")
@@ -1427,16 +1437,16 @@ class ImageTracePlugin(Star):
             yield result
 
     async def _random_media_delivery(self, event: AstrMessageEvent, directory, content_type: str, settings: dict):
-        # R1：流程主体在 services/random.py，main 只留同名薄委托。
+        """随机图/视频的取图与回传；委托 services.random_service.RandomService._random_media_delivery。"""
         async for result in self.services.random._random_media_delivery(event, directory, content_type, settings):
             yield result
 
     async def _random_image_candidate(self, directory, settings: dict, *, thumbnail: bool | None=None) -> tuple[str, str, str]:
-        # R1：流程主体在 services/random.py，main 只留同名薄委托。
+        """取一张随机图的 (直链, 文件名, 类型)；委托 services.random_service.RandomService._random_image_candidate。"""
         return await self.services.random._random_image_candidate(directory, settings, thumbnail=thumbnail)
 
     async def _random_image_from_media(self, media_url: str, settings: dict, *, thumbnail: bool | None=None) -> tuple[str, str, str]:
-        # R1：流程主体在 services/random.py，main 只留同名薄委托。
+        """把随机接口返回的媒体项解析成可发送候选；委托 services.random_service.RandomService._random_image_from_media。"""
         return await self.services.random._random_image_from_media(media_url, settings, thumbnail=thumbnail)
 
     # ------------------------------------------------------------------
@@ -1704,7 +1714,7 @@ class ImageTracePlugin(Star):
         return post, send_url, original_url, image.file_name, local_thumb
 
     async def _checkin_flow(self, event: AstrMessageEvent):
-        # R1：流程主体在 services/checkin.py，main 只留同名薄委托。
+        """`/签到` 完整流程；委托 services.checkin_service.CheckinService._checkin_flow。"""
         async for result in self.services.checkin._checkin_flow(event):
             yield result
 

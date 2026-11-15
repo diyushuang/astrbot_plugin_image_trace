@@ -591,7 +591,7 @@
         ],
         "default": "quote",
         "obvious_hint": true,
-        "hint": "quote=随机图 + 随机语句（现有行为）；weibo=随机取一条微博文案及其图库对应图片，卡片显示博主与发博日期、不显示链接。文案放 data/plugin_data/astrbot_plugin_image_trace/weibo/（CSV 或 MD），或用 /签到文案导入 上传；精确配图由 scripts/build_weibo_map.py 生成 weibo_post_map.json，签到只读本地表不请求微博。"
+        "hint": "quote=随机图 + 随机语句（现有行为）；weibo=随机取一条微博文案及其图库对应图片，卡片显示博主与发博日期、不显示链接。文案放 data/plugin_data/astrbot_plugin_image_trace/weibo/（CSV 或 MD），或用 /签到文案导入 上传；精确配图由离线生成的 weibo_post_map.json 提供（本仓库不附带生成脚本，格式见 weibo_posts.save_post_map），签到只读本地表不请求微博。"
       },
       "render_mode": {
         "description": "【选填】图文呈现方式",

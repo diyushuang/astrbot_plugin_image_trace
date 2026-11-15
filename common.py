@@ -1,7 +1,7 @@
 """插件内部共享的小工具与常量。
 
-只放无业务语义的通用件（配置解析、User-Agent、常量），供 main /
-image_bed / vector_search / s3_store 取用，避免同一份真值表与解析
+只放无业务语义的通用件（配置解析、User-Agent、常量），供 main、各子包与
+image_bed / vector_search / s3_store 等门面取用，避免同一份真值表与解析
 逻辑在各模块各写一份。
 """
 
