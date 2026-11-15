@@ -20,11 +20,7 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import io
 import os
-import random
-import secrets
 import time
 from collections.abc import AsyncGenerator
 from pathlib import Path
@@ -56,7 +52,7 @@ if __package__ in (None, ""):
         _sys.modules[_pkg_name] = _pkg
     __package__ = _pkg_name
 
-from .checkin_card import QuoteLibrary, compose_poster, strip_emoji
+from .checkin_card import QuoteLibrary, strip_emoji
 from .checkin_store import CheckinStore
 from .common import (
     AI_VERIFY_MAX_CANDIDATES,
@@ -68,7 +64,6 @@ from .common import (
     TMP_MAX_AGE_SECONDS,
     as_int,
     read_bytes,
-    sanitize_error_text,
 )
 from .config.loader import (
     bool_cfg,
@@ -116,6 +111,17 @@ from .delivery.primitives import (
     send_via_onebot,
     url_delivery_plan,
 )
+from .delivery.qq_upload import (
+    block_size,
+    notify,
+    public_media_url,
+    qq_send_target,
+    qq_target_kwargs,
+    upload_block,
+    upload_takeover,
+    upload_via_chunked,
+    upload_via_url,
+)
 from .features import (
     avif_available,
     heif_available,
@@ -131,15 +137,14 @@ from .image_delivery import (
     CompressionEvidence,
     DeliveryTarget,
     SendOutcome,
-    build_original_url,
-    build_scaled_url,
-    choose_qq_upload_channel,
     delivery_target,
-    is_public_http_url,
-    qq_upload_safe_image,
-    upgrade_to_https,
 )
 from .library import ImageLibrary
+from .media.format_triage import (
+    inspect_image_delivery,
+    rewrite_blocks,
+    write_transcoded_jpeg,
+)
 from .media.image_source import ImageSource, ResolvedImage
 from .media_history import MediaHistory
 from .random_media import (
@@ -156,21 +161,17 @@ from .search import (
     miss_message,
 )
 from .services import (
+    CheckinRenderService,
     CheckinService,
     OriginalService,
     RandomService,
     TraceService,
+    WeiboService,
 )
 from .services.checkin_identity import checkin_sender_name
 from .storage import StorageRegistry
-from .url_guard import read_limited_bytes
 from .vector_search import VectorEngine
-from .weibo_posts import (
-    WeiboPost,
-    load_post_map,
-    load_posts_from_dir,
-    map_is_stale,
-)
+from .weibo_posts import WeiboPost
 
 # 兼容旧测试/外部引用：这些常量已迁到 config.migrations，main 只保留别名。
 _LAYOUT_VERSION = LAYOUT_VERSION
@@ -193,11 +194,6 @@ IMAGE_EXTS = {
 } | ({".heic", ".heif"} if heif_available() else set()) | (
     {".avif"} if avif_available() else set()
 )
-# QQ 开放平台富媒体 file_type：1=图片、2=视频、3=语音、4=文件
-QQ_IMAGE_FILE_TYPE = 1
-# 假格式转码前的像素上限：与 features / 签到卡片同一量级，防解压炸弹
-QQ_TRANSCODE_MAX_PIXELS = 50_000_000
-
 # ----------------------------------------------------------------------
 # 配置布局（1.7.14）：同类项合并进 basic / delivery / limits 三个组。
 # 旧布局（顶层散项 + image_delivery / qq_upload 两组）继续可读——新键优先、
@@ -345,6 +341,8 @@ class ImageTracePlugin(Star):
             ),
             random=RandomService(host=self),
             original=OriginalService(host=self),
+            weibo=WeiboService(host=self),
+            checkin_render=CheckinRenderService(host=self),
         )
         # 第三轮：投递编排（去重/建请求/offbox 前置/计划/选通道/执行/记账）
         self.delivery = DeliveryService(
@@ -1455,9 +1453,8 @@ class ImageTracePlugin(Star):
 
     @staticmethod
     def _write_bytes(path: str, data: bytes) -> None:
-        """写临时文件；同步 IO，调用方走 asyncio.to_thread。"""
-        with open(path, "wb") as handle:
-            handle.write(data)
+        """写临时文件；委托 services.checkin_render.CheckinRenderService.write_bytes。"""
+        CheckinRenderService.write_bytes(path, data)
 
     async def _checkin_card_path(
         self,
@@ -1468,250 +1465,59 @@ class ImageTracePlugin(Star):
         *,
         quote_max_lines: int = 3,
     ) -> str | None:
-        """下载图片 → 合成卡片 → 落临时文件，返回路径；任一步失败返回 None。
-
-        合成放进 to_thread：Pillow 解码/绘制/编码是 CPU 活，放事件循环里会
-        阻塞其它消息处理；实测 720px 卡片整段约 10ms、1440px 约 25ms。
-        """
-        try:
-            if os.path.isfile(image_url):
-                data = await asyncio.to_thread(read_bytes, image_url)
-            else:
-                data = await self._download_bytes(image_url)
-        except Exception as exc:
-            logger.warning(f"签到卡片下载图片失败，改用轻量模式: {exc}")
-            return None
-        image_bytes = await asyncio.to_thread(
-            compose_poster,
-            data,
-            quote=quote,
-            footer=footer,
-            font_path=settings["font_path"],
-            border_px=settings["border_px"],
+        """下载图片 → 合成卡片 → 落临时文件；委托 CheckinRenderService.card_path。"""
+        return await self.services.checkin_render.card_path(
+            image_url,
+            quote,
+            footer,
+            settings,
             quote_max_lines=quote_max_lines,
-            show_quote=bool(settings.get("show_quote", True)),
         )
-        if not image_bytes:
-            return None
-        path = os.path.join(self.tmp_dir, f"c_{secrets.token_hex(8)}.jpg")
-        try:
-            await asyncio.to_thread(self._write_bytes, path, image_bytes)
-        except OSError as exc:
-            logger.warning(f"签到卡片写入临时文件失败: {exc}")
-            return None
-        return path
 
     async def _checkin_card_source(
         self, send_url: str, original_url: str, settings: dict
     ) -> str:
-        """卡片合成专用图源：遵循 checkin.image_mode，与「回传的那张」解耦。
-
-        ``checkin.image_mode`` 决定合成用哪张：
-        - ``original``：直接用原图。合成端会先做 JPEG 的 DCT 缩放再降到最长边
-          1440px，所以原图不会撑爆内存，只是多花下载流量；
-        - ``thumbnail``（默认）：优先缩略图替身。卡片成品只有 ≤1440px，用原图
-          合成没有收益——2026-11-02 线上实录：一张 8736×11648 的手机长图被拿来
-          合成，既白花几十 MB 流量与上亿像素解码，又被 compose_poster 的防炸
-          上限挡回去，整张卡片降级成没有边框的轻量模式。
-
-        注意这里**不看** ``random_media.send_thumbnail``：那个开关管 /随机图、
-        /随机视频 发哪张，与签到各管各的，只是共用同一段缩略图反查链路。
-
-        settings 是**签到组**的配置（只取 image_mode）；缩略图替身回来的是公网
-        直链，必须再按 random_media 的内网配置换源，所以内部另取
-        ``_random_settings()``，不能拿签到配置去算 lan_base_url。
-        """
-        source = original_url or send_url
-        if settings.get("image_mode") == "original":
-            return source
-        if is_thumbnail_url(send_url):
-            # 上游已经给的就是缩略图直链（图床随机目录指到了 thumbnails/）
-            return send_url
-        thumb = await self._random_send_url(
-            source, self._random_settings(), thumbnail=True
+        """卡片合成专用图源；委托 CheckinRenderService.card_source。"""
+        return await self.services.checkin_render.card_source(
+            send_url,
+            original_url,
+            settings,
+            random_settings=self._random_settings(),
         )
-        if thumb and thumb != source:
-            logger.debug(f"签到卡片改用缩略图合成: {source} -> {thumb}")
-        return thumb or source
 
     # ------------------------------------------------------------------
     # 微博签到：离线映射表（签到只读本地 JSON，不请求微博、不算 pHash）
     # ------------------------------------------------------------------
 
     def _weibo_map_path(self) -> str:
-        return os.path.join(self.weibo_dir, "weibo_post_map.json")
+        """微博映射表路径；委托 services.weibo_service.WeiboService.map_path。"""
+        return self.services.weibo.map_path()
 
     def _weibo_signature_sync(self) -> tuple:
-        """映射表 + 源文件 mtime 组合；任一方变化即触发重新加载。"""
-        try:
-            map_mtime = os.path.getmtime(self._weibo_map_path())
-        except OSError:
-            map_mtime = 0.0
-        source_mtime = 0.0
-        try:
-            for name in os.listdir(self.weibo_dir):
-                if not name.lower().endswith((".csv", ".md", ".markdown")):
-                    continue
-                try:
-                    source_mtime = max(
-                        source_mtime,
-                        os.path.getmtime(os.path.join(self.weibo_dir, name)),
-                    )
-                except OSError:
-                    continue
-        except OSError:
-            pass
-        return (round(map_mtime, 3), round(source_mtime, 3))
+        """映射表 + 源文件 mtime 组合；委托 WeiboService.signature_sync。"""
+        return self.services.weibo.signature_sync()
 
-    def _load_weibo_pool_sync(self) -> tuple[list[WeiboPost], dict]:
-        """读映射表；映射缺失/过期时才解析 CSV/MD，避免签到热路径重复解析。
+    def _load_weibo_pool_sync(self) -> tuple[list, dict]:
+        """读取映射表并合并源文件；委托 WeiboService.load_pool_sync。"""
+        return self.services.weibo.load_pool_sync()
 
-        映射表优先（带图），源文件只用来补新帖子：映射过期时把源文件里有、
-        映射里没有的帖子追加进来，这些帖子的 image 为 None，签到走回退。
-        """
-        map_path = self._weibo_map_path()
-        posts, generated_at, map_meta = load_post_map(map_path)
-        stale = map_is_stale(map_path, self.weibo_dir)
-        source_posts: list[WeiboPost] = []
-        source_files: list[str] = []
-        errors: list[str] = []
-        if not posts or stale:
-            source_posts, source_files, errors = load_posts_from_dir(self.weibo_dir)
-        merged = posts
-        if not posts:
-            merged = source_posts
-        elif stale and source_posts:
-            by_key = {(post.account.casefold(), post.published_at): post for post in posts}
-            merged = [
-                by_key.get((post.account.casefold(), post.published_at), post)
-                for post in source_posts
-            ]
-            # 源文件被删掉时仍保留映射里的旧条目，避免已有配图丢失
-            source_keys = {
-                (post.account.casefold(), post.published_at) for post in source_posts
-            }
-            merged.extend(
-                post
-                for post in posts
-                if (post.account.casefold(), post.published_at) not in source_keys
-            )
-        meta = {
-            "count": len(merged),
-            "matched_count": sum(1 for post in merged if post.image is not None),
-            "map_count": len(posts),
-            "map_generated_at": generated_at,
-            "map_stale": stale,
-            "source_files": [os.path.basename(path) for path in source_files],
-            "errors": errors,
-            "map_meta": map_meta,
-        }
-        return merged, meta
-
-    async def _weibo_posts(self) -> tuple[list[WeiboPost], dict]:
-        """签到热路径：mtime 未变时直接返回内存池，不解析任何文件。"""
-        signature = await asyncio.to_thread(self._weibo_signature_sync)
-        if self._weibo_posts_cache is not None and signature == self._weibo_signature:
-            return self._weibo_posts_cache, self._weibo_meta_cache
-        posts, meta = await asyncio.to_thread(self._load_weibo_pool_sync)
-        self._weibo_posts_cache = posts
-        self._weibo_meta_cache = meta
-        self._weibo_signature = signature
-        if posts:
-            self._weibo_empty_warned = False
-        elif not self._weibo_empty_warned:
-            logger.warning(
-                "微博签到模式已开启，但 %s 下没有文案文件或映射表；/签到 将回退随机语句。",
-                self.weibo_dir,
-            )
-            self._weibo_empty_warned = True
-        if meta.get("errors"):
-            logger.warning("微博文案解析失败: %s", "；".join(meta["errors"]))
-        return posts, meta
+    async def _weibo_posts(self) -> tuple[list, dict]:
+        """签到热路径的文案池；委托 WeiboService.posts。"""
+        return await self.services.weibo.posts()
 
     async def _weibo_status_line(self) -> str:
-        settings = self._checkin_settings()
-        # 两个维度各自独立，状态行里都报出来，省得用户改完不知道生效在哪一层：
-        # render_mode=合不合成，image_mode=用缩略图还是原图。文字/昵称两个
-        # 开关同样常被改错（以为关掉文字会把签到信息也关掉），一并报出。
-        shape = (
-            f"{'合成卡片' if settings['render_mode'] == 'card' else '图文直发'}"
-            f"，取图：{'原图' if settings['image_mode'] == 'original' else '缩略图'}"
-            f"，文字：{'显示' if settings['show_quote'] else '不显示'}"
-            f"，群昵称：{'显示' if settings['show_sender'] else '不显示'}"
-        )
-        if settings["mode"] != "weibo":
-            return f"· 签到模式：quote（随机图 + 随机语句；{shape}）"
-        posts, meta = await self._weibo_posts()
-        if not posts:
-            return f"· 签到模式：weibo（未找到文案/映射，/签到 将回退随机语句；{shape}）"
-        matched = int(meta.get("matched_count") or 0)
-        suffix = "，源文件比映射新" if meta.get("map_stale") else ""
-        if not meta.get("map_count"):
-            suffix += "，映射表未生成"
-        return (
-            f"· 签到模式：weibo（文案 {len(posts)} 条，可配对 {matched} 条"
-            f"{suffix}；{shape}）"
-        )
+        """`/溯源状态` 的签到模式一行；委托 WeiboService.status_line。"""
+        return await self.services.weibo.status_line(self._checkin_settings())
 
     def _weibo_thumb_path(self, file_name: str) -> str:
-        """本地预缓存缩略图路径；文件名用 sha1，避免中文/特殊字符进路径。"""
-        key = hashlib.sha1(str(file_name or "").encode("utf-8")).hexdigest()
-        path = os.path.join(self.weibo_thumb_dir, f"{key}.jpg")
-        return path if os.path.isfile(path) else ""
+        """本地预缓存缩略图路径；委托 WeiboService.thumb_path。"""
+        return self.services.weibo.thumb_path(file_name)
 
     async def _weibo_candidate(self, random_settings: dict, *, image_mode: str = "thumbnail"):
-        """取一条微博及其图库图片；返回 (post, 发送直链, 原图直链, 文件名, 本地缩略图)。
-
-        映射表里有图就直接用；没有图时退一步取同账号同日的任意已匹配图片，
-        仍没有则返回 None，由调用方回退现有「随机图 + 随机语句」。
-
-        ``本地缩略图`` 由映射脚本的 ``--prefetch-thumbs`` 预生成；只有
-        ``image_mode=thumbnail`` 才会返回它（card 模式零网络合成），原图模式
-        必须发/用原图，不能被本地缩略图顶替。
-
-        ``image_mode`` 来自 ``checkin.image_mode``，只影响签到：thumbnail 取
-        ``thumb_url``，original 取 ``image_url``。
-        """
-        posts, _meta = await self._weibo_posts()
-        if not posts:
-            return None
-        post = random.choice(posts)
-        image = post.image
-        if image is None:
-            pool = [
-                item.image
-                for item in posts
-                if item.image is not None
-                and item.account.casefold() == post.account.casefold()
-                and item.date == post.date
-            ]
-            if pool:
-                image = random.choice(pool)
-        if image is None:
-            return None
-        use_thumb = image_mode != "original"
-        local_thumb = self._weibo_thumb_path(image.file_name) if use_thumb else ""
-        original_url = image.image_url or image.thumb_url
-        if original_url:
-            original_url = build_original_url(unquote(original_url))
-        # 原图模式下优先真原图直链，映射里缺 image_url 时才退 thumb_url
-        preferred, fallback = (
-            (image.thumb_url, original_url)
-            if use_thumb
-            else (original_url, image.thumb_url)
+        """取一条微博及其图库图片；委托 WeiboService.candidate。"""
+        return await self.services.weibo.candidate(
+            random_settings, image_mode=image_mode
         )
-        send_url = preferred or fallback
-        lan_hosts = self._lan_url_hosts(random_settings)
-        lan_base = str((random_settings or {}).get("lan_base_url") or "")
-        if lan_hosts:
-            send_url = swap_url_origin(send_url, lan_base, lan_hosts)
-            original_url = swap_url_origin(original_url, lan_base, lan_hosts)
-        base_url = str((random_settings or {}).get("base_url") or "")
-        send_url = upgrade_to_https(send_url, base_url)
-        original_url = upgrade_to_https(original_url, base_url)
-        if not send_url and not local_thumb:
-            return None
-        return post, send_url, original_url, image.file_name, local_thumb
 
     async def _checkin_flow(self, event: AstrMessageEvent):
         """`/签到` 完整流程；委托 services.checkin_service.CheckinService._checkin_flow。"""
@@ -1770,33 +1576,10 @@ class ImageTracePlugin(Star):
         保留（只花一次 16 字节嗅探）；假格式可解码 → 换成本地 JPEG path；
         不可解码 → 换成缩略图替身 URL。全部体检失败按原样保留——体检是
         增强，不能反过来挡住发送。
+
+        实现已迁到 media.format_triage，保留同名薄委托。
         """
-        settings = self._random_settings()
-        rewritten: list[dict] = []
-        for block in blocks:
-            url = str(block.get("url") or "")
-            if not url or block.get("path"):
-                rewritten.append(block)
-                continue
-            try:
-                outcome = await self._offbox_image_delivery(url, settings)
-            except Exception as exc:
-                logger.warning(f"qq_official 图片格式体检异常，按原样交付: {exc}")
-                outcome = None
-            if outcome is None:
-                rewritten.append(block)
-                continue
-            kind, value = outcome
-            new_block = dict(block)
-            if kind == "path":
-                new_block.pop("url", None)
-                new_block["path"] = value
-                # 转码产物属于本次投递：由 _yield_delivery 在发送完成后清理
-                new_block["_tmp_owned"] = True
-            else:
-                new_block["url"] = value
-            rewritten.append(new_block)
-        return rewritten
+        return await rewrite_blocks(self, blocks, self._random_settings())
 
     async def _offbox_image_delivery(
         self, url: str, settings: dict
@@ -1811,80 +1594,14 @@ class ImageTracePlugin(Star):
           缩略图替身直链（img-indexer 预生成的真 JPEG）。
         文件头能放行、或两级兜底都失败时返回 None（按原样交付——体检是增强，
         不能反过来挡住发送）。
+
+        实现已迁到 media.format_triage，保留同名薄委托。
         """
-        try:
-            client = await self._get_http()
-            limit = self._download_limit_bytes()
-            async with await client.request(
-                "GET", url, timeout=ImageSource._timeout()
-            ) as resp:
-                if not 200 <= resp.status < 300:
-                    return None
-                head = await resp.content.read(16)
-                if qq_upload_safe_image(head):
-                    return None
-                # 嗅探已消费前 16 字节：转码必须用完整字节，把 head 拼回去，
-                # 否则 PIL 拿到的是缺了文件头的残缺流，解码必败。
-                # 上限按完整响应体算：read_limited_bytes 会拿 Content-Length 与
-                # limit 比较，若传 limit-len(head) 会把恰好等于上限的文件误拒。
-                rest = await read_limited_bytes(resp, limit)
-                data = head + rest
-                if len(data) > limit:
-                    logger.warning(f"qq_official 图片超过体检上限，按原样交付: {len(data)} 字节")
-                    return None
-        except Exception as exc:
-            logger.warning(f"qq_official 图片格式体检失败，按原样交付: {exc}")
-            return None
-        path = await asyncio.to_thread(self._write_transcoded_jpeg, data)
-        if path:
-            return ("path", path)
-        file_id = self._bed_file_id(url)
-        if file_id and self.vector.qdrant_ready:
-            try:
-                thumb = await self.vector.thumb_url_for(file_id)
-            except Exception:
-                thumb = None
-            if thumb:
-                lan_hosts = self._lan_url_hosts(settings)
-                if lan_hosts:
-                    # 图片由适配器本机下载，替身直链同样收进内网源
-                    thumb = swap_url_origin(
-                        thumb, str(settings.get("lan_base_url") or ""), lan_hosts
-                    )
-                logger.info(f"qq_official 假格式且不可转码，改发缩略图替身: {file_id}")
-                return ("url", thumb)
-        return None
+        return await inspect_image_delivery(self, url, settings)
 
     def _write_transcoded_jpeg(self, data: bytes) -> str | None:
-        """把任意可解码图片字节转存为 JPEG 临时文件，返回路径；失败返回 None。"""
-        try:
-            import pillow_heif
-
-            pillow_heif.register_heif_opener()  # 幂等：让 Image.open 直解 HEIC
-        except ImportError:
-            pass
-        try:
-            from PIL import Image, ImageOps
-        except ImportError:
-            logger.warning("PIL 不可用，无法转码非标准格式图片，按原样交付")
-            return None
-        try:
-            with Image.open(io.BytesIO(data)) as image:
-                if image.width * image.height > QQ_TRANSCODE_MAX_PIXELS:
-                    logger.warning(
-                        f"qq_official 待转码图片像素过大，跳过转码: {image.size}"
-                    )
-                    return None
-                fixed = ImageOps.exif_transpose(image)
-                if fixed.mode not in ("RGB", "L"):
-                    fixed = fixed.convert("RGB")
-                path = os.path.join(self.tmp_dir, f"qqsafe_{secrets.token_hex(8)}.jpg")
-                fixed.save(path, format="JPEG", quality=92)
-            logger.info(f"qq_official 图片格式体检：已转码为 JPEG 交付 {path}")
-            return path
-        except Exception as exc:
-            logger.warning(f"图片转码失败，按原样交付: {exc}")
-            return None
+        """把任意可解码图片字节转存为 JPEG 文件；委托 format_triage.write_transcoded_jpeg。"""
+        return write_transcoded_jpeg(self, data)
 
     # ------------------------------------------------------------------
     # QQ 官方机器人上传通道（url / chunked，与缩略图发送无关）
@@ -1899,37 +1616,12 @@ class ImageTracePlugin(Star):
         让调用方交回原回传逻辑——猜错会话类型会把图发到错误的聊天里，比不发
         严重得多，所以这里宁可放弃接管。
         """
-        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
-        group_openid = str(getattr(raw, "group_openid", "") or "").strip()
-        if group_openid:
-            return ("group", group_openid)
-        author = getattr(raw, "author", None)
-        user_openid = str(getattr(author, "user_openid", "") or "").strip()
-        if not user_openid:
-            user_openid = str(getattr(raw, "user_openid", "") or "").strip()
-        if user_openid:
-            return ("c2c", user_openid)
-        try:
-            session_id = str(event.get_session_id() or "").strip()
-        except Exception:
-            session_id = ""
-        if not session_id:
-            return None
-        try:
-            message_type = str(event.get_message_type() or "").upper()
-        except Exception:
-            message_type = ""
-        if "GROUP" in message_type:
-            return ("group", session_id)
-        if any(hint in message_type for hint in ("FRIEND", "C2C", "PRIVATE")):
-            return ("c2c", session_id)
-        return None
+        return qq_send_target(event)
 
     @staticmethod
     def _qq_target_kwargs(target: tuple[str, str]) -> dict:
         """把 (类型, openid) 转成适配器上传方法的收件人关键字参数。"""
-        kind, session_id = target
-        return {"group_openid": session_id} if kind == "group" else {"openid": session_id}
+        return qq_target_kwargs(target)
 
     def _public_media_url(self, url: str, settings: dict) -> str | None:
         """把图床直链换成「外部服务器下载得到」的公网地址；换不出来返回 None。
@@ -1946,52 +1638,20 @@ class ImageTracePlugin(Star):
         2. 换完仍落在内网主机上（说明 base_url 本身就配成了内网）→ 不可用；
         3. 与 base_url 同主机 → 视为公网直链（配置已声明它是公网站点）；
         4. 其余第三方主机 → 退化为句法判断（公网域名/公网 IP 放行）。
+
+        实现已迁到 delivery.qq_upload，保留同名薄委托。
         """
-        if not url:
-            return None
-        base = str(settings.get("base_url") or "").strip()
-        lan_hosts = self._lan_url_hosts(settings)
-        candidate = swap_url_origin(url, base, lan_hosts) if lan_hosts else url
-        try:
-            host = (urlsplit(candidate).hostname or "").lower()
-        except ValueError:
-            return None
-        # 只与「内网地址的主机」比，不能与整个 _lan_url_hosts 比——后者里头还
-        # 包含公网 base 的主机（换源后正是要落到它上面）
-        lan_host = ""
-        lan_base = str(settings.get("lan_base_url") or "").strip()
-        if lan_base:
-            try:
-                lan_host = (urlsplit(lan_base).hostname or "").lower()
-            except ValueError:
-                lan_host = ""
-        if lan_host and host == lan_host:
-            # 换源后仍是内网主机：腾讯服务器访问不到，别发出一次必败的上传
-            return None
-        base_host = ""
-        if base:
-            try:
-                base_host = (urlsplit(base).hostname or "").lower()
-            except ValueError:
-                base_host = ""
-        if base_host and host == base_host:
-            return candidate
-        return candidate if is_public_http_url(candidate) else None
+        return public_media_url(self, url, settings)
 
     async def _qq_block_size(self, block: dict) -> int | None:
         """该图体积：优先用命中条目自带的大小，未知时 HEAD 探一次。
 
         探不出来返回 None（=未知），调用方据此避开「未知却当成小图直传」这个
         5MB 陷阱；探测只读响应头，不产生下载流量。
+
+        实现已迁到 delivery.qq_upload，保留同名薄委托。
         """
-        known = self._known_bytes(block)
-        if known:
-            return known
-        url = str(block.get("url") or "")
-        if not url:
-            return None
-        exists, length = await self._probe_url(url)
-        return length if exists is not False else None
+        return await block_size(self, block)
 
     async def _qq_upload_takeover(
         self,
@@ -2016,100 +1676,18 @@ class ImageTracePlugin(Star):
         - fallback（默认）：一张都还没发出去时返回 False，交回原有的本地压缩 /
           缩略图降级链；只要已经发过就绝不再交回，避免同一张图发两遍。
         - notify：不交回，改回一条文字说明失败原因。
+
+        实现已迁到 delivery.qq_upload，保留同名薄委托。
         """
-        mode, direct_max, url_max, auto_prefer, max_upload, on_failure = (
-            qq_upload_config(self.config)
+        return await upload_takeover(
+            self,
+            event,
+            header,
+            blocks,
+            qq_config=qq_upload_config(self.config),
+            random_settings=self._random_settings(),
+            mark_compressed=mark_compressed,
         )
-        if mode == "native":
-            # 通道关闭：交给 image_delivery 的原生回传逻辑（含压缩）
-            return False
-        target = self._qq_send_target(event)
-        bot = getattr(event, "bot", None)
-        if target is None or getattr(bot, "api", None) is None:
-            logger.debug("qq_official 上传通道：会话标识或 bot 未就绪，交回原回传逻辑")
-            return False
-        images = [block for block in blocks if block.get("url") or block.get("path")]
-        if not images:
-            return False
-
-        settings = self._random_settings()
-        plan: list[tuple[dict, str, str | None]] = []
-        degraded = 0
-        for block in images:
-            # 固定通道（native/bytes/url/url-scaled）不依赖体积，省掉一次 HEAD 探测
-            size = None if mode != "auto" else await self._qq_block_size(block)
-            url = str(block.get("url") or "")
-            public_url = self._public_media_url(url, settings) if url else None
-            url_usable = public_url is not None
-            if mode == "auto" and url_usable and self._qq_url_cooling():
-                # 刚撞过「腾讯拉不到公网直链」：冷却期内 auto 直接分片，别再白等
-                url_usable = False
-            channel = choose_qq_upload_channel(
-                mode=mode,
-                size_bytes=size,
-                direct_max_bytes=direct_max,
-                url_max_bytes=url_max,
-                url_usable=url_usable,
-                auto_prefer=auto_prefer,
-            )
-            if channel == "native":
-                # 混批里只要有一张判定该直传，就整批交回原逻辑：拆成两次投递会
-                # 绕开「一次事件只投递一批图」的去重盾，用户可能收到重复图片
-                logger.debug("qq_official 上传通道：该批含直传图，交回原回传逻辑")
-                return False
-            if channel in {"url", "url-scaled"} and public_url is None:
-                # 钉死直链通道，但这张图没有可交给腾讯的公网直链：只剩本地
-                # 转码 path（格式体检把假格式换成 JPEG 时会丢掉 url），或图床
-                # 只有内网源（base_url 未配/本身是内网）。URL 上传没有入参，
-                # 发出去必然失败——降级到分片，图源本机就有，不依赖图床公网可达
-                degraded += 1
-                channel = "bytes"
-            plan.append((block, channel, public_url))
-
-        if degraded:
-            logger.info(
-                f"qq_official 直链通道没有可用的公网直链（本地转码图或内网图床），"
-                f"本批 {degraded} 张改走分片上传"
-            )
-
-        if mark_compressed:
-            # 本通道发的是原图（URL 原样 / 分片原始字节），配文按「原图」口径写，
-            # 不能沿用压缩证据——文字说已压缩而用户收到原图是这个仓库的老毛病
-            self._mark_compressed_captions(
-                blocks, [CompressionEvidence.ORIGINAL] * len(images)
-            )
-
-        prefix = [header] if header else []
-        sent_any = False
-        for index, (block, channel, public_url) in enumerate(plan):
-            own_text = str(block.get("text") or "").strip()
-            parts = (*prefix, own_text) if index == 0 else (own_text,)
-            content = "\n".join(part for part in parts if part)
-            try:
-                media = await self._qq_upload_block(
-                    event, block, channel, public_url, target, max_upload
-                )
-                await self._qq_post_media(event, target, content, media)
-            except Exception as exc:
-                detail = f"{type(exc).__name__}: {exc}"
-                logger.warning(
-                    f"qq_official {channel} 通道上传/发送失败"
-                    f"（第 {index + 1}/{len(plan)} 张）: {detail}"
-                )
-                if channel in {"url", "url-scaled"}:
-                    # 公网直链拿得到、腾讯却拉不到：记冷却，auto 后续直接走 bytes
-                    self._note_qq_url_unsupported(exc)
-                if not sent_any and on_failure == "fallback":
-                    logger.warning(
-                        "qq_official 上传通道不可用，交回原回传逻辑（本地压缩/缩略图）"
-                    )
-                    return False
-                await self._qq_notify(
-                    event, target, f"⚠️ 图片发送失败：{sanitize_error_text(detail)}"
-                )
-                return True
-            sent_any = True
-        return True
 
     async def _qq_upload_block(
         self,
@@ -2125,35 +1703,19 @@ class ImageTracePlugin(Star):
         url / url-scaled 共用同一条 URL 上传实现，区别只在交给腾讯的是原图
         直链还是图床缩放直链；bytes 即分片上传（官方术语 chunked upload），
         需要先把图落到本地。
+
+        实现已迁到 delivery.qq_upload，保留同名薄委托。
         """
-        if channel in {"url", "url-scaled"}:
-            if not public_url:
-                raise RuntimeError("没有公网直链，QQ 无法按 URL 拉取该图")
-            upload_url = public_url
-            if channel == "url-scaled":
-                _mode, max_side, quality, style = self._delivery_config()
-                upload_url = (
-                    build_scaled_url(public_url, max_side, quality=quality, style=style)
-                    or public_url
-                )
-            return await self._qq_upload_via_url(event, upload_url, target)
-        path = str(block.get("path") or "")
-        temp = ""
-        try:
-            if not path:
-                temp = await self.image_source.download(
-                    str(block.get("url") or ""), size_limit=max_upload
-                )
-                path = temp
-            name = (
-                str(block.get("file_name") or "").strip()
-                or os.path.basename(path)
-                or "image.jpg"
-            )
-            return await self._qq_upload_via_chunked(event, path, name, target)
-        finally:
-            # 分片通道只为这一次上传落盘，发完即删；临时目录另有 TTL 清理兜底
-            self._remove_quiet(temp)
+        return await upload_block(
+            self,
+            event,
+            block,
+            channel,
+            public_url,
+            target,
+            max_upload,
+            delivery_config=self._delivery_config(),
+        )
 
     async def _qq_upload_via_url(
         self, event: AstrMessageEvent, url: str, target: tuple[str, str]
@@ -2163,23 +1725,10 @@ class ImageTracePlugin(Star):
         借适配器自身的通用媒体上传方法（它对「非本地路径」正是走 url 分支），
         避免在插件里复刻 QQ 接口字段与错误码；AstrBot 发主动消息时也是用同样的
         伪事件（只带 bot 属性）调用它。
+
+        实现已迁到 delivery.qq_upload，保留同名薄委托。
         """
-        try:
-            from astrbot.core.platform.sources.qqofficial.qqofficial_message_event import (
-                QQOfficialMessageEvent,
-            )
-        except ImportError as exc:  # 版本差异：模块或方法被改名
-            raise RuntimeError(
-                f"当前 AstrBot 版本缺少 qqofficial 媒体上传方法: {exc}"
-            ) from exc
-        helper = SimpleNamespace(bot=getattr(event, "bot", None))
-        return await QQOfficialMessageEvent.upload_group_and_c2c_media(
-            helper,
-            url,
-            QQ_IMAGE_FILE_TYPE,
-            srv_send_msg=False,
-            **self._qq_target_kwargs(target),
-        )
+        return await upload_via_url(self, event, url, target)
 
     async def _qq_upload_via_chunked(
         self, event: AstrMessageEvent, path: str, name: str, target: tuple[str, str]
@@ -2188,32 +1737,10 @@ class ImageTracePlugin(Star):
 
         直接实例化适配器的分片器，而不是走 upload_group_and_c2c_media：后者只在
         「本地文件 > 10MB」时才分片，5~10MB 仍会落回 base64 分支（照样撞 5MB）。
+
+        实现已迁到 delivery.qq_upload，保留同名薄委托。
         """
-        try:
-            from astrbot.core.platform.sources.qqofficial.qqofficial_chunked_upload import (
-                QQOfficialChunkedUploader,
-            )
-        except ImportError as exc:
-            raise RuntimeError(
-                f"当前 AstrBot 版本缺少 qqofficial 分片上传器: {exc}"
-            ) from exc
-        uploader = QQOfficialChunkedUploader(event.bot.api._http)
-        kind, session_id = target
-        if kind == "group":
-            return await uploader.upload_group(
-                file_path=Path(path),
-                file_type=QQ_IMAGE_FILE_TYPE,
-                file_name=name,
-                group_openid=session_id,
-                srv_send_msg=False,
-            )
-        return await uploader.upload_c2c(
-            file_path=Path(path),
-            file_type=QQ_IMAGE_FILE_TYPE,
-            file_name=name,
-            user_openid=session_id,
-            srv_send_msg=False,
-        )
+        return await upload_via_chunked(self, event, path, name, target)
 
     async def _qq_post_media(
         self, event: AstrMessageEvent, target: tuple[str, str], content: str, media
@@ -2231,25 +1758,11 @@ class ImageTracePlugin(Star):
     async def _qq_notify(
         self, event: AstrMessageEvent, target: tuple[str, str], text: str
     ) -> None:
-        """失败说明用纯文本回一条；这条发不出去也不影响主流程。"""
-        try:
-            api = event.bot.api
-            message_id = str(
-                getattr(getattr(event, "message_obj", None), "message_id", "") or ""
-            ).strip()
-            payload = {
-                "msg_type": 0,
-                "content": text,
-                "msg_id": message_id or None,
-                "msg_seq": random.randint(1, 10000),
-            }
-            kind, session_id = target
-            if kind == "group":
-                await api.post_group_message(group_openid=session_id, **payload)
-            else:
-                await api.post_c2c_message(openid=session_id, **payload)
-        except Exception as exc:
-            logger.debug(f"qq_official 失败说明发送失败（忽略）: {exc}")
+        """失败说明用纯文本回一条；这条发不出去也不影响主流程。
+
+        实现已迁到 delivery.qq_upload，保留同名薄委托。
+        """
+        await notify(self, event, target, text)
 
     async def _random_send_url(
         self, media_url: str, settings: dict, *, thumbnail: bool | None = None

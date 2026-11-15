@@ -310,7 +310,7 @@ async def test_checkin_flow_uses_builtin_quote_when_library_raises(
     make_plugin, make_event, monkeypatch
 ):
     """语句库构造/取句失败时签到仍要发出卡片文案，而不是抛回事件管线。"""
-    import astrbot_plugin_image_trace.main as main_module
+    import random as random_module
 
     plugin = make_plugin(checkin={"render_mode": "simple"})
     event = make_event("/签到", platform="telegram", sender_id="u1")
@@ -328,7 +328,7 @@ async def test_checkin_flow_uses_builtin_quote_when_library_raises(
         raise RuntimeError("boom")
 
     monkeypatch.setattr(plugin, "_quote_library", broken_library)
-    monkeypatch.setattr(main_module.random, "choice", lambda _seq: "FALLBACK")
+    monkeypatch.setattr(random_module, "choice", lambda _seq: "FALLBACK")
 
     jpeg = io.BytesIO()
     PILImage.effect_noise((64, 64), 32).convert("RGB").save(jpeg, "JPEG")
@@ -432,7 +432,7 @@ async def test_checkin_weibo_mode_falls_back_when_no_image(
     make_plugin, make_event, data_dir, monkeypatch
 ):
     """映射里的微博没有图时回退随机图 + 随机语句，签到不失败。"""
-    import astrbot_plugin_image_trace.main as main_module
+    import random as random_module
 
     plugin = make_plugin(checkin={"mode": "weibo", "render_mode": "simple"})
     _write_weibo_map(plugin.weibo_dir, with_image=False)
@@ -451,7 +451,7 @@ async def test_checkin_weibo_mode_falls_back_when_no_image(
         raise RuntimeError("boom")
 
     monkeypatch.setattr(plugin, "_quote_library", broken_library)
-    monkeypatch.setattr(main_module.random, "choice", lambda _seq: "FALLBACK")
+    monkeypatch.setattr(random_module, "choice", lambda _seq: "FALLBACK")
 
     jpeg = io.BytesIO()
     PILImage.effect_noise((64, 64), 32).convert("RGB").save(jpeg, "JPEG")
@@ -534,7 +534,7 @@ async def test_checkin_flow_hides_quote_and_shows_sender(
 
 async def test_checkin_flow_hides_sender_name(make_plugin, make_event, monkeypatch):
     """show_sender=False：文字里只剩天数，不带昵称。"""
-    import astrbot_plugin_image_trace.main as main_module
+    import random as random_module
 
     plugin = make_plugin(checkin={"render_mode": "simple", "show_sender": False})
     event = make_event("/签到", platform="telegram", sender_id="u1")
@@ -552,7 +552,7 @@ async def test_checkin_flow_hides_sender_name(make_plugin, make_event, monkeypat
         raise RuntimeError("boom")
 
     monkeypatch.setattr(plugin, "_quote_library", broken_library)
-    monkeypatch.setattr(main_module.random, "choice", lambda _seq: "FALLBACK")
+    monkeypatch.setattr(random_module, "choice", lambda _seq: "FALLBACK")
 
     jpeg = io.BytesIO()
     PILImage.effect_noise((64, 64), 32).convert("RGB").save(jpeg, "JPEG")

@@ -32,6 +32,9 @@ class DeliveryConfig:
     napcat_scaled_url_style: Literal["query", "cf-path"] = "query"
     napcat_target_kb: int = 0
     napcat_webp: bool = False
+    # OneBot image 段的 timeout 字段（秒）：URL 段由协议端（NapCat 等）自行
+    # 下载，该值即协议端下载网络图片的超时。NapCat 另有 sendMsg 内部回调窗口，
+    # 大图/多图时显式放宽可减少回调超时；base64 段不经下载，带该字段无副作用。
     napcat_timeout: int = 60
     qq_mode: str = "auto"
     qq_native_max_mb: int = 3
@@ -135,18 +138,6 @@ class LimitsConfig:
     remote_hash_enabled: bool = True
     remote_hash_ttl: int = 21600
     remote_hash_max_points: int = 0
-
-
-@dataclass(frozen=True)
-class PluginConfig:
-    basic: BasicConfig = field(default_factory=BasicConfig)
-    delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
-    image_bed: ImageBedConfig = field(default_factory=ImageBedConfig)
-    storage_bucket: StorageBucketConfig = field(default_factory=StorageBucketConfig)
-    random_media: RandomMediaConfig = field(default_factory=RandomMediaConfig)
-    checkin: CheckinConfig = field(default_factory=CheckinConfig)
-    vector_search: VectorConfig = field(default_factory=VectorConfig)
-    limits: LimitsConfig = field(default_factory=LimitsConfig)
 
 
 # 共享的默认单例：调用点用它兜底，任何默认值只在这里定义一次。

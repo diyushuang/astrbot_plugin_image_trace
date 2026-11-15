@@ -128,7 +128,6 @@ class DeliveryService:
         request = DeliveryRequest(
             header=header,
             blocks=blocks,
-            mode_override=mode_override,
             allow_local_fallback=allow_local_fallback,
             mark_compressed=mark_compressed,
         )

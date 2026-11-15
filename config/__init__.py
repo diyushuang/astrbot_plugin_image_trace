@@ -9,7 +9,6 @@ from .loader import (
     encode_options,
     engine_choice,
     ensure_group_cfg,
-    load_plugin_config,
     napcat_delivery_cfg,
     onebot_image_timeout,
     qq_delivery_cfg,
@@ -20,10 +19,8 @@ from .loader import (
     verify_scaled,
 )
 from .migrations import migrate_bucket_config, migrate_config_layout
-from .typed import PluginConfig
 
 __all__ = [
-    "PluginConfig",
     "bucket_config",
     "checkin_settings",
     "delivery_config",
@@ -32,7 +29,6 @@ __all__ = [
     "encode_options",
     "engine_choice",
     "ensure_group_cfg",
-    "load_plugin_config",
     "migrate_bucket_config",
     "migrate_config_layout",
     "napcat_delivery_cfg",

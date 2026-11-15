@@ -63,6 +63,8 @@ flowchart TD
 | `original_service.py` | 文件名反查、缩略图反查、图床直链探测 |
 | `random_service.py` | 随机接口取图、缩略图替身、发送 |
 | `checkin_service.py` | 签到记账、取图、文案/卡片、失败回退 |
+| `checkin_render.py` | 签到卡片合成：图源选择、下载、`compose_poster` 与临时文件 |
+| `weibo_service.py` | 微博文案池：映射表/源文件加载、缓存、状态行与签到候选 |
 | `checkin_identity.py` | 签到者群昵称解析（OneBot 群成员接口优先，回退事件昵称）与 `/溯源昵称` 诊断共用 |
 
 ### 检索层 `search/`
@@ -101,6 +103,7 @@ flowchart TD
 | `planner.py` | 纯函数 `plan_delivery`：把请求 + 平台画像 + 配置折算成候选步骤 |
 | `service.py` | `DeliveryService.deliver`：事件去重 → offbox 前置 → 计划 → 选通道 → 执行 → 记账 |
 | `channels.py` | `OneBotChannel`（URL / 压缩字节）、`QQOfficialChannel`（体检 + 上传接管）、`ChainChannel`（标准消息链） |
+| `qq_upload.py` | QQ 官方上传通道：会话目标解析、公网直链换源、URL/分片上传与接管编排 |
 | `primitives.py` | 字节级 / 消息段级原语：OneBot 直发、本地压缩、URL 计划、配文与 @ 前缀 |
 
 投递层集中保证五条不变量：同一事件只投递一次；`UNKNOWN` / 超时按已送达、绝不重发；只有明确 `failed` 才换通道；「已压缩」配文只按实测证据写入；QQ 官方接管已发图后不再交回。
@@ -108,6 +111,8 @@ flowchart TD
 ### 图片获取层 `media/`
 
 `image_source.py`：图片段 → 本地路径 / 字节，URL 存在性探测，坏图分诊。不引用 AstrBot 事件类型，出网经注入的 `GuardedHttpClient`。
+
+`format_triage.py`：第三方转存平台的图片格式体检（文件头嗅探、假格式转码、缩略图替身回退），配置由调用方注入。
 
 ### 配置层 `config/`
 

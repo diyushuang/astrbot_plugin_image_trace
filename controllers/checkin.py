@@ -21,7 +21,7 @@ class CheckinController:
 
     async def checkin(self, event):
         """每日签到，领取一张带边框与随机语句的随机缩略图"""
-        async for result in self.plugin.services.checkin._checkin_flow(event):
+        async for result in self.plugin._checkin_flow(event):
             yield result
 
     async def checkin_import(self, event):
@@ -116,11 +116,18 @@ class CheckinController:
         if dates and dates[-1] != dates[0]:
             date_text += f" ~ {dates[-1][:4]}-{dates[-1][4:6]}-{dates[-1][6:]}"
         map_path = plugin._weibo_map_path()
-        map_note = "映射表未生成：签到时会按同账号同日图片回退，建议运行 scripts/build_weibo_map.py。"
+        map_note = (
+            "映射表未生成：签到时会按同账号同日图片回退；"
+            "请按 README 的映射表格式离线生成 weibo_post_map.json"
+            "（weibo_posts.save_post_map）。"
+        )
         if os.path.isfile(map_path):
             map_posts, _generated, map_meta = await asyncio.to_thread(load_post_map, map_path)
             if map_is_stale(map_path, plugin.weibo_dir):
-                map_note = "源文件已更新，映射表比源文件旧；请重新运行 scripts/build_weibo_map.py。"
+                map_note = (
+                    "源文件已更新，映射表比源文件旧；"
+                    "请重新离线生成 weibo_post_map.json。"
+                )
             else:
                 map_note = (
                     f"映射表：{len(map_posts)} 条，可配对 "

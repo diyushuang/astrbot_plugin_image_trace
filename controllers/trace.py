@@ -35,13 +35,13 @@ class TraceController:
                     return
                 for seg in images[:budget]:
                     plugin._reset_event_sent(event)
-                    async for item in plugin.services.trace._trace_vector(event, seg):
+                    async for item in plugin._trace_vector(event, seg):
                         yield item
                 return
             if engine == "auto" and plugin.vector.enabled:
                 for seg in images[:budget]:
                     plugin._reset_event_sent(event)
-                    async for item in plugin.services.trace._trace_auto(event, seg):
+                    async for item in plugin._trace_auto(event, seg):
                         yield item
                 return
             # hash（或 auto 但向量引擎未配置）
@@ -58,7 +58,7 @@ class TraceController:
                 return
             for seg in images[:budget]:
                 plugin._reset_event_sent(event)
-                async for item in plugin.services.trace._trace_hash(event, seg):
+                async for item in plugin._trace_hash(event, seg):
                     yield item
         finally:
             plugin._defer_event_stop(event, False)

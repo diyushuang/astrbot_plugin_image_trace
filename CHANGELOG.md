@@ -1,5 +1,13 @@
 # 更新日志
 
+## 未发布（2026-11-15，重构审查修复）
+
+- **修复**：`/签到文案导入` 不再提示运行仓库中不存在的 `scripts/build_weibo_map.py`，改为按 README 的映射表格式离线生成 `weibo_post_map.json`。
+- **兼容**：命令控制器恢复调用 `main` 的同名薄委托，`monkeypatch(plugin._trace_*)` / `_checkin_flow` / `_random_media_delivery` 等既有测试与扩展点重新生效。
+- **清理**：删除未使用的 `load_plugin_config()` / `PluginConfig`、`DeliveryContext.deliver` 存根、`DeliveryRequest.mode_override` 字段，以及 `common.ONEBOT_IMAGE_TIMEOUT` 重复默认值；OneBot 超时默认值统一为 `DEFAULT_DELIVERY.napcat_timeout`。
+- **重构**：QQ 官方上传、微博文案池、签到卡片渲染、图片格式体检分别下沉到 `delivery/qq_upload.py`、`services/weibo_service.py`、`services/checkin_render.py`、`media/format_triage.py`；`main.py` 由约 2400 行降至 1669 行，薄委托签名不变。
+- **验证**：`ruff check` 全绿，全量 **573 passed / 2 skipped**（未安装 pillow-heif）。
+
 ## 1.8.0（2026-11-15，架构重构，用户可见行为不变）
 
 - **架构重构，用户可见行为不变**：插件按 `config/`、`controllers/`、`services/`、`delivery/`、`media/`、`search/`、`storage/` 分层重组，`main.py` 只保留入口与薄委托。指令名、参数、配置键、默认值、数据目录与文件格式、回传链路语义全部与 1.7.25 一致，升级无需迁移。

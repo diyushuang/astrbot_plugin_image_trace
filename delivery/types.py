@@ -16,7 +16,6 @@ class DeliveryRequest:
 
     header: str
     blocks: list[dict]
-    mode_override: str | None = None
     allow_local_fallback: bool = True
     mark_compressed: bool = False
 
@@ -76,5 +75,3 @@ class DeliveryContext:
     plan: Any
     image_blocks: list[dict] = field(default_factory=list)
     url_plan: Any = None
-
-    async def deliver(self, context: DeliveryContext) -> DeliveryResult: ...

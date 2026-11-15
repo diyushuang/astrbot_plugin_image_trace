@@ -234,7 +234,7 @@ async def test_onebot_image_segments_carry_download_timeout(
     回调窗口，超时后结果是「未知」因而不敢重发（用户可能收不到图）。显式放宽
     下载超时窗口可降低这种概率；base64 段不经下载，带该字段无副作用。
     """
-    from astrbot_plugin_image_trace.common import ONEBOT_IMAGE_TIMEOUT
+    from astrbot_plugin_image_trace.config.typed import DEFAULT_DELIVERY
 
     plugin = vector_stub(
         make_plugin(search_engine="vector", image_delivery={"mode": "scaled-url"})
@@ -255,7 +255,7 @@ async def test_onebot_image_segments_carry_download_timeout(
     images = [seg for seg in message if seg["type"] == "image"]
     assert images
     assert all(
-        seg["data"]["timeout"] == ONEBOT_IMAGE_TIMEOUT for seg in images
+        seg["data"]["timeout"] == DEFAULT_DELIVERY.napcat_timeout for seg in images
     ), "每个图片段都应带下载超时"
 
 
@@ -268,14 +268,14 @@ async def test_onebot_image_timeout_honours_config_override(
     绝不能原样写进消息段——那等于告诉协议端「立刻放弃下载」，图片必然拉不到。
     非法值一律收敛到安全区间 [10, 300]，非数字则落回默认值。
     """
-    from astrbot_plugin_image_trace.common import ONEBOT_IMAGE_TIMEOUT
+    from astrbot_plugin_image_trace.config.typed import DEFAULT_DELIVERY
 
     for configured, expected in (
         (120, 120),  # 正常配置：原样生效
         (0, 10),  # 0 非法 → 收敛到下限 10（而非原样写 0）
         (-5, 10),  # 负数非法 → 收敛到下限 10
         (9999, 300),  # 越上界 → 收敛到 300
-        ("abc", ONEBOT_IMAGE_TIMEOUT),  # 非数字 → 默认值
+        ("abc", DEFAULT_DELIVERY.napcat_timeout),  # 非数字 → 默认值
     ):
         plugin = vector_stub(
             make_plugin(

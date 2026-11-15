@@ -23,25 +23,11 @@ from .migrations import (
 )
 from .typed import (
     DEFAULT_BASIC,
-    DEFAULT_BED,
-    DEFAULT_BUCKET,
     DEFAULT_CHECKIN,
     DEFAULT_DELIVERY,
-    DEFAULT_LIMITS,
     DEFAULT_RANDOM,
     DEFAULT_VECTOR,
-    BasicConfig,
-    CheckinConfig,
-    DeliveryConfig,
-    ImageBedConfig,
-    LimitsConfig,
-    PluginConfig,
-    RandomMediaConfig,
-    StorageBucketConfig,
-    VectorConfig,
 )
-
-_MB = 1024 * 1024
 
 
 def logger_warning(message: str) -> None:
@@ -278,166 +264,6 @@ def checkin_settings(config: Any) -> dict:
     }
 
 
-def _pick(raw: dict, key: str, default: Any) -> Any:
-    value = raw.get(key)
-    return default if is_blank(value) else value
-
-
-def load_plugin_config(config: Any) -> PluginConfig:
-    """把面板配置一次性收成类型化快照（不修改原始 dict）。"""
-    raw = config if isinstance(config, dict) else {}
-    b, lim, v = DEFAULT_BASIC, DEFAULT_LIMITS, DEFAULT_VECTOR
-
-    basic = BasicConfig(
-        search_engine=engine_choice(raw),
-        scan_dirs=tuple(scan_dirs(raw)),
-        hash_similarity_threshold=max(
-            0.0,
-            min(1.0, as_float(scalar_cfg(raw, "similarity_threshold"), b.hash_similarity_threshold)),
-        ),
-        ai_verify=bool_or(scalar_cfg(raw, "ai_verify"), b.ai_verify),
-        register_admin_only=bool_or(scalar_cfg(raw, "register_admin_only"), b.register_admin_only),
-        max_images_per_query=max(
-            1,
-            min(10, as_int(scalar_cfg(raw, "max_images_per_query"), b.max_images_per_query)),
-        ),
-        hash_size=as_int(scalar_cfg(raw, "hash_size"), b.hash_size),
-        top_n=max(0, min(50, as_int(scalar_cfg(raw, "top_n"), b.top_n))),
-    )
-
-    napcat = napcat_delivery_cfg(raw)
-    qq = qq_delivery_cfg(raw)
-    mode, max_side, quality, style = delivery_settings(napcat)
-    qq_mode, direct_max, url_max, prefer, max_upload, failure = qq_upload_settings(qq)
-    d = DEFAULT_DELIVERY
-    delivery = DeliveryConfig(
-        napcat_mode=mode,
-        napcat_max_side=max_side,
-        napcat_quality=quality,
-        napcat_verify_scaled=verify_scaled(raw),
-        napcat_scaled_url_style=style,
-        napcat_target_kb=bounded_int(napcat.get("target_kb"), d.napcat_target_kb, 0, 10240),
-        napcat_webp=truthy(napcat.get("webp")),
-        napcat_timeout=bounded_int(
-            napcat.get("onebot_image_timeout"), d.napcat_timeout, 10, 300
-        ),
-        qq_mode=qq_mode,
-        qq_native_max_mb=direct_max // _MB,
-        qq_auto_prefer=prefer,
-        qq_url_max_mb=url_max // _MB,
-        qq_max_upload_mb=max_upload // _MB,
-        qq_on_failure=failure,
-    )
-
-    bed_raw = dict_group(raw, "image_bed")
-    bed = DEFAULT_BED
-    image_bed = ImageBedConfig(
-        mode=str(_pick(bed_raw, "mode", bed.mode)),
-        api_url=str(_pick(bed_raw, "api_url", bed.api_url)),
-        token=str(_pick(bed_raw, "token", bed.token)),
-        auth_header=str(_pick(bed_raw, "auth_header", bed.auth_header)),
-        auth_prefix=str(_pick(bed_raw, "auth_prefix", bed.auth_prefix)),
-        file_field=str(_pick(bed_raw, "file_field", bed.file_field)),
-        extra_fields=_pick(bed_raw, "extra_fields", {}),
-        url_path=str(_pick(bed_raw, "url_path", bed.url_path)),
-        timeout=as_int(_pick(bed_raw, "timeout", bed.timeout), bed.timeout),
-        cfi_base_url=str(_pick(bed_raw, "cfi_base_url", bed.cfi_base_url)),
-        cfi_token=str(_pick(bed_raw, "cfi_token", bed.cfi_token)),
-        cfi_auth_code=str(_pick(bed_raw, "cfi_auth_code", bed.cfi_auth_code)),
-        cfi_upload_channel=str(_pick(bed_raw, "cfi_upload_channel", bed.cfi_upload_channel)),
-        cfi_channel_name=str(_pick(bed_raw, "cfi_channel_name", bed.cfi_channel_name)),
-        cfi_upload_folder=str(_pick(bed_raw, "cfi_upload_folder", bed.cfi_upload_folder)),
-    )
-
-    bucket_raw = dict_group(raw, "storage_bucket")
-    bucket = DEFAULT_BUCKET
-    bucket_mode = str(_pick(bucket_raw, "mode", bucket.mode)).strip()
-    if bucket_mode not in ("none", *BUCKET_MODES):
-        bucket_mode = bucket.mode
-    storage_bucket = StorageBucketConfig(
-        mode=bucket_mode,
-        r2_account_id=str(_pick(bucket_raw, "r2_account_id", bucket.r2_account_id)),
-        r2_access_key_id=str(_pick(bucket_raw, "r2_access_key_id", bucket.r2_access_key_id)),
-        r2_secret_access_key=str(
-            _pick(bucket_raw, "r2_secret_access_key", bucket.r2_secret_access_key)
-        ),
-        r2_bucket=str(_pick(bucket_raw, "r2_bucket", bucket.r2_bucket)),
-        r2_endpoint=str(_pick(bucket_raw, "r2_endpoint", bucket.r2_endpoint)),
-        r2_public_base_url=str(_pick(bucket_raw, "r2_public_base_url", bucket.r2_public_base_url)),
-        oci_namespace=str(_pick(bucket_raw, "oci_namespace", bucket.oci_namespace)),
-        oci_region=str(_pick(bucket_raw, "oci_region", bucket.oci_region)),
-        oci_access_key_id=str(_pick(bucket_raw, "oci_access_key_id", bucket.oci_access_key_id)),
-        oci_secret_access_key=str(
-            _pick(bucket_raw, "oci_secret_access_key", bucket.oci_secret_access_key)
-        ),
-        oci_bucket=str(_pick(bucket_raw, "oci_bucket", bucket.oci_bucket)),
-        oci_endpoint=str(_pick(bucket_raw, "oci_endpoint", bucket.oci_endpoint)),
-        oci_public_bucket=bool_or(
-            _pick(bucket_raw, "oci_public_bucket", bucket.oci_public_bucket),
-            bucket.oci_public_bucket,
-        ),
-        oci_public_base_url=str(
-            _pick(bucket_raw, "oci_public_base_url", bucket.oci_public_base_url)
-        ),
-    )
-
-    random_media = RandomMediaConfig(**random_settings(raw, set()))
-    checkin = CheckinConfig(**checkin_settings(raw))
-
-    vector_raw = dict_group(raw, "vector_search")
-    vector_search = VectorConfig(
-        qdrant_url=str(_pick(vector_raw, "qdrant_url", v.qdrant_url)),
-        qdrant_api_key=str(_pick(vector_raw, "qdrant_api_key", v.qdrant_api_key)),
-        collection_name=str(_pick(vector_raw, "collection_name", v.collection_name)),
-        embed_base_url=str(_pick(vector_raw, "embed_base_url", v.embed_base_url)),
-        embed_api_key=str(_pick(vector_raw, "embed_api_key", v.embed_api_key)),
-        embed_model=str(_pick(vector_raw, "embed_model", v.embed_model)),
-        similarity_threshold=max(
-            0.0, min(1.0, as_float(_pick(vector_raw, "similarity_threshold", v.similarity_threshold), v.similarity_threshold))
-        ),
-        duplicate_vector_threshold=max(
-            0.0,
-            min(
-                1.0,
-                as_float(
-                    _pick(vector_raw, "duplicate_vector_threshold", v.duplicate_vector_threshold),
-                    v.duplicate_vector_threshold,
-                ),
-            ),
-        ),
-        vector_index_on_register=bool_or(
-            _pick(vector_raw, "vector_index_on_register", v.vector_index_on_register),
-            v.vector_index_on_register,
-        ),
-        embed_image_input=str(_pick(vector_raw, "embed_image_input", v.embed_image_input)),
-        embed_input_type=str(_pick(vector_raw, "embed_input_type", v.embed_input_type)),
-        top_k=as_int(_pick(vector_raw, "top_k", v.top_k), v.top_k),
-        request_timeout=as_int(_pick(vector_raw, "request_timeout", v.request_timeout), v.request_timeout),
-    )
-
-    limits = LimitsConfig(
-        max_download_mb=as_int(scalar_cfg(raw, "max_download_mb"), lim.max_download_mb),
-        remote_hash_enabled=bool_or(
-            scalar_cfg(raw, "remote_hash_enabled"), lim.remote_hash_enabled
-        ),
-        remote_hash_ttl=max(300, as_int(scalar_cfg(raw, "remote_hash_ttl"), lim.remote_hash_ttl)),
-        remote_hash_max_points=max(
-            0, as_int(scalar_cfg(raw, "remote_hash_max_points"), lim.remote_hash_max_points)
-        ),
-    )
-
-    return PluginConfig(
-        basic=basic,
-        delivery=delivery,
-        image_bed=image_bed,
-        storage_bucket=storage_bucket,
-        random_media=random_media,
-        checkin=checkin,
-        vector_search=vector_search,
-        limits=limits,
-    )
-
-
 __all__ = [
     "NAPCAT_KEY_MAP",
     "QQ_KEY_MAP",
@@ -450,7 +276,6 @@ __all__ = [
     "encode_options",
     "engine_choice",
     "ensure_group_cfg",
-    "load_plugin_config",
     "napcat_delivery_cfg",
     "onebot_image_timeout",
     "qq_delivery_cfg",
