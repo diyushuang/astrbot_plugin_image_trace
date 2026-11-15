@@ -1,8 +1,8 @@
 """存储注册表与兼容适配器。
 
-ImageBedClient 仍是唯一的存储实现（mode 映射保留在 image_bed 内）；本模块
-只负责“按配置构造当前生效的存储”并把它适配成 ImageStore 协议，后续新增
-存储实现时在这里注册、不必改发送链路。
+ImageBedClient 仍是唯一的存储入口（按 mode 分派到 `storage/` 下的具体后端）；
+本模块只负责“按配置构造当前生效的存储”并把它适配成 ImageStore 协议，新增
+后端时改 `storage/` 与 image_bed 的 mode 分派即可，发送链路无需感知。
 """
 
 from __future__ import annotations
@@ -48,8 +48,8 @@ class ImageBedStoreAdapter:
 class StorageRegistry:
     """持有当前生效的图片存储。
 
-    目前只有图床适配器一种实现；构造参数与旧 `ImageBedClient` 完全一致，
-    因此切换过程对调用方零行为差异。
+    目前统一由图床适配器承接（后端分派在 ImageBedClient 内）；构造参数与旧
+    `ImageBedClient` 完全一致，因此切换过程对调用方零行为差异。
     """
 
     def __init__(

@@ -6,7 +6,7 @@ SQLite 保存元数据；哈希十六进制串解码为 numpy 位矩阵常驻内
 
 并发约定：写路径持锁，内存缓存以单个 tuple 整体替换（Python 属性赋值
 原子），读路径先取快照再计算——读写方在任意线程交错都不会读到
-"新 ids + 旧矩阵"的错代组合。main 侧的重操作应经 asyncio.to_thread 调用。
+"新 ids + 旧矩阵"的错代组合。调用方的重操作应经 asyncio.to_thread 调用。
 """
 
 from __future__ import annotations

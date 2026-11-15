@@ -167,7 +167,7 @@ flowchart LR
 | `delivery.qq_auto_prefer` | `url` | `auto` 在 `native` 之外优先 `url` 或 `bytes` |
 | `delivery.qq_url_max_mb` | `20` | 直链通道体积上限；`0`=不限制 |
 | `delivery.qq_max_upload_mb` | `100` | `bytes`（分片）通道的下载上限 |
-| `delivery.qq_on_failure` | `fallback` | 通道失败后 `fallback`=交回原生回传 / `native` / `none` |
+| `delivery.qq_on_failure` | `fallback` | 通道失败后 `fallback`=一张都没发出时交回本地压缩/缩略图降级链；`notify`=不交回，回一条文字说明（两种取值下，本批已发过图片都不再回交） |
 
 通道名两平台通用：`auto`=自动；`native`=不加工交给适配器；`bytes`=本机处理成字节再上传（QQ 官方为分片）；`url`=直链交平台下载原图；`url-scaled`=直链交平台下载缩放版。旧写法 `local-compress` / `scaled-url` / `original-url` / `direct` / `chunked` 自动映射为 `auto` / `url-scaled` / `url` / `native` / `bytes`。
 
@@ -262,7 +262,7 @@ flowchart LR
 | 微博签到映射 | `weibo/weibo_post_map.json`（签到只读此表，格式见下） |
 | 微博缩略图缓存 | `weibo/thumbs/`（card 模式零网络读本地文件） |
 | 图床哈希缓存 | `remote_phash.json`（可安全删除，下次启动自动重拉） |
-| 本地图床副本 | `images/`（`image_bed.mode=local` 或上传失败回退时落盘） |
+| 本地副本 | `images/`（`image_bed.mode=local`，或图床 / 储存桶上传失败回退时落盘） |
 | 临时文件 | `tmp/`（插件加载/卸载时按 `TMP_MAX_AGE_SECONDS` 清理） |
 
 > [!NOTE]

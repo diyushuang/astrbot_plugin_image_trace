@@ -60,8 +60,8 @@ REMOTE_HASH_PAYLOAD_KEYS = ("phash", "src", "image_url", "file_name", "mime", "c
 class RemoteMatch:
     """一条远端（图床）哈希命中。
 
-    字段名与 library.MatchResult 对齐，好让 main.py 的两条哈希腿共用同一套
-    展示与回传代码——调用方只需按 `.origin` 区分来源。
+    字段名与 library.MatchResult 对齐，好让 search.hash_engine 的两条哈希腿共用
+    同一套展示与回传代码——调用方只需按 `.origin` 区分来源。
     """
 
     id: str  # Qdrant point id（UUID5），仅用于日志与去重

@@ -1,6 +1,6 @@
 """QQ 官方机器人上传通道：URL 转存 / 分片上传与接管编排。
 
-从 `main` 下沉的实现主体；`main` 仍保留同名薄委托，因此测试对
+QQ 官方上传通道的实现主体；`main` 保留同名薄委托，因此测试对
 ``plugin._qq_upload_block`` / ``plugin._qq_block_size`` 等方法的 monkeypatch
 继续生效。模块函数统一接收 host（插件实例），通过 host 上的公开成员访问
 配置、图片下载与会话能力，不反向 import main。

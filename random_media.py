@@ -79,7 +79,7 @@ THUMBNAIL_PREFIX_PATTERN = re.compile(r"^\d{10,}_")
 # 故只列插件真正会生成的两个图标；要加新图标就往这里补一个字符。
 DECORATION_ICON_PATTERN = re.compile(r"^(?:🖼️|🖼|🎬|📷|🎞️|🖼\ufe0f)+\s*")
 
-# 消息段序号前缀（多图回传时由 main 的 block["prefix"] 加上的 `1.` / `12、`），
+# 消息段序号前缀（多图回传时 block["prefix"] 携带的 `1.` / `12、`），
 # 与表情前缀同理：它属于排版信息，不属于文件名。
 #
 # 分隔符**必须**是 `.` 或 `、` 且其后紧跟空白（或紧邻下一个前缀），
@@ -401,9 +401,9 @@ def clean_display_name(url_or_name) -> str | None:
     对任何名字调用。取不到合法文件名时返回 None，由调用方决定回退文案。
 
     ⚠️ **本函数会丢弃目录层级**（第 1 步只取末段）。用在「展示名」与「按名直查
-    图床」两处都对（图床是按完整对象键取的，见 main._lookup_imgbed_file 的
-    反查路径）；但**不要**拿它去清洗用户手写的相对路径——那会把
-    `7、综艺节目/…/海报.jpg` 削成 `海报.jpg`。这种场景用
+    图床」两处都对（图床是按完整对象键取的，见 services.original_service 的
+    `_lookup_imgbed_file` 反查路径）；但**不要**拿它去清洗用户手写的相对路径——
+    那会把 `7、综艺节目/…/海报.jpg` 削成 `海报.jpg`。这种场景用
     `strip_leading_decoration()`（保目录，只剥开头装饰）。
     """
     if not url_or_name:
@@ -483,8 +483,8 @@ class RandomMediaClient:
 
     走 GuardedHttpClient，失败按指数退避重试。403 直接抛错且不重试：它代表
     “站点未开启随机图功能”这一配置前置条件，重试无意义，交给用户开启后再试。
-    settings 由调用方（main._random_settings）归一化后传入，本类不再解析原始
-    配置。
+    settings 由调用方（config.loader.random_settings）归一化后传入，本类不再
+    解析原始配置。
     """
 
     def __init__(self, settings: dict, http_getter: HttpGetter):

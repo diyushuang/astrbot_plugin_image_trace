@@ -1,6 +1,6 @@
 """微博签到文案池：映射表读取、缓存、状态行与候选图选择。
 
-从 `main` 下沉的实现主体；`main` 仍保留同名薄委托与缓存属性，因此
+文案池的实现主体；`main` 保留同名薄委托与缓存属性，因此
 ``controllers.checkin`` 的缓存失效逻辑、测试对 ``plugin._weibo_candidate``
 的调用都继续有效。本模块只接收 host 门面，不反向 import main。
 """

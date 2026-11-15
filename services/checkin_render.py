@@ -1,8 +1,8 @@
 """签到卡片渲染：下载图源、合成海报、落临时文件与缩略图替身选择。
 
-从 `main` 下沉的实现主体；`main` 保留同名薄委托，`CheckinService` 仍通过
-host 门面调用，因此既有 monkeypatch 点不变。本模块不反向 import main，
-random_media 配置由调用方注入。
+渲染流程的实现主体；`main` 保留同名薄委托，`CheckinService` 通过 host 门面
+调用，因此既有 monkeypatch 点不变。本模块不反向 import main，random_media
+配置由调用方注入。
 """
 
 from __future__ import annotations

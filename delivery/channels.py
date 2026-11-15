@@ -1,13 +1,11 @@
 """发送通道实现：OneBot、QQ 官方上传、标准消息链。
 
 通道只拿 `DeliveryContext`（请求 + 计划 + 已算好的 URL 计划），负责「走哪条
-通道、按什么顺序、结果怎么记账」；字节级发送原语仍由插件实例提供
-（_send_via_onebot / _local_compress_delivery / _prepare_delivery_blocks /
-_qq_upload_takeover），本批不搬这些底层实现。
+通道、按什么顺序、结果怎么记账」；字节级与消息段级原语在 delivery/primitives.py，
+通过插件实例上的同名薄委托调用。
 
-已真正搬到本模块的实现：`_qq_post_media` → `QQOfficialChannel.post_media`，
-`_offbox_pipeline` 的编排 → `QQOfficialChannel.run_offbox`；两个旧方法在
-main 里保留同名薄委托，签名不变。
+`QQOfficialChannel.post_media` / `run_offbox` 也在本模块实现；main 里对应的
+旧方法保留同名薄委托，签名不变。
 """
 
 from __future__ import annotations
@@ -93,7 +91,7 @@ class QQOfficialChannel:
         return blocks, handled
 
     async def post_media(self, event, target, content: str, media) -> None:
-        """发送一条 msg_type=7 的 media 消息（实现自 main._qq_post_media）。"""
+        """发送一条 msg_type=7 的 media 消息。"""
         api = event.bot.api
         message_id = str(
             getattr(getattr(event, "message_obj", None), "message_id", "") or ""

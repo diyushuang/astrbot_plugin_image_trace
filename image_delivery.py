@@ -222,7 +222,7 @@ def delivery_target(platform: str, *, has_bot: bool = True) -> DeliveryTarget:
 # - bytes：upload_prepare → 分片 PUT → upload_part_finish → 合并，保原图、
 #   上限 200MB，代价是多次往返与先落盘。
 #
-# 通道选择是纯决策，放本模块便于单测；网络请求与消息发送在 main.py。
+# 通道选择是纯决策，放本模块便于单测；网络请求与消息发送在 delivery/ 下。
 
 QQ_AUTO_PREFER = frozenset({"bytes", "url"})
 # auto 偏好的旧写法（统一命名前叫 chunked）
@@ -332,7 +332,8 @@ def is_public_http_url(url: str) -> bool:
     注意这条检查**只能识别形如 10/172.16/192.168 的私有段与回环地址**：有些部署
     会把云厂商分配的公网段 IP 当作内网地址使用，句法上分不出来。
     所以真正决定「图床直链能不能交给腾讯下载」的是配置里的内网/公网地址对比
-    （见 main._public_media_url），本函数只兜住第三方的明显内网地址。
+    （见 delivery.qq_upload.public_media_url），本函数只兜住第三方的明显内网
+    地址。
     """
     try:
         parsed = urlsplit(str(url or "").strip())

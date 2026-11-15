@@ -1,7 +1,7 @@
 """发送域公共类型：请求、结果、通道协议与平台画像。
 
 这一层只描述「要发什么、发到哪、结果如何」，不碰 event / bot / 网络；
-main 负责把 AstrBot 事件适配成 `DeliveryRequest`，通道实现负责真正出网。
+delivery.service 负责把 AstrBot 事件适配成 `DeliveryRequest`，通道实现负责真正出网。
 """
 
 from __future__ import annotations

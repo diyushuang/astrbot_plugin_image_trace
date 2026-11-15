@@ -27,7 +27,7 @@ flowchart TD
 依赖方向只有两种：
 
 - **自上而下**：`main → controllers → services → 领域子包 → 根门面`；
-- **横向复用**：子包之间只允许引用 `config` / `common` / `http_client` / `url_guard` 这类无业务语义的公共件，且**不得反向 `import main`**。`services` 与 `controllers` 通过构造函数拿到插件实例（作为 host 门面）或配置对象，再调用其公开成员。
+- **横向复用**：子包之间只允许引用 `config` / `common` / `http_client` / `url_guard` 这类无业务语义的公共件，且**不得反向 `import main`**。`services` 与 `controllers` 通过构造函数拿到插件实例（作为 host 门面）或配置对象，再调用其公开成员与同名薄委托（含 `_` 前缀的配置 / 发送原语）。
 
 ## 各层职责
 
@@ -106,7 +106,7 @@ flowchart TD
 | `qq_upload.py` | QQ 官方上传通道：会话目标解析、公网直链换源、URL/分片上传与接管编排 |
 | `primitives.py` | 字节级 / 消息段级原语：OneBot 直发、本地压缩、URL 计划、配文与 @ 前缀 |
 
-投递层集中保证五条不变量：同一事件只投递一次；`UNKNOWN` / 超时按已送达、绝不重发；只有明确 `failed` 才换通道；「已压缩」配文只按实测证据写入；QQ 官方接管已发图后不再交回。
+投递层集中保证五条不变量：同一事件只投递一次，`UNKNOWN` / 超时按已送达、绝不重发；只有明确 `failed` 才换通道；「已压缩」配文只按实测证据写入；临时文件无论成功 / 失败 / 生成器关闭都清理；QQ 官方接管已发图后不再交回。
 
 ### 图片获取层 `media/`
 
@@ -122,9 +122,9 @@ flowchart TD
 | `loader.py` | 读取门面：新布局优先、旧键回落、类型归一化 |
 | `migrations.py` | 布局版本迁移与储存桶迁移（只搬移、不删旧键，幂等） |
 
-## 根目录门面与遗留模块
+## 根目录公共模块
 
-`main.py` 之外，根目录保留了重构前的公共模块。它们是**兼容门面或纯工具**，子包仍按原路径导入：
+`main.py` 之外，根目录的公共模块保留原有导入路径，分为兼容门面、纯工具与独立组件：
 
 | 模块 | 角色 |
 | --- | --- |
@@ -205,11 +205,12 @@ controllers.random.RandomController.random_image
 
 ```text
 controllers.checkin.CheckinController.checkin
+  → main._checkin_flow（薄委托）
   → services.checkin_service.CheckinService._checkin_flow
       → checkin_store.CheckinStore.check_in（按配置时区算日期）
-      → 取图：services.random_service.RandomService / weibo_posts 映射表
+      → 取图：services.random_service.RandomService / services.weibo_service.WeiboService
       → 文字：checkin_card.QuoteLibrary
-      → 卡片：checkin_card.compose_poster（失败回退 simple）
+      → 卡片：services.checkin_render.CheckinRenderService → checkin_card.compose_poster（失败回退 simple）
       → 昵称：services.checkin_identity.checkin_sender_name
   → main._yield_delivery / 标准消息链
 ```
@@ -238,8 +239,8 @@ TraceController.trace → main._maybe_start_remote_hash_refresh（TTL 判定）
 ### 新增投递通道
 
 1. 在 `delivery/channels.py` 实现一个类，提供 `deliver_url(ctx)` 与/或 `deliver_bytes(ctx)`，返回 `delivery.types.DeliveryResult`；
-2. 在 `delivery/planner.py` 的 `stages` 中加入新步骤名（该函数是纯函数，只决定候选顺序）；
-3. 在 `delivery/service.py` 的 `deliver` 中为步骤名增加执行分支，并复用 `EventGuard` 记账；
+2. 在 `delivery/planner.py` 增加判定并写入 `DeliveryPlan`（该函数是纯函数，只决定候选能力，不执行）；
+3. 在 `delivery/service.py` 的 `deliver` 中增加显式执行分支并复用 `EventGuard` 记账（执行顺序由 `deliver` 控制，不是遍历 `stages`）；
 4. 通道所需的字节级能力优先走 `delivery/primitives.py`，不要在通道内直接拼 AstrBot 消息组件。
 
 ### 新增检索引擎

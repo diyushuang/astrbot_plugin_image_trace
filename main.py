@@ -327,7 +327,7 @@ class ImageTracePlugin(Star):
             f"引擎={engine} {vector_note}{bucket_note}{cache_note}"
         )
 
-        # R1：业务流程服务。服务只接收 host 门面，不反向 import main；
+        # 业务流程服务。服务只接收 host 门面，不反向 import main；
         # 原有 self._xxx 委托仍保留，测试的 monkeypatch 点不变。
         self.services = SimpleNamespace(
             trace=TraceService(
@@ -344,7 +344,7 @@ class ImageTracePlugin(Star):
             weibo=WeiboService(host=self),
             checkin_render=CheckinRenderService(host=self),
         )
-        # 第三轮：投递编排（去重/建请求/offbox 前置/计划/选通道/执行/记账）
+        # 投递编排（去重/建请求/offbox 前置/计划/选通道/执行/记账）
         self.delivery = DeliveryService(
             host=self,
             delivery_config=lambda: self._delivery_config(),

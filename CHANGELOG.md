@@ -5,8 +5,8 @@
 - **修复**：`/签到文案导入` 不再提示运行仓库中不存在的 `scripts/build_weibo_map.py`，改为按 README 的映射表格式离线生成 `weibo_post_map.json`。
 - **兼容**：命令控制器恢复调用 `main` 的同名薄委托，`monkeypatch(plugin._trace_*)` / `_checkin_flow` / `_random_media_delivery` 等既有测试与扩展点重新生效。
 - **清理**：删除未使用的 `load_plugin_config()` / `PluginConfig`、`DeliveryContext.deliver` 存根、`DeliveryRequest.mode_override` 字段，以及 `common.ONEBOT_IMAGE_TIMEOUT` 重复默认值；OneBot 超时默认值统一为 `DEFAULT_DELIVERY.napcat_timeout`。
-- **重构**：QQ 官方上传、微博文案池、签到卡片渲染、图片格式体检分别下沉到 `delivery/qq_upload.py`、`services/weibo_service.py`、`services/checkin_render.py`、`media/format_triage.py`；`main.py` 由约 2400 行降至 1669 行，薄委托签名不变。
-- **验证**：`ruff check` 全绿，全量 **573 passed / 2 skipped**（未安装 pillow-heif）。
+- **重构**：QQ 官方上传、微博文案池、签到卡片渲染、图片格式体检分别下沉到 `delivery/qq_upload.py`、`services/weibo_service.py`、`services/checkin_render.py`、`media/format_triage.py`；`main.py` 由 2403 行降至 1916 行（含为兼容既有 monkeypatch 而恢复的薄委托），发布清单为 71 文件 / 63 个 .py。
+- **验证**：`ruff check` 全绿，全量 **575 passed**（`requirements.txt` 已含 pillow-heif）。
 
 ## 1.8.0（2026-11-15，架构重构，用户可见行为不变）
 
@@ -155,7 +155,7 @@
   之前就清成默认值。因此旧键以**隐藏镜像**（`invisible: true`）保留在 schema 里，
   `_migrate_config_layout()` 首次加载时把旧值搬进新组并写入 `config_layout` 版本
   标记（只搬一次，之后不再覆盖面板新值）；`_cfg()` 仍逐项回落到旧键，配置被手改
-  回旧布局也照常工作。旧镜像计划在后续版本移除。
+  回旧布局也照常工作。旧镜像当时计划在后续版本移除；1.8.0 复审后确认 AstrBot 会在插件初始化前剪枝，删除会导致老用户配置丢失，故保留为隐藏键、不再计划移除。
 - 测试：新增 `tests/test_config_layout.py` 13 例（搬移/合并/只跑一次/旧值优先/
   回落）。全量 378 passed。
 

@@ -1,7 +1,7 @@
 """守护：除 main.py 与测试外，任何模块都不得绕过 config 门面直接读私有配置。
 
-Step 1 已把配置读取/迁移收口到 `config/`，并把 `main` 上的同名方法降级为薄委托。
-后续批次（ImageSource / SearchEngine / DeliveryService …）如果把 `self._cfg(...)`
+配置读取/迁移已收口到 `config/`，`main` 上的同名方法只是薄委托。
+后续新增模块如果把 `self._cfg(...)`
 或 `plugin._checkin_settings()` 这类调用写回新模块，就会重新长出一条绕过门面的
 依赖，同时把默认值再分散一份。这里用 AST 静态检查挡住两类回归：
 
@@ -102,7 +102,7 @@ def test_services_do_not_bypass_config_facade():
 
 
 def test_main_keeps_config_delegate_methods():
-    """薄委托仍在：旧测试与外部引用依赖这些方法名，Step 1–2 期间不能删。"""
+    """薄委托仍在：旧测试与外部引用依赖这些方法名，不能删。"""
     from astrbot_plugin_image_trace.main import ImageTracePlugin
 
     missing = sorted(

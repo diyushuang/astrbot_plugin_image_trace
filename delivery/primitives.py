@@ -1,9 +1,9 @@
-"""R2 发送原语：OneBot 直发、本地压缩、URL 计划、配文与 @ 前缀。
+"""发送原语：OneBot 直发、本地压缩、URL 计划、配文与 @ 前缀。
 
-从 main 下沉到这里的是**字节级与消息段级**实现，通道层（channels.py）仍负责
-「选哪条通道、失败后怎么回退」。所有原语都接收 `host` 作为依赖门面，调用
-host 上保留的同名薄委托（`_load_delivery_bytes` / `_prepare_delivery_blocks` /
-`_send_via_onebot` 等），因此既有 monkeypatch 点不受影响。
+这里实现**字节级与消息段级**能力，通道层（channels.py）负责「选哪条通道、
+失败后怎么回退」。所有原语都接收 `host` 作为依赖门面，通过 host 上的同名
+薄委托（`_load_delivery_bytes` / `_prepare_delivery_blocks` / `_send_via_onebot`
+等）访问其余状态，因此既有 monkeypatch 点不受影响。
 
 配置读取不在这里发生：`_delivery_config` / `_encode_options` /
 `_onebot_image_timeout` / `_verify_scaled` 的取值由 main 的薄委托读好后注入，

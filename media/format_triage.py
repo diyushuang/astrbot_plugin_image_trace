@@ -1,8 +1,8 @@
 """第三方转存平台的图片格式体检：嗅探、假格式转码与缩略图替身回退。
 
-从 `main` 下沉的实现主体；`main` 保留同名薄委托，`DeliveryService` 仍通过
-host 门面调用，因此既有 monkeypatch 点不变。本模块不反向 import main，
-random_media 配置由调用方注入。
+格式体检的实现主体；`main` 保留同名薄委托，`DeliveryService` 通过 host 门面
+调用，因此既有 monkeypatch 点不变。本模块不反向 import main，random_media
+配置由调用方注入。
 """
 
 from __future__ import annotations

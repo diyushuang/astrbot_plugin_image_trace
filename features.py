@@ -58,7 +58,7 @@ _MIME_BY_FORMAT = {
 def phash_hex_len(hash_size: int) -> int:
     """pHash 十六进制串长度：hash_size² bit 经 packbits 补齐到字节边界后的字符数。
 
-    期望长度在 main（建库）与 library（过滤）两侧使用，必须统一从这里取；
+    期望长度在建库与 library（过滤）两侧使用，必须统一从这里取；
     此前两处各自用 hash_size²//4 推导，与实际长度仅在 hash_size 为 4 的
     倍数时一致，其它取值会导致全库数据被过滤、索引静默清空。
     """

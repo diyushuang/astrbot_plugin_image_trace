@@ -114,7 +114,7 @@ class OriginalController:
                     "可先用 /溯源 命中该图后再发 /原图。"
                 )
                 return
-        # R6：/原图 只发 URL、不落地字节——剥离 ImgBed 处理参数还原未处理原文件，
+        # /原图 只发 URL、不落地字节——剥离 ImgBed 处理参数还原未处理原文件，
         # 并强制 url 通道 + 禁用本地回退
         final_url = build_original_url(url)
         # 最后一次校验：走到这里说明上游每一条路径都「自认为」拿到的是原图，
