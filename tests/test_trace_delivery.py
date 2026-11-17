@@ -118,7 +118,7 @@ async def test_trace_sends_prompt_then_one_message_with_all_images(
 
     prompt, gallery = results
     assert prompt.kind == "plain"
-    assert "向量检索命中" in prompt.text
+    assert "向量比对成功" in prompt.text
     assert not _chain_images(prompt) if prompt.chain else True
 
     assert gallery.kind == "chain"
@@ -134,7 +134,7 @@ async def test_gallery_message_does_not_repeat_the_hit_prompt(
 
     results = await _collect(plugin.trace(make_event("/溯源", chain=[_image_segment()])))
 
-    assert "向量检索命中" not in _chain_text(results[1])
+    assert "向量比对成功" not in _chain_text(results[1])
 
 
 async def test_onebot_gallery_caption_appears_once_per_image(
@@ -780,7 +780,7 @@ async def test_prompt_and_images_both_sent_on_onebot_path(
         "".join(seg["data"]["text"] for seg in params["message"] if seg["type"] == "text")
         for _action, params in bot.calls
     ]
-    assert any("向量检索命中" in text for text in texts), "提示必须发出"
+    assert any("向量比对成功" in text for text in texts), "提示必须发出"
     assert any(
         any(seg["type"] == "image" for seg in params["message"])
         for _action, params in bot.calls
@@ -1071,8 +1071,8 @@ async def test_auto_engine_resolves_query_image_only_once_on_hash_fallback(
     results = await _collect(plugin._trace_auto(make_event(""), _image_segment()))
 
     assert len(calls) == 1, f"同一张查询图只该解析一次，实际 {len(calls)} 次"
-    assert any("尝试哈希比对" in (getattr(item, "text", None) or "") for item in results)
-    assert any("未找到相似度达标" in (getattr(item, "text", None) or "") for item in results)
+    texts = [getattr(item, "text", None) or "" for item in results]
+    assert texts == ["❌ 比对失败"]
 
 
 async def test_auto_engine_reuses_features_and_mime_from_single_decode(
@@ -1126,7 +1126,8 @@ async def test_auto_engine_reuses_features_and_mime_from_single_decode(
 
     assert len(calls) == 1
     assert embed_mimes == ["image/jpeg"]
-    assert any("未找到相似度达标" in (getattr(item, "text", None) or "") for item in results)
+    texts = [getattr(item, "text", None) or "" for item in results]
+    assert texts == ["❌ 比对失败"]
 
 
 async def test_download_bytes_reuses_open_response_for_large_images(

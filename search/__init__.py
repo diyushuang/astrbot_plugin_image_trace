@@ -25,7 +25,6 @@ __all__ = [
     "SearchHit",
     "SearchOutcome",
     "VectorSearchEngine",
-    "miss_message",
 ]
 
 _LAZY_EXPORTS = {
@@ -38,7 +37,6 @@ _LAZY_EXPORTS = {
     "SearchHit": ".base",
     "SearchOutcome": ".base",
     "VectorSearchEngine": ".vector_engine",
-    "miss_message": ".base",
 }
 
 

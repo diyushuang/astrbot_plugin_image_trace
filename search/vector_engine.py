@@ -17,7 +17,7 @@ except Exception:  # 兼容独立模块加载/本地自测环境
 
 from ..image_delivery import deduplicate_vector_hits
 from ..vector_search import VectorEngineError
-from .base import QueryImage, SearchHit, SearchOutcome, miss_message
+from .base import QueryImage, SearchHit, SearchOutcome
 
 
 def _as_int(value: Any) -> int | None:
@@ -74,15 +74,16 @@ class VectorSearchEngine:
                 f" 相似度 {h['score'] * 100:.1f}%"
                 for h in hits[: self._top_n]
             ]
+            # 候选与阈值只进日志：聊天里只回一行「向量比对失败」
+            logger.info(
+                "向量比对未命中（阈值 %.0f%%）；候选：%s",
+                self._engine.threshold * 100,
+                "；".join(candidate_lines) if candidate_lines else "无",
+            )
             return SearchOutcome(
                 kind="miss",
                 candidate_lines=candidate_lines,
-                miss_text=miss_message(
-                    f"❌ 向量库中未找到相似度达标的原图"
-                    f"（阈值 {self._engine.threshold * 100:.0f}%）。",
-                    candidate_lines,
-                    empty_note="（向量库中暂无图床图片，等待图床上传侧钩子入库）",
-                ),
+                miss_text="❌ 向量比对失败",
             )
         except VectorEngineError as exc:
             logger.warning(f"向量检索出错: {getattr(exc, 'detail', exc)}")

@@ -71,7 +71,7 @@ flowchart TD
 
 | 模块 | 职责 |
 | --- | --- |
-| `base.py` | `SearchHit` / `QueryImage` / `SearchOutcome` 统一模型、`SearchEngine` 协议、`miss_message` |
+| `base.py` | `SearchHit` / `QueryImage` / `SearchOutcome` 统一模型、`SearchEngine` 协议 |
 | `hash_engine.py` | 本地图库 + 图床哈希镜像两条腿的合并排序、候选行 |
 | `vector_engine.py` | 把 `vector_search.VectorEngine` 的原始结果收敛为统一命中（阈值、降序、同图去重） |
 | `auto_engine.py` | 向量优先、未命中或不可用时回退哈希 |

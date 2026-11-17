@@ -68,9 +68,19 @@ class TraceService:
                 self.host._remove_quiet(resolved.path)
 
     async def _hash_outcome_delivery(
-        self, event: AstrMessageEvent, query_path: str, hits: list, candidate_lines: list
+        self,
+        event: AstrMessageEvent,
+        query_path: str,
+        hits: list,
+        candidate_lines: list,
+        *,
+        miss_text: str = "❌ 哈希比对失败",
     ) -> AsyncGenerator:
-        """哈希候选的统一渲染：AI 复核（仅哈希腿）→ 命中回传或未命中提示。"""
+        """哈希候选的统一渲染：AI 复核（仅哈希腿）→ 命中回传或简短未命中提示。
+
+        候选与阈值明细只写日志：聊天里只留一行结论，避免每次未命中都刷出
+        一大段「最接近的候选」。
+        """
         if hits and self.bool_cfg("ai_verify", DEFAULT_BASIC.ai_verify):
             hits = await self.host._ai_verify(query_path, hits)
 
@@ -79,30 +89,32 @@ class TraceService:
                 yield result
             return
 
-        yield event.plain_result(
-            self.host._miss_message(
-                f"❌ 图库中未找到相似度达标的原图（阈值 {self.host.hash_threshold * 100:.0f}%）。",
-                candidate_lines,
-            )
+        logger.info(
+            "哈希比对未命中（阈值 %.0f%%）；候选：%s",
+            self.host.hash_threshold * 100,
+            "；".join(candidate_lines) if candidate_lines else "无",
         )
+        yield event.plain_result(miss_text)
 
     async def _hash_hit_result(self, event: AstrMessageEvent, best) -> AsyncGenerator:
         """把一条哈希命中渲染成回复（本地腿与图床腿共用）。
 
-        两腿的差异只有两处：展示名（本地用备注、图床用文件名）与路径来源
-        （本地文件 vs 远端直链）。其余展示与回传逻辑完全一致，故合并到一处，
-        免得日后改一处漏一处。
+        聊天里只留「哈希比对成功 + 相似度」一行；编号、备注、尺寸、入库时间
+        与直链全部写日志，避免刷屏。
         """
-        title = f"✅ 溯源命中（相似度 {best.similarity * 100:.1f}%）#{best.id}"
-        label = self.host._candidate_note(best)
-        if label:
-            title += f" · {label}"
-        lines = []
-        if best.width and best.height:
-            lines.append(f"尺寸：{best.width}x{best.height}")
-        if best.created_at:
-            lines.append(f"入库时间：{best.created_at}")
-        block = {"text": " · ".join(lines)}
+        title = f"✅ 哈希比对成功，相似度 {best.similarity * 100:.1f}%"
+        logger.info(
+            "哈希比对命中 #%s 相似度 %.1f%% 名称=%s 尺寸=%sx%s 入库=%s 直链=%s 本地=%s",
+            best.id,
+            best.similarity * 100,
+            self.host._candidate_note(best) or "-",
+            best.width or "-",
+            best.height or "-",
+            best.created_at or "-",
+            best.image_url or "-",
+            best.file_path or "-",
+        )
+        block: dict = {}
         if best.width and best.height:
             # 供回传计划判断是否需要图床缩放，以及压缩标识是否成立
             block["width"] = best.width
@@ -123,9 +135,7 @@ class TraceService:
                 f"哈希命中 #{best.id} 的原图不可用: "
                 f"{best.file_path or best.image_url or '未知路径'}"
             )
-            yield event.plain_result(
-                f"{title}，但原图文件已不存在或无法访问（详情见机器人日志）。"
-            )
+            yield event.plain_result(f"{title}（原图不可用）")
 
     async def _vector_search_one(self, event, seg, resolved: ResolvedImage | None = None):
         """单图向量检索。返回 (kind, item)：hit / miss / nofile / error。
@@ -158,7 +168,8 @@ class TraceService:
         """严格向量引擎：只用向量库，出错直接提示。"""
         kind, item = await self.host._vector_search_one(event, seg)
         if kind == "error":
-            yield event.plain_result(f"⚠️ 向量检索引擎错误：{item}")
+            logger.warning(f"向量比对不可用: {item}")
+            yield event.plain_result("⚠️ 向量比对失败")
         elif kind == "hit":
             async for result in item:
                 yield result
@@ -167,6 +178,9 @@ class TraceService:
 
     async def _trace_auto(self, event: AstrMessageEvent, seg) -> AsyncGenerator:
         """auto 引擎：向量优先，未命中或引擎不可用时回退哈希。
+
+        聊天里只输出一行结论：命中时「xx 比对成功，相似度 xx%」，两腿都失败
+        时「比对失败」；候选、阈值与回退原因明细只进日志。
 
         图片只解析一次：解析时用 compute_features_with_mime 同时完成格式校验与
         感知特征，向量腿拿 MIME、哈希腿拿 features，两边都不再为同一张图重复
@@ -196,26 +210,24 @@ class TraceService:
             if vector.kind == "nofile":
                 yield event.plain_result(resolved.message)
                 return
+            # 向量未命中/不可用：明细只进日志，不再往聊天里发中间提示
             if vector.kind == "miss":
-                yield event.plain_result(vector.miss_text)
-                if outcome.hash is None:
-                    yield event.plain_result("（哈希图库为空，无兜底可执行）")
-                    return
-                yield event.plain_result("尝试哈希比对：")
-            else:  # error
-                logger.info(f"auto 引擎回退哈希：{vector.error}")
-                if outcome.hash is None:
-                    yield event.plain_result(
-                        "⚠️ 向量引擎不可用，且哈希图库为空，无兜底可执行。"
-                        "可发送 /登记原图 或执行 /溯源重扫 建库。"
-                    )
-                    return
-                yield event.plain_result("⚠️ 向量引擎不可用，改用哈希比对：")
+                logger.info("向量比对未命中，回退哈希")
+            else:
+                logger.info(f"向量引擎不可用，回退哈希：{vector.error}")
+            if outcome.hash is None:
+                yield event.plain_result(
+                    "❌ 比对失败（哈希图库为空）"
+                    if getattr(outcome, "hash_empty", False)
+                    else "❌ 比对失败"
+                )
+                return
             async for item in self._hash_outcome_delivery(
                 event,
                 resolved.path,
                 outcome.hash.hits,
                 outcome.hash.candidate_lines,
+                miss_text="❌ 比对失败",
             ):
                 yield item
         finally:
@@ -262,31 +274,34 @@ class TraceService:
             )
 
         if multi:
-            header = f"✅ 向量检索命中 {len(hits)} 张（按相似度降序），图片发送可能有延迟"
-        else:
             header = (
-                f"✅ 向量检索命中（相似度 {hits[0]['score'] * 100:.1f}%），"
-                "图片发送可能有延迟"
+                f"✅ 向量比对成功，最高相似度 {hits[0]['score'] * 100:.1f}%"
+                f"（{len(hits)} 张）"
             )
+        else:
+            header = f"✅ 向量比对成功，相似度 {hits[0]['score'] * 100:.1f}%"
 
         blocks = []
         for idx, hit in enumerate(hits, 1):
             payload = hit.get("payload") or {}
             file_name = payload.get("file_name") or str(hit.get("id")).rsplit("/", 1)[-1]
-            fields = []
-            if multi:
-                fields.append(f"相似度 {hit['score'] * 100:.1f}%")
             width, height = payload.get("width"), payload.get("height")
-            if width and height:
-                fields.append(f"{width}x{height}")
-            if payload.get("created_at"):
-                fields.append(str(payload["created_at"]))
-            prefix = f"{idx}." if multi else ""
-            block = {
-                "prefix": prefix,
-                "file_name": str(file_name or ""),
-                "fields": fields,
-            }
+            image_url = str(payload.get("image_url") or "")
+            logger.info(
+                "向量比对命中 %s 相似度 %.1f%% 名称=%s 尺寸=%sx%s 入库=%s 直链=%s",
+                hit.get("id"),
+                hit["score"] * 100,
+                file_name or "-",
+                width or "-",
+                height or "-",
+                payload.get("created_at") or "-",
+                image_url or "-",
+            )
+            block = {}
+            if multi:
+                block["prefix"] = f"{idx}."
+            if file_name:
+                block["file_name"] = str(file_name)
             if width and height:
                 # 供回传计划判断是否需要图床缩放，以及压缩标识是否成立
                 block["width"] = width
@@ -296,11 +311,10 @@ class TraceService:
                 # 图床侧钩子（img-indexer）入库时已记录原图体积，直接用：
                 # 回传计划因此不必再探测原图尺寸，省一次往返与一次图床处理
                 block["size_bytes"] = size_bytes
-            image_url = str(payload.get("image_url") or "")
             if image_url:
                 block["url"] = image_url
             else:
-                block["fields"].append("该条目没有可用直链，可能已被删除")
+                logger.warning("向量命中 %s 没有可用直链，跳过回传", hit.get("id"))
             blocks.append(block)
         prompt_via_onebot = False
         prompt_task = None

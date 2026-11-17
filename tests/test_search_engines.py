@@ -208,7 +208,7 @@ def test_vector_engine_no_path_and_miss_candidates() -> None:
     miss = asyncio.run(engine.search_outcome(QueryImage(path="q.jpg")))
     assert miss.kind == "miss"
     assert len(miss.candidate_lines) == 2
-    assert "阈值 80%" in miss.miss_text
+    assert miss.miss_text == "❌ 向量比对失败"
     assert asyncio.run(engine.search(QueryImage(path="q.jpg"))) == []
 
 

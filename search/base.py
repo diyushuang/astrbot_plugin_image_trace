@@ -87,12 +87,3 @@ class SearchEngine(Protocol):
     """检索引擎的最小契约：给定查询图，返回统一命中列表。"""
 
     async def search(self, image: QueryImage) -> list[SearchHit]: ...
-
-
-def miss_message(fail_line: str, candidates: list, empty_note: str = "") -> str:
-    """未命中回复的统一拼装：阈值提示 + 可选的“最接近候选”或空库说明。"""
-    if candidates:
-        return "\n".join([fail_line, "最接近的候选："] + candidates)
-    if empty_note:
-        return f"{fail_line}\n{empty_note}"
-    return fail_line

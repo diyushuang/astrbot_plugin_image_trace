@@ -99,8 +99,7 @@ async def test_trace_auto_vector_error_falls_back_to_hash(
     results = await _collect(plugin._trace_auto(make_event(""), _image_segment()))
 
     texts = [_text(item) for item in results]
-    assert any("向量引擎不可用，改用哈希比对" in text for text in texts)
-    assert any("未找到相似度达标" in text for text in texts)
+    assert texts == ["❌ 比对失败"]
 
 
 async def test_trace_auto_vector_error_without_hash_reports_unavailable(
@@ -125,7 +124,7 @@ async def test_trace_auto_vector_error_without_hash_reports_unavailable(
     results = await _collect(plugin._trace_auto(make_event(""), _image_segment()))
 
     assert len(results) == 1
-    assert "向量引擎不可用，且哈希图库为空" in _text(results[0])
+    assert "比对失败（哈希图库为空）" in _text(results[0])
 
 
 async def test_trace_hash_ai_verify_rejects_negative_candidate(
@@ -172,7 +171,7 @@ async def test_trace_hash_ai_verify_rejects_negative_candidate(
     assert len(calls) == 1
     assert calls[0] == [str(candidate), str(query)]
     assert len(results) == 1
-    assert "未找到相似度达标" in _text(results[0])
+    assert "哈希比对失败" in _text(results[0])
 
 
 async def test_trace_hash_ai_verify_off_never_calls_provider(
@@ -215,7 +214,7 @@ async def test_trace_hash_ai_verify_off_never_calls_provider(
     )
 
     assert len(results) == 1
-    assert "溯源命中" in _chain_text(results[0])
+    assert "哈希比对成功" in _chain_text(results[0])
 
 
 # ----------------------------------------------------------------------

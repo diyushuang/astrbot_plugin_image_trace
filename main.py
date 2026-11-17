@@ -158,7 +158,6 @@ from .search import (
     AutoSearchEngine,
     HashSearchEngine,
     VectorSearchEngine,
-    miss_message,
 )
 from .services import (
     CheckinRenderService,
@@ -981,11 +980,6 @@ class ImageTracePlugin(Star):
         「图库还是空的」，而实际上哈希腿完全可用——用户会被误导去配 scan_dirs。
         """
         return self.library.count() + self.remote_hash.count
-
-    @staticmethod
-    def _miss_message(fail_line: str, candidates: list, empty_note: str = "") -> str:
-        """未命中回复的统一拼装（实现已迁到 search.base，保留同名薄委托）。"""
-        return miss_message(fail_line, candidates, empty_note)
 
     def _hash_engine(self) -> HashSearchEngine:
         """按当前实例状态构造哈希合并引擎（属性动态读取，兼容测试替换）。"""

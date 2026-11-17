@@ -199,13 +199,13 @@ async def test_trace_auto_no_file_miss_and_error_without_hash(
             SimpleNamespace(
                 vector=SearchOutcome(kind="miss", miss_text="向量未命中"),
                 hash=None,
+                hash_empty=True,
             )
         ),
     )
     results = await _collect(plugin._trace_auto(event, _image_segment()))
     text = "\n".join(_text(item) for item in results)
-    assert "向量未命中" in text
-    assert "哈希图库为空" in text
+    assert text == "❌ 比对失败（哈希图库为空）"
 
     monkeypatch.setattr(
         plugin,
@@ -214,12 +214,13 @@ async def test_trace_auto_no_file_miss_and_error_without_hash(
             SimpleNamespace(
                 vector=SearchOutcome(kind="error", error="vector down"),
                 hash=None,
+                hash_empty=True,
             )
         ),
     )
     results = await _collect(plugin._trace_auto(event, _image_segment()))
     text = "\n".join(_text(item) for item in results)
-    assert "向量引擎不可用，且哈希图库为空" in text
+    assert text == "❌ 比对失败（哈希图库为空）"
 
     monkeypatch.setattr(
         plugin,
@@ -233,7 +234,7 @@ async def test_trace_auto_no_file_miss_and_error_without_hash(
     )
     results = await _collect(plugin._trace_auto(event, _image_segment()))
     text = "\n".join(_text(item) for item in results)
-    assert "改用哈希比对" in text
+    assert text == "❌ 比对失败"
 
 
 @pytest.mark.asyncio

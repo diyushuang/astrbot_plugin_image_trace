@@ -745,7 +745,7 @@ async def test_trace_hash_path_still_hits(make_plugin, imgbed, make_event, tmp_p
     results = await _collect(plugin.trace(event))
 
     assert results, "溯源应回传命中结果"
-    assert "溯源命中" in _chain_text(results[0])
+    assert "哈希比对成功" in _chain_text(results[0])
 
 
 async def test_trace_accepts_heic_query_image(make_plugin, imgbed, make_event, tmp_path):
@@ -779,7 +779,7 @@ async def test_trace_accepts_heic_query_image(make_plugin, imgbed, make_event, t
     results = await _collect(plugin.trace(event))
 
     assert results, "HEIC 查询图应当正常溯源"
-    assert "溯源命中" in _chain_text(results[0])
+    assert "哈希比对成功" in _chain_text(results[0])
 
 
 async def test_original_image_not_reported_missing_when_bed_denies_access(
