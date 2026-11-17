@@ -1,16 +1,12 @@
 # 更新日志
 
-## 未发布（2026-11-17，溯源提示精简）
+## 1.8.1（2026-11-17，溯源提示精简与重构收尾）
 
 - **变更**：`/溯源` 命中时聊天里只保留一行「✅ 向量/哈希比对成功，相似度 xx%」；未命中只回「❌ 向量/哈希比对失败」或「❌ 比对失败」，不再发送阈值、候选列表与「尝试哈希比对」等中间提示。编号、备注、尺寸、入库时间、直链与候选明细全部改写入日志。
 - **说明**：QQ 官方机器人群聊不支持「表情表态」（官方消息类型表：单聊 ❌ / 群聊 ❌ / 频道 ✅），因此未用贴表情表达成功/失败；当前以单行 ✅/❌ 文案代替。
-- **验证**：`ruff check` 全绿，全量 **575 passed**。
-
-## 未发布（2026-11-15，重构审查修复）
-
 - **修复**：`/签到文案导入` 不再提示运行仓库中不存在的 `scripts/build_weibo_map.py`，改为按 README 的映射表格式离线生成 `weibo_post_map.json`。
 - **兼容**：命令控制器恢复调用 `main` 的同名薄委托，`monkeypatch(plugin._trace_*)` / `_checkin_flow` / `_random_media_delivery` 等既有测试与扩展点重新生效。
-- **清理**：删除未使用的 `load_plugin_config()` / `PluginConfig`、`DeliveryContext.deliver` 存根、`DeliveryRequest.mode_override` 字段，以及 `common.ONEBOT_IMAGE_TIMEOUT` 重复默认值；OneBot 超时默认值统一为 `DEFAULT_DELIVERY.napcat_timeout`。
+- **清理**：删除未使用的 `load_plugin_config()` / `PluginConfig`、`DeliveryContext.deliver` 存根、`DeliveryRequest.mode_override` 字段，以及 `common.ONEBOT_IMAGE_TIMEOUT` 重复默认值；OneBot 超时默认值统一为 `DEFAULT_DELIVERY.napcat_timeout`；删除未命中提示的旧 `miss_message` 拼装。
 - **重构**：QQ 官方上传、微博文案池、签到卡片渲染、图片格式体检分别下沉到 `delivery/qq_upload.py`、`services/weibo_service.py`、`services/checkin_render.py`、`media/format_triage.py`；`main.py` 由 2403 行降至 1916 行（含为兼容既有 monkeypatch 而恢复的薄委托），发布清单为 71 文件 / 63 个 .py。
 - **验证**：`ruff check` 全绿，全量 **575 passed**（`requirements.txt` 已含 pillow-heif）。
 

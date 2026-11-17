@@ -1,6 +1,6 @@
 # 架构说明
 
-本文描述 `astrbot_plugin_image_trace` 在 1.8.0 的分层结构与调用链，用于二次开发与排障。行为细节以代码为准；配置项含义见 [README](./README.md#配置分组)。
+本文描述 `astrbot_plugin_image_trace` 在 1.8.x 的分层结构与调用链，用于二次开发与排障。行为细节以代码为准；配置项含义见 [README](./README.md#配置分组)。
 
 ## 分层总览
 
