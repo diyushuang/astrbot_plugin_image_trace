@@ -7,6 +7,7 @@ import contextlib
 import io
 import ipaddress
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -419,6 +420,86 @@ SEND_REASON_TIMEOUT = "timeout"
 SEND_REASON_PROTOCOL_REJECT = "protocol-reject"
 SEND_REASON_DISCONNECTED = "disconnected"
 SEND_REASON_UNCLASSIFIED = "unclassified"
+
+
+# ---------------------------------------------------------------------------
+# QQ 官方上传/发送失败归因
+# ---------------------------------------------------------------------------
+#
+# 官方文档（富媒体上传、发送消息）给出了明确的业务错误码；不同错误码该做的事
+# 完全不同：URL 拉取失败可以改分片重试，体积超限可以本地压缩，而「今日文件
+# 上传额度用完」「被禁言」「消息发送超频」再换通道也必然失败，只能提示用户。
+# 把这些判断收成纯函数，避免接管逻辑里用一串 if "字符串" in str(exc) 各判各的。
+QQ_UPLOAD_FATAL_KINDS = frozenset({"quota", "muted", "rate_limit", "no_permission"})
+QQ_UPLOAD_ERROR_CODES = {
+    "40093002": "quota",
+    "40093001": "retryable",
+    "850018": "muted",
+    "850019": "unsupported",
+    "850026": "url_unreachable",
+    "850027": "timeout",
+    "850031": "too_large",
+    "304082": "url_unreachable",
+    "304083": "url_unreachable",
+    "22009": "rate_limit",
+    "11253": "no_permission",
+}
+# _error_text 已统一转小写，故英文线索也用小写
+QQ_UPLOAD_ERROR_HINTS = (
+    ("超过今天发送文件容量上限", "quota"),
+    ("daily file upload quota", "quota"),
+    ("msg limit exceed", "rate_limit"),
+    ("消息发送超频", "rate_limit"),
+    ("群被禁言", "muted"),
+    ("机器人被禁言", "muted"),
+    ("不支持的文件格式", "unsupported"),
+    ("unsupported file format", "unsupported"),
+    ("上传文件超过大小限制", "too_large"),
+    ("上传文件大小超过限制", "too_large"),
+    ("upload file size limit", "too_large"),
+    ("下载原始文件失败", "url_unreachable"),
+    ("download original file failed", "url_unreachable"),
+    ("富媒体资源拉取失败", "url_unreachable"),
+    ("upload media info fail", "url_unreachable"),
+    ("convert media info fail", "url_unreachable"),
+    ("no permission", "no_permission"),
+    ("timeout", "timeout"),
+    ("timed out", "timeout"),
+)
+QQ_UPLOAD_FAILURE_HINTS = {
+    "quota": "今日 QQ 文件上传额度已用完，请明天再试",
+    "muted": "机器人当前被禁言，无法发送",
+    "rate_limit": "发送太频繁，请稍后再试",
+    "too_large": "图片超过 QQ 允许的大小",
+    "unsupported": "图片格式不受 QQ 官方支持",
+    "url_unreachable": "腾讯侧拉取图片失败",
+    "timeout": "QQ 接口响应超时",
+    "no_permission": "机器人缺少发送权限",
+}
+
+
+def classify_qq_upload_error(exc: BaseException) -> str:
+    """把 QQ 官方接口异常归到可处置的类别。
+
+    返回 ``quota`` / ``muted`` / ``rate_limit`` / ``no_permission`` /
+    ``too_large`` / ``unsupported`` / ``url_unreachable`` / ``timeout`` /
+    ``retryable`` / ``unknown``。业务错误码优先于文案匹配：文案会随接口版本
+    改，错误码是文档承诺的稳定契约；两者都识别不出时返回 ``unknown``，由调用
+    方按「保守」策略处理（不重发、必要时回退）。
+    """
+    text = _error_text(exc)
+    for code, kind in QQ_UPLOAD_ERROR_CODES.items():
+        if re.search(rf"(?<!\d){code}(?!\d)", text):
+            return kind
+    for hint, kind in QQ_UPLOAD_ERROR_HINTS:
+        if hint in text:
+            return kind
+    return "unknown"
+
+
+def qq_upload_failure_hint(kind: str) -> str:
+    """给用户看的短句；未收录的类别返回空串，由调用方决定是否展示原始摘要。"""
+    return QQ_UPLOAD_FAILURE_HINTS.get(kind, "")
 
 
 def send_outcome_reason(exc: BaseException | None) -> str:

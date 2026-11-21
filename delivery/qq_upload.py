@@ -8,8 +8,9 @@ QQ 官方上传通道的实现主体；`main` 保留同名薄委托，因此测�
 
 from __future__ import annotations
 
+import asyncio
+import itertools
 import os
-import random
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit
@@ -17,17 +18,133 @@ from urllib.parse import urlsplit
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
-from ..common import sanitize_error_text
+from ..common import read_bytes, sanitize_error_text
 from ..image_delivery import (
+    QQ_UPLOAD_FATAL_KINDS,
     CompressionEvidence,
     build_scaled_url,
     choose_qq_upload_channel,
+    classify_qq_upload_error,
     is_public_http_url,
+    qq_upload_failure_hint,
+    qq_upload_safe_image,
+    sniff_image_format,
 )
 from ..random_media import swap_url_origin
 
 # QQ 开放平台富媒体 file_type：1=图片、2=视频、3=语音、4=文件
 QQ_IMAGE_FILE_TYPE = 1
+
+# 官方文档：每个 msg_id 最多被动回复 5 次。一次事件里若回传超过 5 张图，
+# 超出的部分必然发不出去，还会连记一串失败日志；这里提前截断并把说明并进
+# 首图正文，至少让用户知道还有图没发。
+QQ_OFFICIAL_MAX_MEDIA_PER_REPLY = 5
+
+# 图片白名单格式 → 用于分片上传文件名的扩展名。QQ 的分片上传要求 file_name，
+# 且格式不受支持会直接回 850019；文件名与真实内容保持一致最稳妥。
+_QQ_FORMAT_SUFFIXES = {
+    "JPEG": ".jpg",
+    "PNG": ".png",
+    "GIF": ".gif",
+    "WEBP": ".webp",
+    "BMP": ".bmp",
+}
+_JPEG_SUFFIXES = frozenset({".jpg", ".jpeg"})
+
+# 被动回复的 (msg_id, msg_seq) 组合重复会被平台判失败；AstrBot 自身发消息
+# 默认用 1，因此插件从 2 开始单调递增，并在 2~9999 之间循环。
+_QQ_MSG_SEQ = itertools.count(2)
+
+
+def cap_qq_media_blocks(
+    blocks: list[dict], limit: int = QQ_OFFICIAL_MAX_MEDIA_PER_REPLY
+) -> tuple[list[dict], str]:
+    """把一次投递的图片数截到官方被动回复上限，返回 (保留的 blocks, 提示语)。
+
+    QQ 文档：被动回复每个 msg_id 最多 5 次。多图命中超过 5 张时，第 6 张起
+    必然失败；与其把它们发失败，不如保留前 5 张并在标题里说明。提示语由
+    调用方并进 header（首图正文），不能写进 block["text"]——向量回传路径
+    随后会用 `_mark_compressed_captions` 重写配文，会把提示覆盖掉。
+    纯文本 block 原样保留；不改动调用方传入的 block，避免污染历史记录。
+    """
+    image_indexes = [
+        index for index, block in enumerate(blocks) if block.get("url") or block.get("path")
+    ]
+    if len(image_indexes) <= max(1, limit):
+        return blocks, ""
+    keep = set(image_indexes[:limit])
+    kept = [
+        block
+        for index, block in enumerate(blocks)
+        if not ((block.get("url") or block.get("path")) and index not in keep)
+    ]
+    dropped = len(image_indexes) - limit
+    logger.info(
+        f"qq_official 单次图片数超过官方被动回复上限，已截断 "
+        f"{len(image_indexes)}→{limit} 张"
+    )
+    return kept, f"（QQ 官方单次最多回传 {limit} 张，另有 {dropped} 张未发送）"
+
+
+def next_qq_msg_seq() -> int:
+    """取下一个可用 msg_seq（2~9999 循环）。
+
+    官方文档只要求同一 msg_id 下不重复，进程内单调递增足以避免插件自己
+    连发多张图时撞号，也避开 AstrBot 适配器默认使用的 1。
+    """
+    value = next(_QQ_MSG_SEQ)
+    return 2 + (value - 2) % 9998
+
+
+def _name_with_suffix(name: str, detected: str) -> str:
+    """按嗅探出的真实格式修正文件名扩展名（仅图片白名单格式）。"""
+    suffix = _QQ_FORMAT_SUFFIXES.get(detected)
+    if not suffix:
+        return name
+    stem, current = os.path.splitext(name)
+    current = current.lower()
+    if current == suffix or (detected == "JPEG" and current in _JPEG_SUFFIXES):
+        return name
+    return f"{stem or 'image'}{suffix}"
+
+
+def _read_file_head(path: str) -> bytes:
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(16)
+    except OSError:
+        return b""
+
+
+async def qq_safe_local_image(
+    host, path: str, name: str, size_limit: int
+) -> tuple[str, str, str]:
+    """确保本地图片是 QQ 富媒体白名单格式；必要时转码为 JPEG。
+
+    返回 (上传路径, 文件名, 需清理的临时文件)。白名单格式（jpg/png/gif/
+    webp/bmp）原样返回；HEIC/AVIF/TIFF/SVG 等可解码图片转成 JPEG，避免
+    分片上传因 850019「不支持的文件格式」失败；解码失败时仍交原文件，
+    让接口返回真实错误，而不是插件提前把图吞掉。
+    """
+    head = await asyncio.to_thread(_read_file_head, path)
+    detected = sniff_image_format(head)
+    if qq_upload_safe_image(head):
+        return path, _name_with_suffix(name, detected), ""
+    try:
+        oversized = os.path.getsize(path) > size_limit
+    except OSError:
+        return path, name, ""
+    if oversized:
+        # 转码大文件要整份读进内存；超限时交给接口报错，不在本地冒险
+        return path, _name_with_suffix(name, detected), ""
+    data = await asyncio.to_thread(read_bytes, path)
+    converted = await asyncio.to_thread(host._write_transcoded_jpeg, data)
+    if not converted:
+        return path, _name_with_suffix(name, detected), ""
+    logger.info(
+        f"qq_official 分片上传前已把 {detected or '未知格式'} 转码为 JPEG: {converted}"
+    )
+    return converted, os.path.basename(converted), converted
 
 
 def qq_send_target(event: AstrMessageEvent) -> tuple[str, str] | None:
@@ -156,10 +273,18 @@ async def upload_takeover(
     （只剩本地转码 path，或图床只有内网源）时，该图降级为分片上传——
     URL 上传没有入参，照原通道发出去必然失败，白记一轮 WARN。
 
+    auto 模式下 URL 上传失败（腾讯侧拉不到图）会按官方建议改走分片重试：
+    先把图下载到本地再分片，既不依赖图床公网可达，也能保住原图。额度用完 /
+    被禁言 / 发送超频这类「换通道也会失败」的错误直接回一条说明，不再做无谓
+    回退。
+
     失败语义两档（delivery.qq_on_failure）：
     - fallback（默认）：一张都还没发出去时返回 False，交回原有的本地压缩 /
       缩略图降级链；只要已经发过就绝不再交回，避免同一张图发两遍。
     - notify：不交回，改回一条文字说明失败原因。
+
+    发送（post_media）阶段的超时/未知错误按「已送达」处理：请求可能已经到达
+    QQ，只是回执丢了，重发会让用户收到重复图片。
     """
     mode, direct_max, url_max, auto_prefer, max_upload, on_failure = qq_config
     if mode == "native":
@@ -226,31 +351,128 @@ async def upload_takeover(
         own_text = str(block.get("text") or "").strip()
         parts = (*prefix, own_text) if index == 0 else (own_text,)
         content = "\n".join(part for part in parts if part)
+
+        # 上传与发送分开捕获：上传失败时图片一定还没发出去，可以安全换通道；
+        # 发送失败则可能已被 QQ 接收，必须按「结果未知」处理，不能一律重发。
         try:
             media = await host._qq_upload_block(
                 event, block, channel, public_url, target, max_upload
             )
-            await host._qq_post_media(event, target, content, media)
         except Exception as exc:
-            detail = f"{type(exc).__name__}: {exc}"
+            upload_kind = classify_qq_upload_error(exc)
             logger.warning(
-                f"qq_official {channel} 通道上传/发送失败"
-                f"（第 {index + 1}/{len(plan)} 张）: {detail}"
+                f"qq_official {channel} 通道上传失败"
+                f"（第 {index + 1}/{len(plan)} 张，{upload_kind}）: "
+                f"{type(exc).__name__}: {exc}"
             )
-            if channel in {"url", "url-scaled"}:
+            if channel in {"url", "url-scaled"} and upload_kind in {
+                "url_unreachable",
+                "timeout",
+                "unknown",
+            }:
                 # 公网直链拿得到、腾讯却拉不到：记冷却，auto 后续直接走 bytes
                 host._note_qq_url_unsupported(exc)
+            if (
+                mode == "auto"
+                and channel in {"url", "url-scaled"}
+                and upload_kind in {"url_unreachable", "timeout", "unknown"}
+            ):
+                # 官方文档明确建议：URL 拉取失败时先下载到本地，再分片上传。
+                # 分片不依赖图床公网可达，也能保住原图，比直接压缩降级更好。
+                logger.info("qq_official URL 上传不可用，按官方建议改走分片重试")
+                try:
+                    media = await host._qq_upload_block(
+                        event, block, "bytes", None, target, max_upload
+                    )
+                except Exception as retry_exc:
+                    upload_kind = classify_qq_upload_error(retry_exc)
+                    logger.warning(
+                        f"qq_official 分片重试失败（{upload_kind}）: "
+                        f"{type(retry_exc).__name__}: {retry_exc}"
+                    )
+                    exc = retry_exc
+                else:
+                    upload_kind = ""
+            if upload_kind:
+                if upload_kind in QQ_UPLOAD_FATAL_KINDS:
+                    # 额度用完 / 禁言 / 超频：换任何通道都会失败，直接说明原因
+                    await host._qq_notify(event, target, _failure_text(exc, upload_kind))
+                    return True
+                if not sent_any and on_failure == "fallback":
+                    logger.warning(
+                        "qq_official 上传通道不可用，交回原回传逻辑（本地压缩/缩略图）"
+                    )
+                    return False
+                await host._qq_notify(event, target, _failure_text(exc, upload_kind))
+                return True
+
+        try:
+            await host._qq_post_media(event, target, content, media)
+        except Exception as exc:
+            send_kind = classify_qq_upload_error(exc)
+            logger.warning(
+                f"qq_official 媒体消息发送失败（{send_kind}，"
+                f"第 {index + 1}/{len(plan)} 张）: {type(exc).__name__}: {exc}"
+            )
+            if channel in {"url", "url-scaled"} and send_kind in {
+                "url_unreachable",
+                "timeout",
+                "unknown",
+            }:
+                # 发送阶段的 304082/304083 同样是「腾讯拉不到媒体」，后续 auto
+                # 应直接走分片，别再反复上传一个发不出去的直链
+                host._note_qq_url_unsupported(exc)
+            if (
+                mode == "auto"
+                and channel in {"url", "url-scaled"}
+                and send_kind == "url_unreachable"
+                and not sent_any
+            ):
+                # 媒体已上传但腾讯拉不到：改分片重传再发一次。此时还没有任何
+                # 图片送达，重试不会产生重复消息。
+                logger.info("qq_official 媒体拉取失败，改走分片重试")
+                try:
+                    media = await host._qq_upload_block(
+                        event, block, "bytes", None, target, max_upload
+                    )
+                    await host._qq_post_media(event, target, content, media)
+                except Exception as retry_exc:
+                    send_kind = classify_qq_upload_error(retry_exc)
+                    logger.warning(
+                        f"qq_official 分片重试发送失败（{send_kind}）: "
+                        f"{type(retry_exc).__name__}: {retry_exc}"
+                    )
+                    exc = retry_exc
+                else:
+                    sent_any = True
+                    continue
+            if send_kind in {"unknown", "timeout"}:
+                # 请求可能已经送达，只是没拿到回执；按不变量「UNKNOWN 视为
+                # 已送达」，绝不回退重发，否则用户会收到重复图片。
+                logger.warning("qq_official 媒体消息结果未知，按已送达处理，不再重发")
+                sent_any = True
+                continue
+            if send_kind in QQ_UPLOAD_FATAL_KINDS:
+                await host._qq_notify(event, target, _failure_text(exc, send_kind))
+                return True
             if not sent_any and on_failure == "fallback":
                 logger.warning(
-                    "qq_official 上传通道不可用，交回原回传逻辑（本地压缩/缩略图）"
+                    "qq_official 媒体消息明确失败，交回原回传逻辑（本地压缩/缩略图）"
                 )
                 return False
-            await host._qq_notify(
-                event, target, f"⚠️ 图片发送失败：{sanitize_error_text(detail)}"
-            )
+            await host._qq_notify(event, target, _failure_text(exc, send_kind))
             return True
         sent_any = True
     return True
+
+
+def _failure_text(exc: BaseException, kind: str) -> str:
+    """失败说明：优先给可操作的短句，未收录的类别退回脱敏后的异常摘要。"""
+    hint = qq_upload_failure_hint(kind)
+    if hint:
+        return f"⚠️ 图片发送失败：{hint}"
+    detail = sanitize_error_text(f"{type(exc).__name__}: {exc}")
+    return f"⚠️ 图片发送失败：{detail}"
 
 
 async def upload_block(
@@ -283,6 +505,7 @@ async def upload_block(
         return await host._qq_upload_via_url(event, upload_url, target)
     path = str(block.get("path") or "")
     temp = ""
+    converted = ""
     try:
         if not path:
             temp = await host.image_source.download(
@@ -294,10 +517,16 @@ async def upload_block(
             or os.path.basename(path)
             or "image.jpg"
         )
+        # 分片上传要求 file_name，且 QQ 只接受富媒体白名单格式；本地图库里的
+        # HEIC/TIFF 与「扩展名 .jpg、实为 WEBP/HEIC」都会在这里被纠正。
+        path, name, converted = await qq_safe_local_image(
+            host, path, name, max_upload
+        )
         return await host._qq_upload_via_chunked(event, path, name, target)
     finally:
         # 分片通道只为这一次上传落盘，发完即删；临时目录另有 TTL 清理兜底
         host._remove_quiet(temp)
+        host._remove_quiet(converted)
 
 
 async def upload_via_url(host, event: AstrMessageEvent, url: str, target: tuple[str, str]):
@@ -373,7 +602,7 @@ async def notify(
             "msg_type": 0,
             "content": text,
             "msg_id": message_id or None,
-            "msg_seq": random.randint(1, 10000),
+            "msg_seq": next_qq_msg_seq(),
         }
         kind, session_id = target
         if kind == "group":

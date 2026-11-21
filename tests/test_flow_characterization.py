@@ -18,7 +18,7 @@ from astrbot_plugin_image_trace import main as main_module
 from astrbot_plugin_image_trace.image_delivery import build_imgbed_file_url
 from astrbot_plugin_image_trace.library import MatchResult
 from astrbot_plugin_image_trace.random_media import RandomMediaError
-from astrbot_plugin_image_trace.search.base import SearchOutcome
+from astrbot_plugin_image_trace.search.base import SearchHit, SearchOutcome
 
 
 async def _collect(agen):
@@ -215,6 +215,40 @@ async def test_trace_hash_ai_verify_off_never_calls_provider(
 
     assert len(results) == 1
     assert "哈希比对成功" in _chain_text(results[0])
+    assert "📄" not in _chain_text(results[0]), "本地腿没有图床文件名，不该多出这一行"
+
+
+async def test_trace_hash_remote_hit_reports_image_file_name(
+    make_plugin, make_event, monkeypatch, tmp_path
+):
+    """图床哈希命中必须把图片文件名一起发出。
+
+    向量腿早就在配文里带 `payload.file_name`，哈希腿此前只有一行相似度，
+    用户拿到图却不知道是哪一张，也没法照着名字 `/原图` 反查。
+    """
+    plugin = make_plugin(basic={"ai_verify": False})
+    query = _jpeg_file(tmp_path, "query.jpg")
+    hit = SearchHit(
+        id="p-remote",
+        score=0.97,
+        url="https://bed.example.com/file/%E7%9B%B8%E5%86%8C/%E9%A3%8E%E6%99%AF.jpg",
+        file_name="【微博@某工作室】20240308-05：风景.jpg",
+        width=1024,
+        height=768,
+    )
+    monkeypatch.setattr(plugin, "_merged_hash_candidates", lambda *_a, **_k: ([hit], []))
+
+    results = await _collect(
+        plugin._trace_hash(
+            make_event(""),
+            _image_segment(),
+            resolved=main_module.ResolvedImage(path=str(query), mime="image/jpeg"),
+        )
+    )
+
+    text = _chain_text(results[-1])
+    assert "哈希比对成功" in text
+    assert "【微博@某工作室】20240308-05：风景.jpg" in text
 
 
 # ----------------------------------------------------------------------

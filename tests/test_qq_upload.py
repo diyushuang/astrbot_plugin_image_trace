@@ -636,3 +636,233 @@ async def test_fixed_url_channel_ignores_cooldown(make_plugin, make_event, monke
     )
 
     assert seen["channel"] == "url"
+
+
+# ----------------------------------------------------------------------
+# 官方错误码归因与失败处置
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("code=40093002 超过今天发送文件容量上限", "quota"),
+        ("HTTP 400 (code=850018, 群被禁言)", "muted"),
+        ("不支持的文件格式 (code=850019)", "unsupported"),
+        ("下载原始文件失败 (code=850026)", "url_unreachable"),
+        ("上传文件超过大小限制 (code=850031)", "too_large"),
+        ("304082 upload media info fail", "url_unreachable"),
+        ("304083 convert media info fail", "url_unreachable"),
+        ("msg limit exceed (code=22009)", "rate_limit"),
+        ("请求超时 timeout", "timeout"),
+        ("something unexpected", "unknown"),
+    ],
+)
+def test_classify_qq_upload_error(message, expected):
+    """官方业务错误码优先于文案；两者都认不出时归为 unknown。"""
+    from astrbot_plugin_image_trace.image_delivery import classify_qq_upload_error
+
+    assert classify_qq_upload_error(RuntimeError(message)) == expected
+
+
+async def test_auto_url_failure_retries_with_chunked(
+    make_plugin, make_event, monkeypatch
+):
+    """auto 下 URL 上传失败（腾讯拉不到）时按官方建议改走分片，而不是直接降级。"""
+    plugin = make_plugin(
+        qq_upload={"mode": "auto"},
+        random_media={"base_url": "https://img.example.com"},
+    )
+    event, api = _qq_event(make_event)
+    monkeypatch.setattr(plugin, "_qq_block_size", _size(8 * MB))
+
+    channels: list[str] = []
+
+    async def fake_upload(_event, _block, channel, *_args):
+        channels.append(channel)
+        if channel == "url":
+            raise RuntimeError("304082 upload media info fail")
+        return "MEDIA"
+
+    monkeypatch.setattr(plugin, "_qq_upload_block", fake_upload)
+
+    handled = await plugin._qq_upload_takeover(
+        event, "标题", [{"url": "https://img.example.com/file/a.jpg"}]
+    )
+
+    assert handled is True
+    assert channels == ["url", "bytes"], "URL 拉取失败应改分片重试，而不是回退压缩"
+    assert api.calls[0][1]["msg_type"] == 7
+    assert plugin._qq_url_cooling() is True
+
+
+async def test_auto_send_media_pull_failure_retries_with_chunked(
+    make_plugin, make_event, monkeypatch
+):
+    """发送阶段 304082（腾讯拉不到媒体）也改分片重传：此时还没有图送达。"""
+    plugin = make_plugin(
+        qq_upload={"mode": "auto"},
+        random_media={"base_url": "https://img.example.com"},
+    )
+    event, _api = _qq_event(make_event)
+    monkeypatch.setattr(plugin, "_qq_block_size", _size(8 * MB))
+
+    channels: list[str] = []
+    posted: list[str] = []
+
+    async def fake_upload(_event, _block, channel, *_args):
+        channels.append(channel)
+        return f"MEDIA-{channel}"
+
+    async def fake_post(_event, _target, _content, media):
+        if media == "MEDIA-url":
+            raise RuntimeError("304082 upload media info fail")
+        posted.append(media)
+
+    monkeypatch.setattr(plugin, "_qq_upload_block", fake_upload)
+    monkeypatch.setattr(plugin, "_qq_post_media", fake_post)
+
+    handled = await plugin._qq_upload_takeover(
+        event, "标题", [{"url": "https://img.example.com/file/a.jpg"}]
+    )
+
+    assert handled is True
+    assert channels == ["url", "bytes"]
+    assert posted == ["MEDIA-bytes"]
+
+
+async def test_quota_error_notifies_instead_of_fallback(
+    make_plugin, make_event, monkeypatch
+):
+    """额度用完/禁言/超频换任何通道都会失败：直接说明原因，不做无谓回退。"""
+    plugin = make_plugin(
+        qq_upload={"mode": "auto", "on_failure": "fallback"},
+        random_media={"base_url": "https://img.example.com"},
+    )
+    event, api = _qq_event(make_event)
+    monkeypatch.setattr(plugin, "_qq_block_size", _size(8 * MB))
+
+    async def quota(*_args, **_kwargs):
+        raise RuntimeError("code=40093002 超过今天发送文件容量上限")
+
+    monkeypatch.setattr(plugin, "_qq_upload_block", quota)
+
+    handled = await plugin._qq_upload_takeover(
+        event, "标题", [{"url": "https://img.example.com/file/a.jpg"}]
+    )
+
+    assert handled is True
+    kind, payload = api.calls[0]
+    assert kind == "group"
+    assert payload["msg_type"] == 0
+    assert "额度已用完" in payload["content"]
+    assert "40093002" not in payload["content"], "错误码与内部细节只进日志"
+
+
+async def test_post_timeout_is_treated_as_delivered(
+    make_plugin, make_event, monkeypatch
+):
+    """媒体消息发送超时：请求可能已达 QQ，按已送达处理，绝不重发。"""
+    plugin = make_plugin(qq_upload={"mode": "bytes"})
+    event, api = _qq_event(make_event)
+
+    async def fake_upload(*_args, **_kwargs):
+        return "MEDIA"
+
+    async def timeout(*_args, **_kwargs):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(plugin, "_qq_upload_block", fake_upload)
+    monkeypatch.setattr(plugin, "_qq_post_media", timeout)
+
+    handled = await plugin._qq_upload_takeover(
+        event, "标题", [{"url": "https://a/b.jpg"}]
+    )
+
+    assert handled is True
+    assert api.calls == [], "结果未知时既不能回退重发，也不能再补一条失败说明"
+
+
+async def test_chunked_upload_uses_content_matched_filename(
+    make_plugin, make_event, monkeypatch, tmp_path
+):
+    """本地图扩展名与内容不符时，分片上传的 file_name 按真实格式纠正。"""
+    from PIL import Image as PILImage
+
+    source = tmp_path / "actually_png.jpg"
+    PILImage.new("RGB", (4, 4), (10, 20, 30)).save(source, format="PNG")
+
+    plugin = make_plugin(qq_upload={"mode": "bytes"})
+    event, api = _qq_event(make_event)
+    seen: dict = {}
+
+    async def fake_chunked(_event, path, name, _target):
+        seen["path"] = path
+        seen["name"] = name
+        return "MEDIA"
+
+    monkeypatch.setattr(plugin, "_qq_upload_via_chunked", fake_chunked)
+
+    handled = await plugin._qq_upload_takeover(
+        event, "", [{"path": str(source), "file_name": "actually_png.jpg"}]
+    )
+
+    assert handled is True
+    assert seen["name"].endswith(".png")
+    assert seen["path"] == str(source)
+    assert api.calls[0][1]["msg_type"] == 7
+
+
+async def test_chunked_upload_transcodes_unsafe_local_format(
+    make_plugin, make_event, monkeypatch, tmp_path
+):
+    """HEIC 等白名单外格式先转码 JPEG，再交分片上传，转码临时文件用后即删。"""
+    source = tmp_path / "photo.heic"
+    source.write_bytes(b"\x00\x00\x00\x18ftypheic" + b"\x00" * 32)
+    converted = tmp_path / "qqsafe_test.jpg"
+    converted.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 32)
+
+    plugin = make_plugin(qq_upload={"mode": "bytes"})
+    event, _api = _qq_event(make_event)
+    seen: dict = {}
+
+    def fake_transcode(_data):
+        return str(converted)
+
+    async def fake_chunked(_event, path, name, _target):
+        seen["path"] = path
+        seen["name"] = name
+        return "MEDIA"
+
+    monkeypatch.setattr(plugin, "_write_transcoded_jpeg", fake_transcode)
+    monkeypatch.setattr(plugin, "_qq_upload_via_chunked", fake_chunked)
+
+    handled = await plugin._qq_upload_takeover(
+        event, "", [{"path": str(source), "file_name": "photo.heic"}]
+    )
+
+    assert handled is True
+    assert seen["path"] == str(converted)
+    assert seen["name"].endswith(".jpg")
+    assert not converted.exists(), "转码临时文件必须在上传结束后删除"
+
+
+def test_cap_media_blocks_truncates_with_note():
+    """超过官方 5 次被动回复上限的图片被截断，并在末张配文里说明。"""
+    from astrbot_plugin_image_trace.delivery.qq_upload import cap_qq_media_blocks
+
+    blocks = [{"url": f"https://a/{index}.jpg"} for index in range(7)]
+    capped, note = cap_qq_media_blocks(blocks)
+
+    assert len(capped) == 5
+    assert "另有 2 张未发送" in note
+    assert all("text" not in block for block in blocks), "不得污染调用方传入的 block"
+
+
+def test_next_qq_msg_seq_avoids_adapter_default():
+    """msg_seq 从 2 开始递增，避开 AstrBot 适配器默认使用的 1。"""
+    from astrbot_plugin_image_trace.delivery.qq_upload import next_qq_msg_seq
+
+    values = [next_qq_msg_seq() for _ in range(5)]
+    assert 1 not in values
+    assert values == sorted(values)

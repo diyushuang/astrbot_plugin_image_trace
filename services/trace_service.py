@@ -99,10 +99,17 @@ class TraceService:
     async def _hash_hit_result(self, event: AstrMessageEvent, best) -> AsyncGenerator:
         """把一条哈希命中渲染成回复（本地腿与图床腿共用）。
 
-        聊天里只留「哈希比对成功 + 相似度」一行；编号、备注、尺寸、入库时间
-        与直链全部写日志，避免刷屏。
+        聊天里只留「哈希比对成功 + 相似度」，命中图床图时再补一行图片文件名；
+        编号、备注、尺寸、入库时间与直链全部写日志，避免刷屏。
+
+        图床腿的 `file_name` 是入库时登记的**原始名**（`@`、中文冒号完好），
+        用户看到名字才能核对是哪一张，也能直接 `/原图 <文件名>` 反查。本地腿
+        没有该字段（为空），保持原样不多一行。
         """
         title = f"✅ 哈希比对成功，相似度 {best.similarity * 100:.1f}%"
+        file_name = str(getattr(best, "file_name", "") or "").strip()
+        name_line = f"\n📄 {file_name}" if file_name else ""
+        title = f"{title}{name_line}"
         logger.info(
             "哈希比对命中 #%s 相似度 %.1f%% 名称=%s 尺寸=%sx%s 入库=%s 直链=%s 本地=%s",
             best.id,
@@ -115,6 +122,10 @@ class TraceService:
             best.file_path or "-",
         )
         block: dict = {}
+        if file_name:
+            # 顺带交给投递层：_remember_blocks 会用它作为 /原图 历史的展示名，
+            # 于是 /原图 <真名> 在哈希命中后同样可用
+            block["file_name"] = file_name
         if best.width and best.height:
             # 供回传计划判断是否需要图床缩放，以及压缩标识是否成立
             block["width"] = best.width
@@ -135,7 +146,9 @@ class TraceService:
                 f"哈希命中 #{best.id} 的原图不可用: "
                 f"{best.file_path or best.image_url or '未知路径'}"
             )
-            yield event.plain_result(f"{title}（原图不可用）")
+            yield event.plain_result(
+                f"✅ 哈希比对成功，相似度 {best.similarity * 100:.1f}%（原图不可用）{name_line}"
+            )
 
     async def _vector_search_one(self, event, seg, resolved: ResolvedImage | None = None):
         """单图向量检索。返回 (kind, item)：hit / miss / nofile / error。
@@ -318,15 +331,23 @@ class TraceService:
             blocks.append(block)
         prompt_via_onebot = False
         prompt_task = None
+        delivery_header = ""
         if self.host._can_send_via_onebot(event):
             # 提示与图片并行发出：提示只走一次 call_action，串行 await 会让图片
             # 晚一个完整往返才起步。两条消息都在同一条 OneBot 连接上按顺序下发，
             # 提示先入队，正常情况下仍先到达。
             prompt_task = asyncio.create_task(self.host._send_prompt(event, header))
+        elif self.host._delivery_target(event).offbox_upload:
+            # QQ 官方机器人被动回复有次数上限（每个 msg_id 最多 5 条）：把标题
+            # 并进首张图的消息正文，少占一条回复；接管通道会按「首图 content」
+            # 原样发送，回退链也会把标题拼在同一条消息里。
+            delivery_header = header
         else:
             yield event.plain_result(header)
         try:
-            async for result in self.host._yield_delivery(event, "", blocks, mark_compressed=True):
+            async for result in self.host._yield_delivery(
+                event, delivery_header, blocks, mark_compressed=True
+            ):
                 yield result
             if prompt_task is not None:
                 # 只为 stop_event 决策等待提示结果；图片可能已经交付，不再回滚。

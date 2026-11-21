@@ -103,7 +103,7 @@ flowchart TD
 | `planner.py` | 纯函数 `plan_delivery`：把请求 + 平台画像 + 配置折算成候选步骤 |
 | `service.py` | `DeliveryService.deliver`：事件去重 → offbox 前置 → 计划 → 选通道 → 执行 → 记账 |
 | `channels.py` | `OneBotChannel`（URL / 压缩字节）、`QQOfficialChannel`（体检 + 上传接管）、`ChainChannel`（标准消息链） |
-| `qq_upload.py` | QQ 官方上传通道：会话目标解析、公网直链换源、URL/分片上传与接管编排 |
+| `qq_upload.py` | QQ 官方上传通道：会话目标解析、公网直链换源、URL/分片上传与接管编排、官方错误码归因、分片前格式纠正与被动回复上限截断 |
 | `primitives.py` | 字节级 / 消息段级原语：OneBot 直发、本地压缩、URL 计划、配文与 @ 前缀 |
 
 投递层集中保证五条不变量：同一事件只投递一次，`UNKNOWN` / 超时按已送达、绝不重发；只有明确 `failed` 才换通道；「已压缩」配文只按实测证据写入；临时文件无论成功 / 失败 / 生成器关闭都清理；QQ 官方接管已发图后不再交回。

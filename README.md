@@ -5,7 +5,7 @@
 
 **群聊里随手转发的一张图，一键找回它的原图。**
 
-[![version](https://img.shields.io/badge/version-1.8.1-blue?style=flat-square)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.8.2-blue?style=flat-square)](./CHANGELOG.md)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4?style=flat-square)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat-square)](./LICENSE)
@@ -170,6 +170,14 @@ flowchart LR
 | `delivery.qq_on_failure` | `fallback` | 通道失败后 `fallback`=一张都没发出时交回本地压缩/缩略图降级链；`notify`=不交回，回一条文字说明（两种取值下，本批已发过图片都不再回交） |
 
 通道名两平台通用：`auto`=自动；`native`=不加工交给适配器；`bytes`=本机处理成字节再上传（QQ 官方为分片）；`url`=直链交平台下载原图；`url-scaled`=直链交平台下载缩放版。旧写法 `local-compress` / `scaled-url` / `original-url` / `direct` / `chunked` 自动映射为 `auto` / `url-scaled` / `url` / `native` / `bytes`。
+
+> [!NOTE]
+> **QQ 官方机器人上传限制**（据官方《富媒体消息》《发送消息》文档）：
+> - 二进制直传 ≤ **5MB**（base64 再膨胀 4/3，故 `auto` 的 `native` 阈值默认 **3MB**）；URL 上传软限 **20MB**，超过会被平台降级成「文件」；分片上传硬限 **200MB**。
+> - `auto` 按体积自动选路；URL 上传失败（304082/304083/850026/超时）会按官方建议**下载到本地改分片重试**，不会直接降级成压缩图。
+> - 仅 `jpg` / `png` / `gif` / `webp` / `bmp` 会直接展示；HEIC/AVIF/TIFF/SVG 等本地文件在分片前会先转 JPEG，`file_name` 扩展名也按真实内容纠正。
+> - 额度用完（40093002）、被禁言（850018）、发送超频（22009）等错误直接回文字说明，不做无谓重试；单次回传超过 **5 张**会截断并在标题提示（官方规定每个 msg_id 最多回复 5 次）。
+> - 视频仅支持 `mp4`；`/随机视频` 抽到其它容器时改发文件卡片。
 
 </details>
 

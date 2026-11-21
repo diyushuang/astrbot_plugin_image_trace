@@ -10,11 +10,10 @@
 
 from __future__ import annotations
 
-import random
-
 import astrbot.api.message_components as Comp
 
 from ..image_delivery import CompressionEvidence, SendOutcome
+from .qq_upload import cap_qq_media_blocks, next_qq_msg_seq
 from .types import DeliveryContext, DeliveryResult
 
 
@@ -79,12 +78,18 @@ class QQOfficialChannel:
         self._host = host
 
     async def run_offbox(self, ctx: DeliveryContext) -> tuple[list[dict], bool]:
-        """先改写信封（可能换成本地转码 path），再由上传通道决定 URL/分片。"""
+        """先按官方回复上限截断，再改写信封，最后由上传通道决定 URL/分片。"""
         host = self._host
-        blocks = await host._offbox_rewrite_blocks(ctx.request.blocks)
+        capped, cap_note = cap_qq_media_blocks(ctx.request.blocks)
+        header = ctx.request.header
+        if cap_note:
+            # 提示并进标题：向量路径随后会重写逐图配文，写进 block 会被覆盖
+            header = f"{header}\n{cap_note}" if header else cap_note
+            ctx.request.header = header
+        blocks = await host._offbox_rewrite_blocks(capped)
         handled = await host._qq_upload_takeover(
             ctx.event,
-            ctx.request.header,
+            header,
             blocks,
             mark_compressed=ctx.request.mark_compressed,
         )
@@ -101,7 +106,7 @@ class QQOfficialChannel:
             "media": media,
             "content": content or None,
             "msg_id": message_id or None,
-            "msg_seq": random.randint(1, 10000),
+            "msg_seq": next_qq_msg_seq(),
         }
         kind, session_id = target
         if kind == "group":

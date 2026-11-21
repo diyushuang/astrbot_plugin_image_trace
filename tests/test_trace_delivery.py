@@ -125,6 +125,39 @@ async def test_trace_sends_prompt_then_one_message_with_all_images(
     assert len(_chain_images(gallery)) == 3, "三张相似图必须在同一条消息里"
 
 
+async def test_qq_official_merges_hit_prompt_into_first_media(
+    make_plugin, make_event, monkeypatch, vector_stub
+):
+    """QQ 官方被动回复次数有限：命中提示并进首图正文，不再单发一条。
+
+    接管通道把 header 放在第一张图的 content；这样「提示 + N 张图」只占
+    N 条回复，而不是 N+1 条，避免撞上官方「每个 msg_id 最多回复 5 次」。
+    """
+    plugin = vector_stub(make_plugin(search_engine="vector"))
+    _install_hits(monkeypatch, plugin, _hits("a.jpg", "b.jpg"))
+    captured: dict = {}
+
+    async def passthrough(blocks):
+        return blocks
+
+    async def fake_takeover(_event, header, blocks, **_kwargs):
+        captured["header"] = header
+        captured["blocks"] = blocks
+        return True
+
+    monkeypatch.setattr(plugin, "_offbox_rewrite_blocks", passthrough)
+    monkeypatch.setattr(plugin, "_qq_upload_takeover", fake_takeover)
+
+    event = make_event(
+        "/溯源", origin="q1", platform="qq_official", chain=[_image_segment()]
+    )
+    results = await _collect(plugin.trace(event))
+
+    assert results == [], "接管通道自行发消息，不应再有独立的纯文本提示"
+    assert "向量比对成功" in captured["header"]
+    assert len(captured["blocks"]) == 2
+
+
 async def test_gallery_message_does_not_repeat_the_hit_prompt(
     make_plugin, make_event, monkeypatch, vector_stub
 ):

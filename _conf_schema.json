@@ -160,13 +160,13 @@
         ],
         "default": "auto",
         "obvious_hint": true,
-        "hint": "本平台用哪条通道上传。auto=小图 native、中大图 url、其余 bytes；native=关闭本功能，交回原生回传。"
+        "hint": "本平台用哪条通道上传。auto=按官方限制自动选路（≤3MB 走 native 直传；≤20MB 且有公网直链走 url；更大或直链不可用走 bytes 分片）；native=关闭本功能，交回原生回传（>5MB 原图会失败）。"
       },
       "qq_native_max_mb": {
         "description": "【选填】native 体积上限（MB）",
         "type": "int",
         "default": 3,
-        "hint": "auto 下不超过该体积走 native。二进制直传硬限 5MB、base64 膨胀 4/3，故默认 3；0=从不走 native。"
+        "hint": "auto 下不超过该体积走 native。官方二进制直传硬限 5MB、base64 再膨胀 4/3，故默认 3；0=从不走 native。"
       },
       "qq_auto_prefer": {
         "description": "【选填】auto 在 native 之外的偏好",
@@ -182,13 +182,13 @@
         "description": "【选填】直链通道体积上限（MB）",
         "type": "int",
         "default": 20,
-        "hint": "超过该体积会被平台降级为文件；0=不限制。"
+        "hint": "官方 URL 上传软限 20MB；超过该体积会被平台降级成文件卡片。0=不限制。"
       },
       "qq_max_upload_mb": {
         "description": "【选填】分片通道下载上限（MB）",
         "type": "int",
         "default": 100,
-        "hint": "bytes 通道先把原图下到本地，此限独立于「限制与缓存」里的单图上限。"
+        "hint": "bytes 通道先把原图下到本地再分片；官方分片硬限 200MB，此限独立于「限制与缓存」里的单图上限。"
       },
       "qq_on_failure": {
         "description": "【选填】通道失败后的处理",
@@ -198,7 +198,7 @@
           "notify"
         ],
         "default": "fallback",
-        "hint": "fallback=交回原生回传（压缩/缩略图）；notify=只回一条文字说明。本批已发出图片时不回交。"
+        "hint": "fallback=交回原生回传（压缩/缩略图）；notify=只回一条文字说明。额度用完/被禁言/发送超频/无权限这几类错误换通道也必然失败，始终只回文字说明。本批已发出图片时不回交。"
       }
     }
   },

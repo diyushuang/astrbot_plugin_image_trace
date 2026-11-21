@@ -6,7 +6,8 @@
 
 from __future__ import annotations
 
-from urllib.parse import unquote
+import os
+from urllib.parse import unquote, urlsplit
 
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
@@ -15,6 +16,7 @@ from astrbot.api.event import AstrMessageEvent
 from ..common import sanitize_error_text
 from ..image_delivery import build_original_url, upgrade_to_https
 from ..random_media import (
+    VIDEO_EXTENSIONS,
     RandomMediaError,
     clean_display_name,
     is_thumbnail_url,
@@ -22,6 +24,20 @@ from ..random_media import (
     pick_default_directory,
     swap_url_origin,
 )
+
+
+def _offbox_video_needs_file_fallback(url: str) -> bool:
+    """QQ 官方富媒体只收 MP4：已知是其它视频容器时按文件发送，避免必败。
+
+    只有扩展名能明确识别、且不是 .mp4 时才返回真；没有扩展名（图床直链
+    常见）时交给 QQ 自己尝试转码，不提前降级。
+    """
+    try:
+        path = unquote(urlsplit(str(url or "")).path).lower()
+    except ValueError:
+        return False
+    suffix = os.path.splitext(path)[1]
+    return bool(suffix) and suffix in VIDEO_EXTENSIONS and suffix != ".mp4"
 
 
 class RandomService:
@@ -65,6 +81,26 @@ class RandomService:
             if target.offbox_upload:
                 send_url = self.host._public_media_url(media_url, settings) or media_url
             caption = self.host._random_caption(media_url, "video", settings)
+            if target.offbox_upload and _offbox_video_needs_file_fallback(send_url):
+                # 官方文档：视频只支持 mp4。其它容器原样发必被打回，改发文件卡片
+                # 至少能让用户拿到内容；文件名沿用清洗后的原名（含扩展名）。
+                name = (
+                    clean_display_name(send_url)
+                    or os.path.basename(unquote(urlsplit(send_url).path))
+                    or "随机视频"
+                )
+                logger.info(
+                    f"qq_official 视频不是 MP4，改按文件发送: {send_url}"
+                )
+                yield event.chain_result(
+                    [
+                        Comp.Plain(
+                            f"{caption}\n⚠️ QQ 官方机器人仅支持 MP4 视频，已按文件发送"
+                        ),
+                        Comp.File(name=name, url=send_url),
+                    ]
+                )
+                return
             yield event.chain_result([Comp.Plain(caption), Comp.Video.fromURL(send_url)])
             return
         if kind == "image":

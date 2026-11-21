@@ -1172,6 +1172,36 @@ async def test_random_video_lan_mode_uses_lan_url_for_aiocqhttp(
     assert videos[0].url.startswith(imgbed.base_url)
 
 
+async def test_random_video_non_mp4_falls_back_to_file_for_qq_official(
+    make_plugin, make_event
+):
+    """QQ 官方只支持 MP4：抽到其它容器时按文件发送，避免必然失败的视频上传。"""
+    import types
+
+    from astrbot.api.message_components import File, Video
+
+    plugin = make_plugin(
+        random_media={"base_url": "https://img.example.com"},
+        image_delivery={"mode": "original-url"},
+    )
+
+    async def fake_fetch(_directory, _content_type):
+        return "https://img.example.com/file/clip.mov"
+
+    plugin._random_media_client = types.SimpleNamespace(fetch=fake_fetch)
+
+    results = await _collect(
+        plugin.random_video(make_event("/随机视频", origin="q1", platform="qq_official"))
+    )
+
+    assert len(results) == 1
+    chain = results[0].chain
+    assert not any(isinstance(seg, Video) for seg in chain)
+    files = [seg for seg in chain if isinstance(seg, File)]
+    assert len(files) == 1
+    assert files[0].url == "https://img.example.com/file/clip.mov"
+
+
 async def test_random_image_mention_prefix_only_on_aiocqhttp(
     make_plugin, imgbed, make_event
 ):
