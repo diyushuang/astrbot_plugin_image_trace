@@ -15,7 +15,7 @@ from astrbot.api.event import AstrMessageEvent
 
 from ..checkin_card import DEFAULT_QUOTES
 from ..common import sanitize_error_text
-from ..random_media import clean_display_name
+from ..random_media import clean_display_name, is_thumbnail_url
 
 
 class CheckinService:
@@ -51,8 +51,33 @@ class CheckinService:
         轻量模式的正文也只留 header / simple_text，不再拼 💬 那一行。
         """
         show_quote = bool(settings.get("show_quote", True))
+        # 历史记的是「原图直链」；但映射表/Qdrant 若缺 image_url，weibo_service
+        # 会退化成 thumb_url，签到就会「图发出去了，/原图 历史里却没有这张」。
+        # 这里在入库前先反查回原图；反查失败仍交给 _remember_blocks 跳过并打
+        # INFO，至少日志能证明「本次确实没记上」，而不是让 /原图 静默拿走更早
+        # 的另一张图。
+        remember_url = original_url
+        remember_name = block_name
+        if remember_url and is_thumbnail_url(remember_url):
+            resolved_name, resolved_url = await self.host._original_from_thumbnail(
+                remember_url
+            )
+            if resolved_url:
+                remember_url = resolved_url
+                remember_name = resolved_name or remember_name
+                logger.info(
+                    "签到原图直链是缩略图，已反查回原图再记历史: "
+                    f"{original_url} -> {resolved_url}"
+                )
+            else:
+                logger.warning(
+                    "签到原图直链是缩略图且反查失败，本次不写入 /原图 历史: "
+                    f"{original_url}"
+                )
         remember = (
-            [{"url": original_url, "file_name": block_name}] if original_url else []
+            [{"url": remember_url, "file_name": remember_name}]
+            if remember_url
+            else []
         )
         if settings["render_mode"] == "card":
             source = card_source if settings["image_mode"] == "thumbnail" else ""

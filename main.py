@@ -687,6 +687,11 @@ class ImageTracePlugin(Star):
         缩略图，此后 /原图 只能拿回那张 720px 小图。/随机图 的发送路径本就
         通过 remember_blocks 传入原图（见 _random_media_delivery），这里是
         第二道闸，保证任何调用点都不会把替身写进历史。
+
+        但「跳过」不能静默：线上排查「/原图 为什么拿到更早的另一张图」时，
+        这条 INFO 是唯一能证明「本次签到/随机图根本没进历史」的证据。签到这类
+        上游原图直链缺失、只能退到缩略图的场景，已在 `_deliver_checkin` 里先
+        反查回原图再记（见 services/checkin_service.py）。
         """
         session = self._session_key(event)
         for block in blocks:
@@ -694,7 +699,10 @@ class ImageTracePlugin(Star):
             if not url:
                 continue
             if is_thumbnail_url(url):
-                logger.debug(f"跳过缩略图直链，不计入 /原图 历史: {url}")
+                logger.info(
+                    "跳过缩略图直链，不计入 /原图 历史"
+                    f"（上游未提供原图直链）: {url}"
+                )
                 continue
             self.history.remember(
                 session, url, display_name=clean_display_name(block.get("file_name"))
@@ -1339,6 +1347,34 @@ class ImageTracePlugin(Star):
                 return base
         base = str(dict_group(self.config, "random_media").get("base_url") or "").strip().rstrip("/")
         return base if base.lower().startswith(("http://", "https://")) else ""
+
+    @classmethod
+    def _quoted_image_candidates(cls, event: AstrMessageEvent) -> list[str]:
+        """取被引用消息链里的图片原始直链/文件名（只读 `Reply.chain`）。
+
+        与 `_first_image_candidate` 的分工：那个把本条消息与被引用消息混在一起，
+        只适合「历史为空时随便找一张图」的兜底；`/原图` 必须区分两者——用户
+        引用了一张图时，目标应当是那张引用图，而不是本条消息或群历史里的图。
+
+        同一图片段同时带 `url` 与 `file` 时两个都返回（顺序 url → file）：QQ 等
+        平台常把 `url` 转存到自己的 CDN、只把可用的裸文件名留在 `file`，调用方
+        需要对两个候选都试一次才能覆盖这种形态。
+        """
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for seg in event.message_obj.message or []:
+            if not isinstance(seg, Comp.Reply):
+                continue
+            for sub in getattr(seg, "chain", None) or []:
+                if not isinstance(sub, Comp.Image):
+                    continue
+                for field in ("url", "file"):
+                    raw = str(getattr(sub, field, None) or "").strip()
+                    if not raw or not media_filename(raw) or raw in seen:
+                        continue
+                    seen.add(raw)
+                    candidates.append(raw)
+        return candidates
 
     @classmethod
     def _first_image_candidate(cls, event: AstrMessageEvent) -> str:

@@ -8,7 +8,7 @@ from unittest.mock import patch
 from urllib.parse import quote, unquote
 
 import pytest
-from astrbot.api.message_components import Image
+from astrbot.api.message_components import Image, Reply
 from PIL import Image as PILImage
 
 from astrbot_plugin_image_trace.features import compute_features, heif_available
@@ -220,6 +220,92 @@ async def test_original_image_falls_back_to_quoted_image_name(
     images = _chain_images(results[0])
     assert len(images) == 1
     assert images[0].url == f"{imgbed.base_url}/file/quoted.jpg"
+
+
+async def test_original_image_prefers_quoted_image_over_session_history(
+    make_plugin, imgbed, make_event
+):
+    """引用图优先级高于群历史——线上「/原图 发出深蓝、引用图却是赵今麦」的根因。
+
+    历史是群级共享的「最近一次机器人发图」，很容易是别人触发的另一张图。
+    用户明确引用一张图后，/原图 必须锁定这张引用图，而不是拿历史顶替。
+    """
+    plugin = make_plugin(random_media={"base_url": imgbed.base_url})
+    origin = "g1"
+    plugin.history.remember(
+        origin,
+        f"{imgbed.base_url}/file/history.jpg",
+        display_name="history.jpg",
+    )
+    event = make_event(
+        "/原图",
+        origin=origin,
+        chain=[Reply(chain=[Image.fromURL(f"{imgbed.base_url}/file/quoted.jpg")])],
+    )
+
+    results = await _collect(plugin.original_image(event))
+
+    images = _chain_images(results[0])
+    assert len(images) == 1, f"应发出引用图的原图，实际 {_chain_text(results[0])!r}"
+    assert images[0].url == f"{imgbed.base_url}/file/quoted.jpg"
+    assert "history.jpg" not in images[0].url
+
+
+async def test_original_image_reverses_quoted_thumbnail_over_history(
+    make_plugin, imgbed, make_event, monkeypatch
+):
+    """引用的是机器人发出的缩略图时，先反查回原图，且不退回群历史。"""
+    plugin = make_plugin(random_media={"base_url": imgbed.base_url})
+    origin = "g1"
+    thumb_url = f"{imgbed.base_url}/file/thumbnails/1789658616018_x.jpg"
+    original_url = f"{imgbed.base_url}/file/%E5%BC%95%E7%94%A8%E5%8E%9F%E5%9B%BE.jpg"
+    _stub_reverse_lookup(monkeypatch, plugin, {thumb_url: original_url})
+    plugin.history.remember(
+        origin,
+        f"{imgbed.base_url}/file/history.jpg",
+        display_name="history.jpg",
+    )
+    event = make_event(
+        "/原图",
+        origin=origin,
+        chain=[Reply(chain=[Image.fromURL(thumb_url)])],
+    )
+
+    results = await _collect(plugin.original_image(event))
+
+    images = _chain_images(results[0])
+    assert len(images) == 1, f"应发出反查到的原图，实际 {_chain_text(results[0])!r}"
+    assert images[0].url == original_url
+    assert "thumbnails" not in images[0].url
+
+
+async def test_original_image_unresolvable_quote_does_not_fall_back_to_history(
+    make_plugin, imgbed, make_event, monkeypatch
+):
+    """引用图查不到时明确报错，绝不能改发群历史里的另一张图。
+
+    退回 history 虽然「有结果」，但结果与用户引用的图无关——线上看到的
+    「原图和本身的图不匹配」正是这么来的。宁可说查不到。
+    """
+    plugin = make_plugin(random_media={"base_url": imgbed.base_url})
+    origin = "g1"
+    plugin.history.remember(
+        origin,
+        f"{imgbed.base_url}/file/history.jpg",
+        display_name="history.jpg",
+    )
+    monkeypatch.setattr(plugin, "_probe_url", _probe_missing)
+    event = make_event(
+        "/原图",
+        origin=origin,
+        chain=[Reply(chain=[Image.fromURL(f"{imgbed.base_url}/file/missing.jpg")])],
+    )
+
+    results = await _collect(plugin.original_image(event))
+
+    assert results[0].kind == "plain"
+    assert "图床里没有找到" in results[0].text
+    assert not _chain_images(results[0]), "引用图查不到时不得发出历史里的图"
 
 
 def _stub_name_lookup(monkeypatch, plugin, mapping):

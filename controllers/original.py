@@ -46,7 +46,14 @@ class OriginalController:
         )
 
     async def original_image(self, event):
-        """重发最近回传过的图片的原图；也可直接按文件名到图床取（/原图 风景.jpg）"""
+        """重发最近回传过的图片的原图；也可直接按文件名到图床取（/原图 风景.jpg）
+
+        取值优先级（无参数时）：
+        1. 被引用的那张图——用户明确引用一张图时，目标就是那张图；缩略图会先
+           反查回原图，绝不因为群历史里还有别的图就改发别的；
+        2. 本会话最近回传过的图（历史）；
+        3. 本条消息自带的图（历史为空的兜底）。
+        """
         plugin = self.plugin
         session = plugin._session_key(event)
         query = plugin._strip_command(event.message_str or "", ("原图",)).strip(" \t:：,，")
@@ -55,7 +62,7 @@ class OriginalController:
         # 引用图里的**原始**直链/名字：保留 `thumbnails/` 路径段，供缩略图判定与
         # 反查使用（反查要拼出与 Qdrant payload 同形的完整缩略图直链）
         quoted = ""
-        # 取值来源，只用于日志：历史命中 / 按名直查 / 缩略图反查。
+        # 取值来源，只用于日志：引用图 / 历史命中 / 按名直查 / 缩略图反查。
         # 线上排查时「/原图 到底走了哪条路」是最关键的一条信息，而历史命中
         # 这条最常见、却原本一行日志都不打，导致日志里完全看不到命令执行过。
         source = "history"
@@ -80,13 +87,38 @@ class OriginalController:
                 # 于是「用户给足了信息反而查不到」。前者原地剥前缀、保住目录。
                 query = strip_leading_decoration(query) or query
         else:
-            latest = plugin.history.latest(session)
-            if latest is not None:
-                name, url = latest
-            else:
-                # 会话里没有回传记录：退化为「按消息/引用图里的文件名直查图床」
-                quoted = plugin._first_image_candidate(event)
-                query = clean_display_name(quoted) or ""
+            # 无参数：引用图优先。引用图存在时不再回退历史——历史是群级共享的
+            # 「最近一次机器人发图」，很容易是别人触发/另一条消息的图；用户
+            # 明确引用了某张图却拿到另一张，比明确报「查不到」更糟。
+            quoted_candidates = plugin._quoted_image_candidates(event)
+            last_message = ""
+            for raw in quoted_candidates:
+                lookup_name = clean_display_name(raw) or ""
+                if not lookup_name:
+                    continue
+                name, url, message = await plugin._lookup_imgbed_file(
+                    lookup_name, quoted=raw
+                )
+                if url:
+                    quoted = raw
+                    source = "quoted"
+                    break
+                last_message = message
+            if quoted_candidates and not url:
+                yield event.plain_result(
+                    last_message
+                    or "引用图里没有可识别的文件名，无法反查原图；"
+                    "请改用 /原图 <文件名> 或先 /溯源 命中该图。"
+                )
+                return
+            if not url:
+                latest = plugin.history.latest(session)
+                if latest is not None:
+                    name, url = latest
+                else:
+                    # 会话里没有回传记录：退化为「按消息/引用图里的文件名直查图床」
+                    quoted = plugin._first_image_candidate(event)
+                    query = clean_display_name(quoted) or ""
 
         if not url:
             if not query:

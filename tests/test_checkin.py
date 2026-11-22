@@ -306,6 +306,49 @@ async def test_weibo_candidate_original_mode_ignores_local_thumb(make_plugin):
     assert send_url.endswith("/file/thumb.jpg")
 
 
+async def test_checkin_resolves_thumbnail_original_before_remember(
+    make_plugin, make_event, monkeypatch
+):
+    """映射表缺 image_url 时签到只剩缩略图直链：记历史前必须先反查回原图。
+
+    否则 /原图 历史里根本没有这次签到，用户引用签到图发 /原图 时只能拿到
+    群里更早的另一张图——线上「原图和本身的图不匹配」的第二条成因。
+    """
+    plugin = make_plugin(checkin={"render_mode": "simple", "show_quote": False})
+    settings = plugin._checkin_settings()
+    thumb = "https://img.example.com/file/thumbnails/1789658616018_签到.jpg"
+    original = "https://img.example.com/file/12%E3%80%81%E5%8E%9F%E5%9B%BE.jpg"
+    seen = []
+
+    async def fake_reverse(ref):
+        seen.append(ref)
+        return "签到原图.jpg", original
+
+    monkeypatch.setattr(plugin, "_original_from_thumbnail", fake_reverse)
+
+    captured = {}
+
+    async def fake_deliver(event, text, blocks, **kwargs):
+        captured["blocks"] = blocks
+        captured["remember"] = kwargs.get("remember_blocks")
+        if False:  # pragma: no cover - 让函数成为异步生成器
+            yield None
+
+    monkeypatch.setattr(plugin, "_yield_delivery", fake_deliver)
+
+    event = make_event("/签到", origin="g1")
+    async for _ in plugin.services.checkin._deliver_checkin(
+        event, "header", "", "footer", thumb, thumb, "签到.jpg", settings
+    ):
+        pass
+
+    assert seen == [thumb], "应拿缩略图直链去反查，而不是直接记历史"
+    assert captured["blocks"][0]["url"] == thumb, "展示仍用缩略图，不应改发送图"
+    assert captured["remember"] == [
+        {"url": original, "file_name": "签到原图.jpg"}
+    ], "历史必须记反查后的原图直链"
+
+
 async def test_checkin_flow_uses_builtin_quote_when_library_raises(
     make_plugin, make_event, monkeypatch
 ):
