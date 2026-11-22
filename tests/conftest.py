@@ -65,9 +65,10 @@ class _Image:
 
 
 class _Reply:
-    def __init__(self, chain=None, id=None):
+    def __init__(self, chain=None, id=None, message_str=""):
         self.chain = chain or []
         self.id = id
+        self.message_str = message_str
 
 
 class _Plain:

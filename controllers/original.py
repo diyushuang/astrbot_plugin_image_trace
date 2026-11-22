@@ -100,6 +100,18 @@ class OriginalController:
                     name = record.get("file_name") or clean_display_name(url) or ""
                     quoted = url
                     source = "record"
+            if not url:
+                # 标准消息链（签到卡片 native 通道等）拿不到 message_id，但
+                # 引用消息的 message_str 仍带着发送时的配文；配文记录同样能
+                # 直接查回原图，仍然不下载、不算哈希。
+                quoted_text = plugin._quoted_message_text(event)
+                if quoted_text:
+                    record = plugin.sent_messages.find_caption(session, quoted_text)
+                    if record and record.get("url"):
+                        url = record["url"]
+                        name = record.get("file_name") or clean_display_name(url) or ""
+                        quoted = url
+                        source = "record-caption"
             # 没有记录（旧消息、或该平台由 AstrBot respond stage 代发、拿不到
             # message_id）才退回引用图优先：先按文件名/缩略图反查，再按内容哈希。
             quoted_candidates = plugin._quoted_image_candidates(event)

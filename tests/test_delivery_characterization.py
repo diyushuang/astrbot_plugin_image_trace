@@ -63,6 +63,32 @@ class _IdBot(_OkBot):
 
 
 @pytest.mark.asyncio
+async def test_chain_delivery_records_caption(make_plugin, make_event, monkeypatch):
+    """标准消息链拿不到 message_id，但配文记录必须落账，供 /原图 回查。
+
+    签到卡片走 native 链正是这条路径：图片是本地 path（没有原图直链），
+    remember_blocks 里才是背景原图；通道代发后只能靠配文与引用消息对上。
+    """
+    plugin = make_plugin(image_delivery={"mode": "url"})
+    event = make_event("", platform="telegram", origin="g1")
+
+    async def fake_plan(*_args, **_kwargs):
+        return [URL_A], [CompressionEvidence.ORIGINAL]
+
+    monkeypatch.setattr(plugin, "_url_delivery_plan", fake_plan)
+    blocks = [{"url": URL_A, "file_name": "a.jpg"}]
+
+    results = [
+        item
+        async for item in plugin._yield_delivery(event, "🖼️ a.jpg（原图）", blocks)
+    ]
+
+    assert results and results[0].kind == "chain"
+    record = plugin.sent_messages.find_caption("g1", "🖼️ a.jpg（原图）")
+    assert record == {"url": URL_A, "file_name": "a.jpg"}
+
+
+@pytest.mark.asyncio
 async def test_onebot_direct_records_message_id(make_plugin, make_event):
     """OneBot send_group_msg 回执里的 message_id 要落进发送账本。"""
     plugin = make_plugin()

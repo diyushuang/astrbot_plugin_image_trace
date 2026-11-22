@@ -292,6 +292,42 @@ async def test_original_image_prefers_sent_message_record(
     assert "record.jpg" in _chain_text(results[0])
 
 
+async def test_original_image_uses_caption_record_when_message_id_missing(
+    make_plugin, imgbed, make_event
+):
+    """标准消息链拿不到 message_id 时，按引用消息的配文查发送记录。
+
+    签到卡片走 native 通道，由 AstrBot respond stage 代发，插件没有回执 ID；
+    但引用消息的 `Reply.message_str` 仍带着当时的签到配文，记录里有同一条
+    配文对应的原图。这里证明它同样优先于临时文件名/哈希。
+    """
+    plugin = make_plugin(random_media={"base_url": imgbed.base_url})
+    origin = "g1"
+    caption = "📅 Carry丶king 今日已签到 · 连续 19 天（累计 19 天）"
+    plugin.sent_messages.remember_caption(
+        origin,
+        caption,
+        [{"url": f"{imgbed.base_url}/file/checkin-record.jpg", "file_name": "checkin.jpg"}],
+    )
+    event = make_event(
+        "/原图",
+        origin=origin,
+        chain=[
+            Reply(
+                id="",
+                message_str=caption,
+                chain=[Image.fromURL(f"{imgbed.base_url}/file/card-temp.jpg")],
+            )
+        ],
+    )
+
+    results = await _collect(plugin.original_image(event))
+
+    images = _chain_images(results[0])
+    assert len(images) == 1, f"应发出配文记录里的原图，实际 {_chain_text(results[0])!r}"
+    assert images[0].url == f"{imgbed.base_url}/file/checkin-record.jpg"
+
+
 async def test_original_image_falls_back_when_record_misses(
     make_plugin, imgbed, make_event
 ):

@@ -130,6 +130,15 @@ class DeliveryService:
         # 事件上，通道只传回执 ID 与该图在 blocks 里的下标。
         with contextlib.suppress(Exception):
             event._image_trace_record_blocks = record_blocks
+
+        def remember_caption(caption: str) -> None:
+            """把本条消息实际发送的配文与本次原图块一起记账。
+
+            标准消息链拿不到 message_id 时，引用消息的 `Reply.message_str`
+            仍带着配文，可据此回查；拿得到 ID 的通道也不冲突，多一条索引。
+            """
+            host._remember_sent_caption(event, caption, record_blocks)
+
         request = DeliveryRequest(
             header=header,
             blocks=blocks,
@@ -157,6 +166,7 @@ class DeliveryService:
                     # 通道接管已自行发完消息：必须标记已发送并 stop_event，否则
                     # respond stage 会照原路（base64 直传）再发一遍
                     guard.finish_direct()
+                    remember_caption(header)
                     return
 
             mode, max_side, quality, scaled_url_style = self.delivery_config()
@@ -198,6 +208,7 @@ class DeliveryService:
                 if result.outcome != "failed":
                     # SENT 已送达；UNKNOWN 可能已送达——两者都不能再发第二次
                     guard.finish_direct()
+                    remember_caption(ctx.request.header)
                     return
                 logger.debug("OneBot URL 直发未成功（%s），继续回退", result.fallback_reason)
 
@@ -208,6 +219,7 @@ class DeliveryService:
                 if result.outcome != "failed":
                     # SENT 已送达；UNKNOWN 可能已送达——两者都不能再发第二次
                     guard.finish_direct()
+                    remember_caption(ctx.request.header)
                     return
                 # 准备失败 或 直发失败：字节路径已试过，整批改走 URL 链
                 logger.warning(
@@ -218,6 +230,7 @@ class DeliveryService:
                 result = await ChainChannel(host).deliver_bytes(ctx)
                 if result.outcome != "failed":
                     guard.mark_sent()
+                    remember_caption(result.caption or ctx.request.header)
                     yield event.chain_result(result.chain)
                     return
                 logger.warning(
@@ -241,6 +254,7 @@ class DeliveryService:
             if result.outcome == "failed":
                 return
             guard.mark_sent()
+            remember_caption(result.caption or ctx.request.header)
             yield event.chain_result(result.chain)
         finally:
             # 生成器被消费完/关闭时执行：此时消息已由 OneBot 直发或由 respond

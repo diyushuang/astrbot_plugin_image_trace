@@ -154,7 +154,7 @@ class ChainChannel:
                 chain.append(Comp.Image.fromBytes(data))
                 image_index += 1
         return DeliveryResult(
-            outcome="sent", sent_count=1, chain=chain
+            outcome="sent", sent_count=1, chain=chain, caption=fallback_header
         )
 
     async def deliver_url(self, ctx: DeliveryContext) -> DeliveryResult:
@@ -181,5 +181,5 @@ class ChainChannel:
             if block.get("url") or path:
                 image_index += 1
         return DeliveryResult(
-            outcome="sent", sent_count=1, chain=chain
+            outcome="sent", sent_count=1, chain=chain, caption=ctx.request.header
         )

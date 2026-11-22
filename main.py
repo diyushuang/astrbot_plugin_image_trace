@@ -717,6 +717,19 @@ class ImageTracePlugin(Star):
                     blocks = [record_images[block_index]]
         self.sent_messages.remember(self._session_key(event), message_id, blocks)
 
+    def _remember_sent_caption(
+        self, event: AstrMessageEvent, caption: str, blocks: list[dict]
+    ) -> None:
+        """登记「本条消息配文 → 原图」。
+
+        标准消息链由 AstrBot respond stage 代发时插件拿不到 message_id
+        （签到卡片走 native 通道正是这种），但引用消息的 ``Reply.message_str``
+        仍带着发送时的配文；配文命中同样能直接回查，不用哈希。
+        """
+        self.sent_messages.remember_caption(
+            self._session_key(event), caption, blocks
+        )
+
     def _remember_blocks(self, event: AstrMessageEvent, blocks: list[dict]) -> None:
         """把本次回传的原图直链记入会话历史，供 /原图 找回。
 
@@ -1405,6 +1418,17 @@ class ImageTracePlugin(Star):
         return ""
 
     @classmethod
+    def _quoted_message_text(cls, event: AstrMessageEvent) -> str:
+        """取被引用消息的纯文本（`Comp.Reply.message_str`），用于配文回查。"""
+        for seg in event.message_obj.message or []:
+            if not isinstance(seg, Comp.Reply):
+                continue
+            text = str(getattr(seg, "message_str", "") or "").strip()
+            if text:
+                return text
+        return ""
+
+    @classmethod
     def _quoted_image_segments(cls, event: AstrMessageEvent) -> list:
         """取被引用消息链里的图片段（只读 `Reply.chain`，保持原始顺序）。"""
         segments: list = []
@@ -1465,9 +1489,10 @@ class ImageTracePlugin(Star):
             "本会话还没有回传过图片。/原图 也可直接按文件名到图床取原图：\n"
             "· /原图 文件名 —— 直接把图床里的原图取回来（无需先回传）\n"
             "· /原图 —— 取本会话最近回传过的图片的原图\n"
-            "· 引用一张图发送 /原图 —— 优先按发图时的发送记录精确取回；"
-            "没有记录（旧消息或平台代发）时按文件名反查，文件名是平台临时名"
-            "（如 media_image_…）时再按图片内容做哈希兜底"
+            "· 引用一张图发送 /原图 —— 优先按发图时的发送记录精确取回"
+            "（消息 ID，或拿不到 ID 时按配文）；没有记录（旧消息或重启后）"
+            "时按文件名反查，文件名是平台临时名（如 media_image_…）时"
+            "再按图片内容做哈希兜底"
         )
 
     async def _reverse_original(self, fetch, *, action: str, level: str='warning') -> tuple[str, str]:

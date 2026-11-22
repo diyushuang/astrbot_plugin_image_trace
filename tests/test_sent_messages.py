@@ -64,3 +64,58 @@ def test_find_refreshes_lru_order():
 
     assert store.find("g1", "mid-1") is not None
     assert store.find("g1", "mid-2") is None
+
+
+def test_caption_record_normalizes_whitespace_and_finds():
+    store = SentMessageStore()
+    store.remember_caption(
+        "g1",
+        "🖼️  风景.jpg\n（原图）",
+        [{"url": URL, "file_name": "风景.jpg"}],
+    )
+
+    hit = store.find_caption("g1", "🖼️ 风景.jpg （原图）")
+
+    assert hit == {"url": URL, "file_name": "风景.jpg"}
+
+
+def test_caption_substring_match_tolerates_platform_wrapping():
+    """平台在引用文本前后加 `[图片]` 时，仍应唯一命中发送记录。"""
+    store = SentMessageStore()
+    store.remember_caption(
+        "g1",
+        "📅 Carry丶king 今日已签到 · 连续 19 天（累计 19 天）",
+        [{"url": URL, "file_name": "a.jpg"}],
+    )
+
+    hit = store.find_caption(
+        "g1", "[图片] 📅 Carry丶king 今日已签到 · 连续 19 天（累计 19 天）"
+    )
+
+    assert hit is not None
+    assert hit["url"] == URL
+
+
+def test_caption_ambiguous_substring_is_rejected():
+    """两条记录都能子串命中时不能猜，否则可能发出另一条消息的原图。"""
+    store = SentMessageStore()
+    store.remember_caption("g1", "签到A", [{"url": URL, "file_name": "a.jpg"}])
+    store.remember_caption("g1", "签到B", [{"url": URL, "file_name": "b.jpg"}])
+
+    assert store.find_caption("g1", "签到A 签到B") is None
+
+
+def test_caption_exact_same_key_returns_latest():
+    """同一条配文重复发送时，后一条覆盖前一条，不和自家历史打架。"""
+    store = SentMessageStore()
+    store.remember_caption("g1", "同一句", [{"url": URL, "file_name": "a.jpg"}])
+    store.remember_caption("g1", "同一句", [{"url": URL, "file_name": "b.jpg"}])
+
+    assert store.find_caption("g1", "同一句") == {"url": URL, "file_name": "b.jpg"}
+
+
+def test_caption_is_scoped_by_session():
+    store = SentMessageStore()
+    store.remember_caption("g1", "签到", [{"url": URL, "file_name": "a.jpg"}])
+
+    assert store.find_caption("g2", "签到") is None

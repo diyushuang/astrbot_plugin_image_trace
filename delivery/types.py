@@ -37,6 +37,7 @@ class DeliveryResult:
     sent_count: int = 0
     fallback_reason: str = ""
     chain: list[Any] | None = None
+    caption: str = ""
 
 
 @dataclass(frozen=True)
