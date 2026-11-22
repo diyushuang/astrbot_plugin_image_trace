@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import astrbot.api.message_components as Comp
 
 from ..image_delivery import CompressionEvidence, SendOutcome
@@ -95,8 +97,8 @@ class QQOfficialChannel:
         )
         return blocks, handled
 
-    async def post_media(self, event, target, content: str, media) -> None:
-        """发送一条 msg_type=7 的 media 消息。"""
+    async def post_media(self, event, target, content: str, media) -> Any:
+        """发送一条 msg_type=7 的 media 消息，返回平台回执。"""
         api = event.bot.api
         message_id = str(
             getattr(getattr(event, "message_obj", None), "message_id", "") or ""
@@ -110,9 +112,8 @@ class QQOfficialChannel:
         }
         kind, session_id = target
         if kind == "group":
-            await api.post_group_message(group_openid=session_id, **payload)
-        else:
-            await api.post_c2c_message(openid=session_id, **payload)
+            return await api.post_group_message(group_openid=session_id, **payload)
+        return await api.post_c2c_message(openid=session_id, **payload)
 
 
 class ChainChannel:

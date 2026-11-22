@@ -251,6 +251,70 @@ async def test_original_image_prefers_quoted_image_over_session_history(
     assert "history.jpg" not in images[0].url
 
 
+async def test_original_image_prefers_sent_message_record(
+    make_plugin, imgbed, make_event
+):
+    """引用消息带 Reply.id 时，/原图 按发送记录精确取回，不猜文件名/不算哈希。
+
+    线上场景：/随机图 发出的图被 QQ 转存成临时名，引用消息里的 `file` 是
+    `media_image_…`，按名查必然 404；而发送时平台已经回执了 message_id，
+    记录里存着当时发出的原图直链。这里同时把群历史放一张**不同的**图，
+    证明记录优先于历史，也优先于引用图的临时名。
+    """
+    plugin = make_plugin(random_media={"base_url": imgbed.base_url})
+    origin = "g1"
+    plugin.history.remember(
+        origin,
+        f"{imgbed.base_url}/file/history.jpg",
+        display_name="history.jpg",
+    )
+    plugin.sent_messages.remember(
+        origin,
+        "mid-1",
+        [{"url": f"{imgbed.base_url}/file/record.jpg", "file_name": "record.jpg"}],
+    )
+    event = make_event(
+        "/原图",
+        origin=origin,
+        chain=[
+            Reply(
+                id="mid-1",
+                chain=[Image.fromURL(f"{imgbed.base_url}/file/media_image_temp.jpg")],
+            )
+        ],
+    )
+
+    results = await _collect(plugin.original_image(event))
+
+    images = _chain_images(results[0])
+    assert len(images) == 1, f"应发出记录里的原图，实际 {_chain_text(results[0])!r}"
+    assert images[0].url == f"{imgbed.base_url}/file/record.jpg"
+    assert "record.jpg" in _chain_text(results[0])
+
+
+async def test_original_image_falls_back_when_record_misses(
+    make_plugin, imgbed, make_event
+):
+    """Reply.id 没有记录（旧消息/链路由 AstrBot 代发）时，仍按引用图名字兜底。"""
+    plugin = make_plugin(random_media={"base_url": imgbed.base_url})
+    event = make_event(
+        "/原图",
+        origin="g1",
+        chain=[
+            Reply(
+                id="mid-unknown",
+                chain=[Image.fromURL(f"{imgbed.base_url}/file/quoted.jpg")],
+            )
+        ],
+    )
+
+    results = await _collect(plugin.original_image(event))
+
+    images = _chain_images(results[0])
+    assert len(images) == 1
+    assert images[0].url == f"{imgbed.base_url}/file/quoted.jpg"
+
+
 async def test_original_image_reverses_quoted_thumbnail_over_history(
     make_plugin, imgbed, make_event, monkeypatch
 ):

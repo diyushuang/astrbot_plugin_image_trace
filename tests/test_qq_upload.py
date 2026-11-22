@@ -335,6 +335,11 @@ async def test_takeover_sends_media_with_msg_type_7(make_plugin, make_event, mon
     assert payload["media"] == "MEDIA"
     assert payload["content"] == "🖼️ a.jpg"
     assert payload["msg_id"] == "ROBOT1.0_test"
+    record = plugin.sent_messages.find(event.unified_msg_origin, "msg")
+    assert record == {
+        "url": "http://192.9.240.227:7658/file/a.jpg",
+        "file_name": "a.jpg",
+    }
 
 
 async def test_takeover_c2c_uses_openid(make_plugin, make_event, monkeypatch):
@@ -349,6 +354,7 @@ async def test_takeover_c2c_uses_openid(make_plugin, make_event, monkeypatch):
     assert await plugin._qq_upload_takeover(event, "", [{"url": "https://a/b.jpg"}]) is True
     assert api.calls[0][0] == "c2c"
     assert api.calls[0][1]["msg_type"] == 7
+    assert plugin.sent_messages.find(event.unified_msg_origin, "msg") is not None
 
 
 async def test_direct_mode_never_takes_over(make_plugin, make_event):

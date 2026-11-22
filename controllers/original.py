@@ -49,10 +49,12 @@ class OriginalController:
         """重发最近回传过的图片的原图；也可直接按文件名到图床取（/原图 风景.jpg）
 
         取值优先级（无参数时）：
-        1. 被引用的那张图——用户明确引用一张图时，目标就是那张图；缩略图会先
-           反查回原图，绝不因为群历史里还有别的图就改发别的；
-        2. 本会话最近回传过的图（历史）；
-        3. 本条消息自带的图（历史为空的兜底）。
+        1. 被引用消息的**发送记录**——发图时平台回执了 message_id，引用时
+           用 Reply.id 直接查回那条消息发过的原图，不下载、不算哈希；
+        2. 没有记录时才看被引用图本身：先按文件名/缩略图反查，文件名不可用
+           时按图片内容哈希兜底；
+        3. 引用里没有图片时，才用本会话最近回传过的图（历史）；
+        4. 历史为空时退化为本条消息自带的图。
         """
         plugin = self.plugin
         session = plugin._session_key(event)
@@ -87,24 +89,35 @@ class OriginalController:
                 # 于是「用户给足了信息反而查不到」。前者原地剥前缀、保住目录。
                 query = strip_leading_decoration(query) or query
         else:
-            # 无参数：引用图优先。引用图存在时不再回退历史——历史是群级共享的
-            # 「最近一次机器人发图」，很容易是别人触发/另一条消息的图；用户
-            # 明确引用了某张图却拿到另一张，比明确报「查不到」更糟。
+            # 无参数：先按**发送记录**精确查。发图时平台回执的 message_id
+            # 与引用消息的 Reply.id 是同一个键；命中就直接拿当时发出的原图，
+            # 不再下载引用图、也不再做图片哈希——那是 /溯源 的职责。
+            quoted_id = plugin._quoted_message_id(event)
+            if quoted_id:
+                record = plugin.sent_messages.find(session, quoted_id)
+                if record and record.get("url"):
+                    url = record["url"]
+                    name = record.get("file_name") or clean_display_name(url) or ""
+                    quoted = url
+                    source = "record"
+            # 没有记录（旧消息、或该平台由 AstrBot respond stage 代发、拿不到
+            # message_id）才退回引用图优先：先按文件名/缩略图反查，再按内容哈希。
             quoted_candidates = plugin._quoted_image_candidates(event)
             quoted_segments = plugin._quoted_image_segments(event)
-            last_message = ""
-            for raw in quoted_candidates:
-                lookup_name = clean_display_name(raw) or ""
-                if not lookup_name:
-                    continue
-                name, url, message = await plugin._lookup_imgbed_file(
-                    lookup_name, quoted=raw
-                )
-                if url:
-                    quoted = raw
-                    source = "quoted"
-                    break
-                last_message = message
+            if not url:
+                last_message = ""
+                for raw in quoted_candidates:
+                    lookup_name = clean_display_name(raw) or ""
+                    if not lookup_name:
+                        continue
+                    name, url, message = await plugin._lookup_imgbed_file(
+                        lookup_name, quoted=raw
+                    )
+                    if url:
+                        quoted = raw
+                        source = "quoted"
+                        break
+                    last_message = message
             if quoted_segments and not url:
                 # 文件名不可用（QQ 临时名 `media_image_…`、图床改名后裸名等）时，
                 # 名字已经完全失去信息量；改用图内容做哈希反查。这是「引用签到图

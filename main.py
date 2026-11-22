@@ -25,6 +25,7 @@ import time
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from urllib.parse import unquote, urlparse, urlsplit
 
 import astrbot.api.message_components as Comp
@@ -159,6 +160,7 @@ from .search import (
     HashSearchEngine,
     VectorSearchEngine,
 )
+from .sent_messages import SentMessageStore
 from .services import (
     CheckinRenderService,
     CheckinService,
@@ -261,6 +263,9 @@ class ImageTracePlugin(Star):
         self._remote_hash_task: asyncio.Task | None = None
         # 回传过的原图直链的历史（供 /原图 找回）；随机图客户端惰性构造
         self.history = MediaHistory()
+        # 发图回执：message_id → 本条消息发出去的原图。引用消息带 Reply.id，
+        # /原图 优先按这条**发送记录**精确取回，不再靠文件名或内容哈希猜。
+        self.sent_messages = SentMessageStore()
         self._random_media_client: RandomMediaClient | None = None
         # 每日签到：独立 SQLite 记录（按用户全局一天一次）与语句库（首次取句时构造）。
         # 签到是附属功能：DB 打不开时降级为「签到不可用」，不能拖垮整个插件加载。
@@ -675,6 +680,19 @@ class ImageTracePlugin(Star):
     def _session_key(event: AstrMessageEvent) -> str:
         """会话唯一标识，用于隔离 /原图 的图片历史。"""
         return str(getattr(event, "unified_msg_origin", None) or "default")
+
+    def _remember_sent_message(
+        self, event: AstrMessageEvent, message_id: str, blocks: list[dict]
+    ) -> None:
+        """把平台回执的消息 ID 与该条消息里的原图一起登记，供 /原图 精确找回。
+
+        只在通道真正拿到回执时调用；没有 message_id 的路径（AstrBot respond
+        stage 代发的标准消息链）不记账，/原图 仍走按名/按内容的旧兜底。
+        """
+        message_id = str(message_id or "").strip()
+        if not message_id:
+            return
+        self.sent_messages.remember(self._session_key(event), message_id, blocks)
 
     def _remember_blocks(self, event: AstrMessageEvent, blocks: list[dict]) -> None:
         """把本次回传的原图直链记入会话历史，供 /原图 找回。
@@ -1349,6 +1367,21 @@ class ImageTracePlugin(Star):
         return base if base.lower().startswith(("http://", "https://")) else ""
 
     @classmethod
+    def _quoted_message_id(cls, event: AstrMessageEvent) -> str:
+        """取被引用消息的 ID（`Comp.Reply.id`），用于查发送记录。
+
+        引用消息的图片段只有「图长什么样」，没有「这条消息是哪次发送」的
+        信息；`Reply.id` 才是指向机器人那条消息的唯一键。
+        """
+        for seg in event.message_obj.message or []:
+            if not isinstance(seg, Comp.Reply):
+                continue
+            message_id = str(getattr(seg, "id", "") or "").strip()
+            if message_id:
+                return message_id
+        return ""
+
+    @classmethod
     def _quoted_image_segments(cls, event: AstrMessageEvent) -> list:
         """取被引用消息链里的图片段（只读 `Reply.chain`，保持原始顺序）。"""
         segments: list = []
@@ -1409,8 +1442,9 @@ class ImageTracePlugin(Star):
             "本会话还没有回传过图片。/原图 也可直接按文件名到图床取原图：\n"
             "· /原图 文件名 —— 直接把图床里的原图取回来（无需先回传）\n"
             "· /原图 —— 取本会话最近回传过的图片的原图\n"
-            "· 引用一张图发送 /原图 —— 先按该图文件名反查；文件名是平台临时名"
-            "（如 media_image_…）时自动改为按图片内容做哈希反查"
+            "· 引用一张图发送 /原图 —— 优先按发图时的发送记录精确取回；"
+            "没有记录（旧消息或平台代发）时按文件名反查，文件名是平台临时名"
+            "（如 media_image_…）时再按图片内容做哈希兜底"
         )
 
     async def _reverse_original(self, fetch, *, action: str, level: str='warning') -> tuple[str, str]:
@@ -1786,8 +1820,8 @@ class ImageTracePlugin(Star):
 
     async def _qq_post_media(
         self, event: AstrMessageEvent, target: tuple[str, str], content: str, media
-    ) -> None:
-        """自己发一条 media 消息（msg_type=7）。
+    ) -> Any:
+        """自己发一条 media 消息（msg_type=7），返回平台回执。
 
         不走 event.send：那条路会把图片重新解析成 base64 交给 file_data 直传，
         正是本次要绕开的 5MB 限制。msg_seq 每条随机——被动回复中 (msg_id,
@@ -1795,7 +1829,7 @@ class ImageTracePlugin(Star):
 
         实现已迁到 delivery.channels.QQOfficialChannel，保留同名薄委托。
         """
-        await QQOfficialChannel(self).post_media(event, target, content, media)
+        return await QQOfficialChannel(self).post_media(event, target, content, media)
 
     async def _qq_notify(
         self, event: AstrMessageEvent, target: tuple[str, str], text: str

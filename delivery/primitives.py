@@ -54,6 +54,31 @@ def mention_prefix(host, event: AstrMessageEvent) -> list:
     return [Comp.At(qq=sender)] if sender else []
 
 
+def onebot_message_id(ret) -> str:
+    """从 OneBot ``send_group_msg`` / ``send_private_msg`` 回执里取消息 ID。
+
+    aiocqhttp 的 ``call_action`` 通常直接返回协议端 `data`（``{"message_id":
+    123}``），个别实现会包一层 ``{"data": {...}}``；两种都兼容。
+    """
+    if isinstance(ret, dict):
+        for key in ("message_id", "messageId"):
+            value = ret.get(key)
+            if value is not None:
+                return str(value).strip()
+        data = ret.get("data")
+        if isinstance(data, dict):
+            for key in ("message_id", "messageId"):
+                value = data.get(key)
+                if value is not None:
+                    return str(value).strip()
+        return ""
+    for key in ("message_id", "messageId"):
+        value = getattr(ret, key, None)
+        if value is not None:
+            return str(value).strip()
+    return ""
+
+
 async def send_via_onebot(host, event: AstrMessageEvent, header: str, blocks: list[dict], payloads: list[str | bytes], *, image_timeout: int) -> SendOutcome:
     """通过 OneBot 原生接口直发消息，消息段按「文字集中 → 图片集中」排列。
 
@@ -132,7 +157,7 @@ async def send_via_onebot(host, event: AstrMessageEvent, header: str, blocks: li
 
     image_count = sum(1 for seg in message if seg["type"] == "image")
     try:
-        await event.bot.call_action(action, **params)
+        ret = await event.bot.call_action(action, **params)
     except Exception as exc:
         outcome = classify_send_error(exc)
         # 日志按成因给结论：不再只写「结果未知」，而是讲清「请求已发出、
@@ -147,6 +172,7 @@ async def send_via_onebot(host, event: AstrMessageEvent, header: str, blocks: li
         )
         return outcome
     logger.info(f"OneBot 图片直发成功: {action}（{image_count} 张）")
+    host._remember_sent_message(event, onebot_message_id(ret), blocks)
     return SendOutcome.SENT
 
 

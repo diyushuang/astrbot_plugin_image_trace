@@ -407,7 +407,7 @@ async def upload_takeover(
                 return True
 
         try:
-            await host._qq_post_media(event, target, content, media)
+            ret = await host._qq_post_media(event, target, content, media)
         except Exception as exc:
             send_kind = classify_qq_upload_error(exc)
             logger.warning(
@@ -435,7 +435,7 @@ async def upload_takeover(
                     media = await host._qq_upload_block(
                         event, block, "bytes", None, target, max_upload
                     )
-                    await host._qq_post_media(event, target, content, media)
+                    ret = await host._qq_post_media(event, target, content, media)
                 except Exception as retry_exc:
                     send_kind = classify_qq_upload_error(retry_exc)
                     logger.warning(
@@ -445,6 +445,7 @@ async def upload_takeover(
                     exc = retry_exc
                 else:
                     sent_any = True
+                    host._remember_sent_message(event, qq_message_id(ret), [block])
                     continue
             if send_kind in {"unknown", "timeout"}:
                 # 请求可能已经送达，只是没拿到回执；按不变量「UNKNOWN 视为
@@ -463,7 +464,23 @@ async def upload_takeover(
             await host._qq_notify(event, target, _failure_text(exc, send_kind))
             return True
         sent_any = True
+        host._remember_sent_message(event, qq_message_id(ret), [block])
     return True
+
+
+def qq_message_id(ret) -> str:
+    """从 QQ 官方 ``post_group_message`` / ``post_c2c_message`` 回执里取消息 ID。
+
+    qq-botpy 可能返回 ``Message`` 对象（``ret.id``）或 dict（``{"id": ...}``）。
+    引用机器人消息时 ``Reply.id`` 通常正是这个 ``ROBOT1.0_…`` 值，可直接对上。
+    """
+    if ret is None:
+        return ""
+    if isinstance(ret, dict):
+        value = ret.get("id") or ret.get("message_id")
+    else:
+        value = getattr(ret, "id", None) or getattr(ret, "message_id", None)
+    return str(value).strip() if value is not None else ""
 
 
 def _failure_text(exc: BaseException, kind: str) -> str:

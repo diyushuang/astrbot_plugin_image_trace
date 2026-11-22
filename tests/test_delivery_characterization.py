@@ -49,6 +49,35 @@ class _OkBot:
         return {"status": "ok"}
 
 
+class _IdBot(_OkBot):
+    """OneBot 直发成功且回执 message_id 的替身。"""
+
+    def __init__(self, message_id="12345") -> None:
+        super().__init__()
+        self.message_id = message_id
+
+    async def call_action(self, action, **params):
+        ret = await super().call_action(action, **params)
+        ret["message_id"] = self.message_id
+        return ret
+
+
+@pytest.mark.asyncio
+async def test_onebot_direct_records_message_id(make_plugin, make_event):
+    """OneBot send_group_msg 回执里的 message_id 要落进发送账本。"""
+    plugin = make_plugin()
+    event = make_event(
+        "", platform="aiocqhttp", bot=_IdBot("mid-1"), group_id="1", origin="g1"
+    )
+    blocks = [{"url": URL_A, "file_name": "a.jpg"}]
+
+    outcome = await plugin._send_via_onebot(event, "标题", blocks, [URL_A])
+
+    assert outcome is SendOutcome.SENT
+    record = plugin.sent_messages.find("g1", "mid-1")
+    assert record == {"url": URL_A, "file_name": "a.jpg"}
+
+
 def _image_calls(bot) -> list[dict]:
     """只看带图片段的直发调用。"""
     return [
