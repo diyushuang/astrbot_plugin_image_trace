@@ -1349,6 +1349,18 @@ class ImageTracePlugin(Star):
         return base if base.lower().startswith(("http://", "https://")) else ""
 
     @classmethod
+    def _quoted_image_segments(cls, event: AstrMessageEvent) -> list:
+        """取被引用消息链里的图片段（只读 `Reply.chain`，保持原始顺序）。"""
+        segments: list = []
+        for seg in event.message_obj.message or []:
+            if not isinstance(seg, Comp.Reply):
+                continue
+            for sub in getattr(seg, "chain", None) or []:
+                if isinstance(sub, Comp.Image):
+                    segments.append(sub)
+        return segments
+
+    @classmethod
     def _quoted_image_candidates(cls, event: AstrMessageEvent) -> list[str]:
         """取被引用消息链里的图片原始直链/文件名（只读 `Reply.chain`）。
 
@@ -1362,18 +1374,13 @@ class ImageTracePlugin(Star):
         """
         candidates: list[str] = []
         seen: set[str] = set()
-        for seg in event.message_obj.message or []:
-            if not isinstance(seg, Comp.Reply):
-                continue
-            for sub in getattr(seg, "chain", None) or []:
-                if not isinstance(sub, Comp.Image):
+        for sub in cls._quoted_image_segments(event):
+            for field in ("url", "file"):
+                raw = str(getattr(sub, field, None) or "").strip()
+                if not raw or not media_filename(raw) or raw in seen:
                     continue
-                for field in ("url", "file"):
-                    raw = str(getattr(sub, field, None) or "").strip()
-                    if not raw or not media_filename(raw) or raw in seen:
-                        continue
-                    seen.add(raw)
-                    candidates.append(raw)
+                seen.add(raw)
+                candidates.append(raw)
         return candidates
 
     @classmethod
@@ -1402,7 +1409,8 @@ class ImageTracePlugin(Star):
             "本会话还没有回传过图片。/原图 也可直接按文件名到图床取原图：\n"
             "· /原图 文件名 —— 直接把图床里的原图取回来（无需先回传）\n"
             "· /原图 —— 取本会话最近回传过的图片的原图\n"
-            "· 引用一张图发送 /原图 —— 按该图文件名到图床取原图"
+            "· 引用一张图发送 /原图 —— 先按该图文件名反查；文件名是平台临时名"
+            "（如 media_image_…）时自动改为按图片内容做哈希反查"
         )
 
     async def _reverse_original(self, fetch, *, action: str, level: str='warning') -> tuple[str, str]:
@@ -1412,6 +1420,10 @@ class ImageTracePlugin(Star):
     async def _original_from_thumbnail(self, thumb_ref: str) -> tuple[str, str]:
         """缩略图直链 → 原图直链；委托 services.original_service.OriginalService._original_from_thumbnail。"""
         return await self.services.original._original_from_thumbnail(thumb_ref)
+
+    async def _original_from_quoted_image(self, seg) -> tuple[str, str]:
+        """按引用图内容做哈希反查；委托 services.original_service.OriginalService._original_from_quoted_image。"""
+        return await self.services.original._original_from_quoted_image(seg)
 
     async def _original_from_thumb_name(self, name: str) -> tuple[str, str]:
         """按缩略图文件名反查原图；委托 services.original_service.OriginalService._original_from_thumb_name。"""

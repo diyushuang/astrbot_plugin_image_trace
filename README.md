@@ -5,7 +5,7 @@
 
 **群聊里随手转发的一张图，一键找回它的原图。**
 
-[![version](https://img.shields.io/badge/version-1.8.3-blue?style=flat-square)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.8.4-blue?style=flat-square)](./CHANGELOG.md)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.0.0-ff69b4?style=flat-square)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat-square)](./LICENSE)
@@ -42,7 +42,7 @@
 | 🗂️ **多种存储** | 图床副本 / 通用 HTTP 图床（Lsky Pro、EasyImages、Chevereto…）/ CloudFlare-ImgBed / Cloudflare R2 / 甲骨文 OCI |
 | 🎲 **随机图** | `/随机图`、`/随机视频` 从图床随机接口取图回传，并可被 LLM 工具 `sendRandomMedia` 调用 |
 | 📅 **每日签到** | `/签到` 每天首次计入连续/累计天数；同日重复签到天数不变，但仍会回传一张新的随机卡片/图片。合成方式（`card` / `simple`）、取图方式（`thumbnail` / `original`）、是否写文字与是否带群昵称各自独立配置 |
-| 🖼️ **`/原图` 直取** | 优先从被引用的图找回原图，无引用时从会话历史找回，或按文件名直接到图床取；默认原图 URL 直传、不下载不本地中转。QQ 官方机器人拿不到公网直链时按上传通道降级 |
+| 🖼️ **`/原图` 直取** | 优先从被引用的图找回原图：先按文件名反查，文件名是平台临时名时再按图片内容做哈希反查；无引用时从会话历史找回，或按文件名直接到图床取。常规路径原图 URL 直传、不下载不本地中转。QQ 官方机器人拿不到公网直链时按上传通道降级 |
 | 🧹 **名字自动净化** | 配文前缀（`🖼️`/`🎬`/序号）与图床改名痕迹（毫秒时间戳、`@`→`_`）在展示与直查前统一剥净 |
 | 🛡️ **安全加固** | 插件自身发起的全部出网（下载兜底、图床 / 对象存储 / Qdrant / 随机图 / 语句接口）经 SSRF 防护（逐跳校验 + IP 钉扎 + 响应限长）；密钥字段在配置面板标记为 secret。平台适配器自身的上传/拉流请求由其负责，不经过本插件的 `url_guard` |
 
@@ -77,14 +77,14 @@
 <details>
 <summary><b>`/原图` 的查找顺序与直链口径（点击展开）</b></summary>
 
-1. **无参数且带了引用图**时，先解析引用图（缩略图先反查回原图，其他按名反查/直查）；查不到就明确报错，**不退回群历史**，避免发出与引用无关的图；
+1. **无参数且带了引用图**时，先解析引用图（缩略图先反查回原图，其他按名反查/直查）；文件名不可用（QQ 临时名 `media_image_…`、平台转存后只剩随机名）或按名查不到时，再下载引用图做一次 pHash 反查（相似度 **≥95%** 才采用）；两者都失败才明确报错，**不退回群历史**，避免发出与引用无关的图；
 2. 没有引用图时，先查**本会话回传历史**（`/溯源`、`/随机图` 回传过的图片都会记入）；历史里若命中缩略图直链，先反查到原图再交付；
 3. 历史未命中时，**先按文件名到 Qdrant 反查**（`payload.file_name` 精确匹配，命中数须恰为 1），取回入库时登记的带完整目录的权威直链；
 4. 反查落空时，才退回按裸名拼接 `{图床地址}/file/{文件名}` 并探测存在性后直传。图床地址取 `image_bed.cfi_base_url`（`cloudflare_imgbed` 模式）或 `random_media.base_url`；
 5. 文件名允许带上传目录，例如 `/原图 2026/09/abc.jpg`——此时跳过反查，直接按路径交给图床；
 6. 引用图直链落在 `thumbnails/`，或只剩缩略图改名后的裸名时，先按该直链/名字到 Qdrant 反查它所属的原图点，换成原图直链再交付；反查失败则明确报「找不到」，不退回替身。
 
-直链口径：只按 CloudFlare-ImgBed 的 Read API 剥离 `width` / `height` / `fit` / `fallback`，其他图床的查询串原样保留（改动可能破坏签名或鉴权）。`/原图` 不查本地图库做相似检索；Qdrant 只在两处做**精确反查**（按值匹配，不做向量检索）。
+直链口径：只按 CloudFlare-ImgBed 的 Read API 剥离 `width` / `height` / `fit` / `fallback`，其他图床的查询串原样保留（改动可能破坏签名或鉴权）。`/原图` 常规路径不做相似检索；仅当引用图按名查不到时，对引用图做一次哈希反查（本地图库 + 图床哈希索引，相似度 ≥95% 才采用，不走向量检索）。Qdrant 仍只在两处做**精确反查**（按值匹配，不做向量检索）。
 
 </details>
 

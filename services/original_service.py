@@ -6,10 +6,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from urllib.parse import unquote, urlsplit
 
 from astrbot.api import logger
 
+from ..features import compute_features, compute_features_with_mime
 from ..image_delivery import build_imgbed_file_url, build_original_url
 from ..random_media import clean_display_name, is_thumbnail_url
 
@@ -116,6 +118,86 @@ class OriginalService:
         if not url:
             return "", ""
         return display or clean_display_name(url) or query, url
+
+    async def _original_from_quoted_image(self, seg) -> tuple[str, str]:
+        """按**引用图内容**做哈希反查，返回 (图床原名, 原图直链)。
+
+        为什么需要这条：QQ 等平台把机器人发出的图转存到自己的 CDN 后，插件
+        手上的文件名可能只是 `media_image_20261122135640939_fef9.jpg` 这种
+        平台临时名。它既不是图床里的真名，也不带 `thumbnails/` 段，按名反查
+        必然 404——线上表现为「引用签到图 + /原图 → 图床里没有找到
+        media_image_…」。此时文件名已经完全失去信息量，唯一可靠的线索是图
+        片内容本身。
+
+        复用 `/溯源` 的哈希腿：解析引用图为本地文件 → 算 pHash → 合并本地
+        图库与图床哈希索引。只接受**带图床直链**的命中；本地图库命中没有
+        `image_url` 时返回空，由调用方明确报错，绝不把本地路径当原图直链发。
+        临时文件在该方法内清理；任何异常都收敛为 ("", "")，不影响后续提示。
+        """
+        resolved = None
+        try:
+            resolved = await self.host._resolve_local(
+                seg,
+                probe=lambda path: compute_features_with_mime(
+                    path, self.host.hash_size
+                ),
+            )
+            if not resolved.path:
+                logger.info(f"/原图 引用图内容反查跳过：{resolved.message}")
+                return "", ""
+            feats = resolved.features
+            if feats is None:
+                feats = await asyncio.to_thread(
+                    compute_features, resolved.path, self.host.hash_size
+                )
+            hits, candidate_lines = await asyncio.to_thread(
+                self.host._merged_hash_candidates,
+                feats.phash,
+                max(5, self.host.top_n),
+            )
+            if not hits:
+                logger.info(
+                    "/原图 引用图内容反查未命中；候选："
+                    + ("；".join(candidate_lines) if candidate_lines else "无")
+                )
+                return "", ""
+            best = hits[0]
+            similarity = float(getattr(best, "similarity", 0.0))
+            # `/原图` 不发相似度、也不给候选，误报的代价比 `/溯源` 高：宁可报
+            # 「找不到」，也不能因为同一天同一组图长得像就发出另一张。同一张图
+            # 经 QQ 压缩/转存后 pHash 实测仍是 100%，95% 的严格线不会误伤正常场景。
+            if similarity < 0.95:
+                logger.info(
+                    "/原图 引用图内容反查最相似仅 "
+                    f"{similarity * 100:.1f}%，低于 /原图 的 95% 严格阈值，"
+                    f"已放弃: {getattr(best, 'file_name', '') or '-'}"
+                )
+                return "", ""
+            original = str(getattr(best, "image_url", "") or "").strip()
+            if not original:
+                logger.info(
+                    "/原图 引用图内容反查命中的是本地图库记录（无图床直链），"
+                    f"已跳过: 本地={getattr(best, 'file_path', '') or '-'}"
+                )
+                return "", ""
+            display = (
+                str(getattr(best, "file_name", "") or "").strip()
+                or clean_display_name(original)
+                or "引用图原图"
+            )
+            logger.info(
+                "/原图 引用图内容反查命中 #"
+                f"{getattr(best, 'id', '-')} 相似度 "
+                f"{similarity * 100:.1f}%: "
+                f"{display} -> {original}"
+            )
+            return display, build_original_url(original)
+        except Exception as exc:
+            logger.warning(f"/原图 引用图内容反查失败: {exc}")
+            return "", ""
+        finally:
+            if resolved is not None and resolved.is_tmp:
+                self.host._remove_quiet(resolved.path)
 
     async def _lookup_imgbed_file(self, name: str, *, quoted: str = "") -> tuple[str, str, str]:
         """按文件名到图床直查原图，返回 (名称, 直链, 失败提示)。

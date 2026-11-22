@@ -91,6 +91,7 @@ class OriginalController:
             # 「最近一次机器人发图」，很容易是别人触发/另一条消息的图；用户
             # 明确引用了某张图却拿到另一张，比明确报「查不到」更糟。
             quoted_candidates = plugin._quoted_image_candidates(event)
+            quoted_segments = plugin._quoted_image_segments(event)
             last_message = ""
             for raw in quoted_candidates:
                 lookup_name = clean_display_name(raw) or ""
@@ -104,12 +105,23 @@ class OriginalController:
                     source = "quoted"
                     break
                 last_message = message
-            if quoted_candidates and not url:
-                yield event.plain_result(
-                    last_message
-                    or "引用图里没有可识别的文件名，无法反查原图；"
-                    "请改用 /原图 <文件名> 或先 /溯源 命中该图。"
+            if quoted_segments and not url:
+                # 文件名不可用（QQ 临时名 `media_image_…`、图床改名后裸名等）时，
+                # 名字已经完全失去信息量；改用图内容做哈希反查。这是「引用签到图
+                # + /原图」线上报 `图床里没有找到 media_image_…` 的直接修复。
+                for seg in quoted_segments:
+                    name, url = await plugin._original_from_quoted_image(seg)
+                    if url:
+                        source = "quoted-hash"
+                        break
+            if quoted_segments and not url:
+                hint = (
+                    "引用图按文件名与图片内容都没有找到对应的原图；"
+                    "可先用 /溯源 确认它是否在图库中，或改用 /原图 <文件名>。"
                 )
+                if last_message:
+                    hint = f"{last_message}\n（已同时按图片内容做哈希反查，仍未命中）"
+                yield event.plain_result(hint)
                 return
             if not url:
                 latest = plugin.history.latest(session)

@@ -308,6 +308,123 @@ async def test_original_image_unresolvable_quote_does_not_fall_back_to_history(
     assert not _chain_images(results[0]), "引用图查不到时不得发出历史里的图"
 
 
+async def test_original_image_resolves_quoted_temp_name_by_content(
+    make_plugin, imgbed, make_event, monkeypatch
+):
+    """QQ 临时名 media_image_… 按名必 404，必须改用图内容哈希反查。
+
+    线上故障：引用签到图发 /原图，直接报
+    「图床里没有找到 media_image_20261122135640939_fef9.jpg」。
+    名字没有信息量，但图内容就是图床原图的缩略/转存版本。
+    """
+    plugin = make_plugin(random_media={"base_url": imgbed.base_url})
+    origin = "g1"
+    plugin.history.remember(
+        origin,
+        f"{imgbed.base_url}/file/history.jpg",
+        display_name="history.jpg",
+    )
+    monkeypatch.setattr(plugin, "_probe_url", _probe_missing)
+    original_url = f"{imgbed.base_url}/file/%E5%8E%9F%E5%9B%BE.jpg"
+
+    async def fake_hash_lookup(_seg):
+        return "【微博@赵今麦angel】20221003-06.jpg", original_url
+
+    monkeypatch.setattr(plugin, "_original_from_quoted_image", fake_hash_lookup)
+    temp_name = "media_image_20261122135640939_fef9.jpg"
+    event = make_event(
+        "/原图",
+        origin=origin,
+        chain=[Reply(chain=[Image.fromURL(f"{imgbed.base_url}/file/{temp_name}")])],
+    )
+
+    results = await _collect(plugin.original_image(event))
+
+    images = _chain_images(results[0])
+    assert len(images) == 1, f"应发出哈希反查到的原图，实际 {_chain_text(results[0])!r}"
+    assert images[0].url == original_url
+    assert "media_image_" not in images[0].url
+
+
+async def test_original_from_quoted_image_returns_remote_hash_hit(
+    make_plugin, imgbed, monkeypatch
+):
+    """内容反查本身：解析引用图 → 算 pHash → 合并哈希命中 → 取图床直链。"""
+    from types import SimpleNamespace
+
+    plugin = make_plugin(random_media={"base_url": imgbed.base_url})
+    phash = "0" * 64
+    resolve_calls = []
+
+    async def fake_resolve(seg, *, probe):
+        resolve_calls.append((seg, probe))
+        return SimpleNamespace(
+            path="C:/tmp/quoted.jpg",
+            message="",
+            features=SimpleNamespace(phash=phash),
+            is_tmp=False,
+        )
+
+    monkeypatch.setattr(plugin, "_resolve_local", fake_resolve)
+    best = SimpleNamespace(
+        id="hit-1",
+        similarity=1.0,
+        image_url=f"{imgbed.base_url}/file/orig.jpg",
+        file_name="【微博@赵今麦angel】20221003-06.jpg",
+        file_path="",
+    )
+    merged_calls = []
+
+    def fake_merged(query_phash, want):
+        merged_calls.append((query_phash, want))
+        return [best], []
+
+    monkeypatch.setattr(plugin, "_merged_hash_candidates", fake_merged)
+
+    name, url = await plugin._original_from_quoted_image(
+        Image.fromURL(f"{imgbed.base_url}/file/media_image_20261122135640939_fef9.jpg")
+    )
+
+    assert resolve_calls, "必须先解析引用图拿到本地文件"
+    assert merged_calls == [(phash, max(5, plugin.top_n))]
+    assert name == "【微博@赵今麦angel】20221003-06.jpg"
+    assert url == f"{imgbed.base_url}/file/orig.jpg"
+
+
+async def test_original_from_quoted_image_rejects_weak_hash_hit(
+    make_plugin, imgbed, monkeypatch
+):
+    """/原图 不发相似度，低于 95% 的相似命中必须放弃，避免发出同组另一张。"""
+    from types import SimpleNamespace
+
+    plugin = make_plugin(random_media={"base_url": imgbed.base_url})
+
+    async def fake_resolve(_seg, *, probe):
+        return SimpleNamespace(
+            path="C:/tmp/quoted.jpg",
+            message="",
+            features=SimpleNamespace(phash="0" * 64),
+            is_tmp=False,
+        )
+
+    monkeypatch.setattr(plugin, "_resolve_local", fake_resolve)
+    weak = SimpleNamespace(
+        id="weak",
+        similarity=0.90,
+        image_url=f"{imgbed.base_url}/file/other.jpg",
+        file_name="other.jpg",
+        file_path="",
+    )
+    monkeypatch.setattr(plugin, "_merged_hash_candidates", lambda *_a: ([weak], []))
+
+    name, url = await plugin._original_from_quoted_image(
+        Image.fromURL(f"{imgbed.base_url}/file/media_image_1_a.jpg")
+    )
+
+    assert name == ""
+    assert url == "", "低相似候选不得被 /原图 当成原图发出"
+
+
 def _stub_name_lookup(monkeypatch, plugin, mapping):
     """把向量引擎伪装成「已启用且能按 file_name 反查」，记录被查的名字。
 
