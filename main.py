@@ -265,7 +265,10 @@ class ImageTracePlugin(Star):
         self.history = MediaHistory()
         # 发图回执：message_id → 本条消息发出去的原图。引用消息带 Reply.id，
         # /原图 优先按这条**发送记录**精确取回，不再靠文件名或内容哈希猜。
-        self.sent_messages = SentMessageStore()
+        # 落盘到 data_dir/sent_messages.json，重启后仍能回查旧消息。
+        self.sent_messages = SentMessageStore(
+            path=os.path.join(self.data_dir, "sent_messages.json")
+        )
         self._random_media_client: RandomMediaClient | None = None
         # 每日签到：独立 SQLite 记录（按用户全局一天一次）与语句库（首次取句时构造）。
         # 签到是附属功能：DB 打不开时降级为「签到不可用」，不能拖垮整个插件加载。
@@ -2035,6 +2038,10 @@ class ImageTracePlugin(Star):
                 self.checkin_store.close()
             except Exception as e:
                 errors.append(f"签到数据库: {e}")
+        try:
+            self.sent_messages.close()
+        except Exception as e:
+            errors.append(f"发送记录: {e}")
         if errors:
             logger.error("图片溯源插件卸载时部分资源清理失败: " + "；".join(errors))
         logger.info("图片溯源插件已卸载。")

@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import logging
 import socket
@@ -327,6 +328,10 @@ async def make_plugin(data_dir):
     for plugin in created:
         if plugin._http is not None:
             await plugin._http.close()
+        # 发送记录默认落盘：测试结束前强制 flush，避免定时器在 tmp 目录
+        # 被回收后仍尝试写文件。
+        with contextlib.suppress(Exception):
+            plugin.sent_messages.close()
     # 内网直连白名单是模块级状态（生产由 terminate 清理），测试插件不走
     # terminate，这里显式复位，避免泄漏到其它测试文件
     url_guard.set_allowed_private_hosts(())

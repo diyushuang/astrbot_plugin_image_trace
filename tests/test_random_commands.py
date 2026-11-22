@@ -328,6 +328,38 @@ async def test_original_image_uses_caption_record_when_message_id_missing(
     assert images[0].url == f"{imgbed.base_url}/file/checkin-record.jpg"
 
 
+async def test_original_image_record_survives_plugin_restart(
+    make_plugin, imgbed, make_event
+):
+    """发送记录落盘后，重启插件（新实例、同 data_dir）仍能按 Reply.id 回查。"""
+    origin = "g1"
+    first = make_plugin(random_media={"base_url": imgbed.base_url})
+    first.sent_messages.remember(
+        origin,
+        "mid-restart",
+        [{"url": f"{imgbed.base_url}/file/before-restart.jpg", "file_name": "before.jpg"}],
+    )
+    first.sent_messages.close()
+
+    restarted = make_plugin(random_media={"base_url": imgbed.base_url})
+    event = make_event(
+        "/原图",
+        origin=origin,
+        chain=[
+            Reply(
+                id="mid-restart",
+                chain=[Image.fromURL(f"{imgbed.base_url}/file/media_image_temp.jpg")],
+            )
+        ],
+    )
+
+    results = await _collect(restarted.original_image(event))
+
+    images = _chain_images(results[0])
+    assert len(images) == 1, f"重启后应命中记录，实际 {_chain_text(results[0])!r}"
+    assert images[0].url == f"{imgbed.base_url}/file/before-restart.jpg"
+
+
 async def test_original_image_falls_back_when_record_misses(
     make_plugin, imgbed, make_event
 ):

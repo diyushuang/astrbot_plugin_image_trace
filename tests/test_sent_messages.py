@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from astrbot_plugin_image_trace.sent_messages import SentMessageStore
 
 URL = "https://img.example.com/file/a.jpg"
@@ -119,3 +121,116 @@ def test_caption_is_scoped_by_session():
     store.remember_caption("g1", "签到", [{"url": URL, "file_name": "a.jpg"}])
 
     assert store.find_caption("g2", "签到") is None
+
+
+def test_load_ignores_malformed_entries(tmp_path):
+    """损坏的 entries 结构不能拖垮插件启动，合法记录仍要保留。"""
+    path = tmp_path / "sent_messages.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "messages": [
+                    {
+                        "session": "g1",
+                        "message_id": "bad-dict",
+                        "entries": {"url": URL},
+                    },
+                    {
+                        "session": "g1",
+                        "message_id": "bad-none",
+                        "entries": [None],
+                    },
+                    {
+                        "session": "g1",
+                        "message_id": "good",
+                        "entries": [{"url": URL, "file_name": "good.jpg"}],
+                    },
+                ],
+                "captions": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    store = SentMessageStore(path=path)
+
+    assert store.find("g1", "bad-dict") is None
+    assert store.find("g1", "bad-none") is None
+    assert store.find("g1", "good") is not None
+    store.close()
+
+
+def test_records_survive_reload(tmp_path):
+    """重启等价于 close 后再 new 一个同路径的 store。"""
+    path = tmp_path / "sent_messages.json"
+    store = SentMessageStore(path=path)
+    store.remember("g1", "mid-1", [{"url": URL, "file_name": "a.jpg"}])
+    store.remember_caption(
+        "g1", "📅 今日已签到", [{"url": URL, "file_name": "a.jpg"}]
+    )
+    store.close()
+
+    reloaded = SentMessageStore(path=path)
+
+    assert reloaded.find("g1", "mid-1") == {"url": URL, "file_name": "a.jpg"}
+    assert reloaded.find_caption("g1", "📅 今日已签到") == {
+        "url": URL,
+        "file_name": "a.jpg",
+    }
+    reloaded.close()
+
+
+def test_corrupt_file_starts_empty(tmp_path):
+    path = tmp_path / "sent_messages.json"
+    path.write_text("{not-json", encoding="utf-8")
+
+    store = SentMessageStore(path=path)
+
+    assert store.count() == 0
+    assert store.find("g1", "mid-1") is None
+
+
+def test_load_skips_thumbnail_and_trims_to_limit(tmp_path):
+    """旧文件里混入缩略图/超量记录时，加载阶段就过滤并按上限保留最新。"""
+    path = tmp_path / "sent_messages.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "messages": [
+                    {
+                        "session": "g1",
+                        "message_id": "old",
+                        "entries": [{"url": URL, "file_name": "old.jpg"}],
+                    },
+                    {
+                        "session": "g1",
+                        "message_id": "thumb",
+                        "entries": [{"url": THUMB, "file_name": "thumb.jpg"}],
+                    },
+                    {
+                        "session": "g1",
+                        "message_id": "middle",
+                        "entries": [{"url": URL, "file_name": "middle.jpg"}],
+                    },
+                    {
+                        "session": "g1",
+                        "message_id": "new",
+                        "entries": [{"url": URL, "file_name": "new.jpg"}],
+                    },
+                ],
+                "captions": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    store = SentMessageStore(path=path, max_messages=2)
+
+    assert store.find("g1", "old") is None, "超过上限的最旧记录被淘汰"
+    assert store.find("g1", "thumb") is None, "缩略图不入账"
+    assert store.find("g1", "new") is not None
+    store.close()
