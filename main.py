@@ -705,8 +705,16 @@ class ImageTracePlugin(Star):
         if record_blocks:
             if block_index is None:
                 blocks = record_blocks
-            elif 0 <= block_index < len(record_blocks):
-                blocks = [record_blocks[block_index]]
+            else:
+                # block_index 是「本批第几张图」（QQ 官方按有图 block 逐张发），
+                # 原图块里可能夹着纯文字条目，先过滤再按同一序号取。
+                record_images = [
+                    item
+                    for item in record_blocks
+                    if item.get("url") or item.get("path")
+                ]
+                if 0 <= block_index < len(record_images):
+                    blocks = [record_images[block_index]]
         self.sent_messages.remember(self._session_key(event), message_id, blocks)
 
     def _remember_blocks(self, event: AstrMessageEvent, blocks: list[dict]) -> None:
