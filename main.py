@@ -682,16 +682,31 @@ class ImageTracePlugin(Star):
         return str(getattr(event, "unified_msg_origin", None) or "default")
 
     def _remember_sent_message(
-        self, event: AstrMessageEvent, message_id: str, blocks: list[dict]
+        self,
+        event: AstrMessageEvent,
+        message_id: str,
+        blocks: list[dict],
+        block_index: int | None = None,
     ) -> None:
         """把平台回执的消息 ID 与该条消息里的原图一起登记，供 /原图 精确找回。
 
         只在通道真正拿到回执时调用；没有 message_id 的路径（AstrBot respond
         stage 代发的标准消息链）不记账，/原图 仍走按名/按内容的旧兜底。
+
+        ``blocks`` 是本次实际发送的块（可能是缩略图/本地卡片 path）；真正要
+        入账的是 ``DeliveryService`` 挂在 event 上的**原图块**。QQ 官方一条
+        media 消息只发一张图，故用 ``block_index`` 取对应原图；OneBot 一条
+        消息可带多图，传 None 记整批。
         """
         message_id = str(message_id or "").strip()
         if not message_id:
             return
+        record_blocks = getattr(event, "_image_trace_record_blocks", None)
+        if record_blocks:
+            if block_index is None:
+                blocks = record_blocks
+            elif 0 <= block_index < len(record_blocks):
+                blocks = [record_blocks[block_index]]
         self.sent_messages.remember(self._session_key(event), message_id, blocks)
 
     def _remember_blocks(self, event: AstrMessageEvent, blocks: list[dict]) -> None:

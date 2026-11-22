@@ -445,7 +445,9 @@ async def upload_takeover(
                     exc = retry_exc
                 else:
                     sent_any = True
-                    host._remember_sent_message(event, qq_message_id(ret), [block])
+                    host._remember_sent_message(
+                        event, qq_message_id(ret), [block], block_index=index
+                    )
                     continue
             if send_kind in {"unknown", "timeout"}:
                 # 请求可能已经送达，只是没拿到回执；按不变量「UNKNOWN 视为
@@ -464,7 +466,9 @@ async def upload_takeover(
             await host._qq_notify(event, target, _failure_text(exc, send_kind))
             return True
         sent_any = True
-        host._remember_sent_message(event, qq_message_id(ret), [block])
+        host._remember_sent_message(
+            event, qq_message_id(ret), [block], block_index=index
+        )
     return True
 
 

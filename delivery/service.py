@@ -19,6 +19,7 @@ yield；直发 / 上传接管成功时没有可 yield 的内容。
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 
@@ -122,9 +123,13 @@ class DeliveryService:
             return
 
         target = hooks.target(event)
-        hooks.remember_blocks(
-            event, blocks if remember_blocks is None else remember_blocks
-        )
+        record_blocks = blocks if remember_blocks is None else remember_blocks
+        hooks.remember_blocks(event, record_blocks)
+        # 发送通道在成功回执后要按 message_id 记账；账本里应存**原图**，
+        # 而不是本次实际发送的缩略图/本地卡片 path。把本次的原图口径挂在
+        # 事件上，通道只传回执 ID 与该图在 blocks 里的下标。
+        with contextlib.suppress(Exception):
+            event._image_trace_record_blocks = record_blocks
         request = DeliveryRequest(
             header=header,
             blocks=blocks,
